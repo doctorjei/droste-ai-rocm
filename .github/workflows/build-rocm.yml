@@ -134,3 +134,139 @@ jobs:
             echo "find_package(hip): OK"
             echo "=== CORE BET VALIDATED: pip rocm-sdk-devel compiles HIP for gfx1151 ==="
           '
+
+  # ── Ports, phase 2 ────────────────────────────────────────────────────────
+  # artifacts: real compiles against build-base (HIP/rocWMMA/flash-attn/aiter/
+  # bitsandbytes/RCCL). FROM-scratch carriers pushed to GHCR so the matching
+  # runtime job can COPY --from them. These are the heavy jobs.
+  artifacts:
+    needs: build-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [ds4, llama, vllm, finetuning]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load pin
+        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push ${{ matrix.name }}-artifacts
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.name }}-artifacts
+          file: ${{ matrix.name }}-artifacts/Containerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:latest
+          build-args: |
+            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-build-base:${{ github.sha }}
+            ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
+            TORCH_VERSION=${{ env.TORCH_VERSION }}
+            GFX_TARGET=${{ env.GFX_TARGET }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:buildcache,mode=max
+
+  # runtimes: thin toolbox on runtime-base, COPY --from the pushed artifacts carrier.
+  runtimes:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [ds4, llama, vllm, finetuning]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load pin
+        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push ${{ matrix.name }}-runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.name }}-runtime
+          file: ${{ matrix.name }}-runtime/Containerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:latest
+          build-args: |
+            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
+            ARTIFACTS_IMAGE=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:${{ github.sha }}
+            ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
+            TORCH_VERSION=${{ env.TORCH_VERSION }}
+            GFX_TARGET=${{ env.GFX_TARGET }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:buildcache,mode=max
+
+  # comfyui: single interactive image (no compile; torch wheels + pip). FROM runtime-base.
+  comfyui:
+    needs: runtime-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load pin
+        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push comfyui-toolbox
+        uses: docker/build-push-action@v6
+        with:
+          context: comfyui-toolbox
+          file: comfyui-toolbox/Containerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-comfyui:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}-comfyui:latest
+          build-args: |
+            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
+            ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
+            TORCH_VERSION=${{ env.TORCH_VERSION }}
+            TORCHVISION_VERSION=${{ env.TORCHVISION_VERSION }}
+            TORCHAUDIO_VERSION=${{ env.TORCHAUDIO_VERSION }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-comfyui:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-comfyui:buildcache,mode=max
