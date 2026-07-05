@@ -1,0 +1,10 @@
+# kanibako infra — never commit
+vault/
+share-ro/
+share-rw/
+
+# local build scratch
+*.tar
+*.tar.xz
+*.tar.gz
+*.log

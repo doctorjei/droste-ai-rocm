@@ -1,0 +1,79 @@
+# rocm-runtime-base: TheRock gfx1151 ROCm RUNTIME kernels on canopy (no init).
+# Root of the unified ROCm lineage — replaces amd-runtime-base + therock-torch-base.
+# ONE pinned TheRock nightly (rocm-pin.env) feeds every image: the runtime kernels
+# (rocm-sdk-libraries-gfx1151) are pip-installed into a venv; NO apt ROCm repo, NO S3
+# tarball. rocm-build-base builds FROM this, so the de-divert runs exactly once and any
+# compiled artifacts ABI-match the runtime libs shipped here.
+FROM ghcr.io/doctorjei/gemet/canopy:1.7.3
+
+LABEL description="rocm-runtime-base: TheRock gfx1151 ROCm runtime kernels (canopy + de-divert, pip venv)"
+
+# Canopy routes coreutils/etc. to busybox via .distrib dpkg diversions; pip/apt postinsts
+# need real GNU binaries. Remove the .distrib diversions, then rehydrate GNU coreutils
+# BEFORE any other install. (Lifted verbatim from amd-runtime-base / droste-seed.) Inherited
+# by rocm-build-base, so the de-divert happens exactly once for the whole ROCm lineage.
+RUN while IFS= read -r orig && IFS= read -r div && IFS= read -r owner; do \
+        case "$div" in \
+            *.distrib) dpkg-divert --quiet --no-rename --remove "$orig" ;; \
+        esac; \
+    done < /var/lib/dpkg/diversions
+
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       coreutils grep sed findutils gzip diffutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# --- The unified pin (rocm-pin.env). A build wrapper sources rocm-pin.env and passes each
+# key as --build-arg; these ARG names MUST match the env keys. ---
+ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/
+ARG ROCM_SDK_LIBRARIES_VERSION=7.13.0a20260501
+ARG GFX_TARGET=gfx1151
+
+# Re-add exactly what canopy purges (per the canopy PURGELIST) plus the venv toolchain.
+# Canopy KEEPS bash/coreutils/libstdc++6/libgcc-s1/libgomp1/ca-certificates/python3 (3.13) —
+# do NOT re-add those. It PURGES sudo/procps/libnss-myhostname: sudo+procps for interactive
+# use, libnss-myhostname for distrobox host-name resolution. radeontop is a Debian-main GPU
+# monitor (not in any gemet base). python3-venv/python3-pip are NOT present in canopy and are
+# needed to build the /opt/venv and pip-install the ROCm wheels.
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       sudo procps libnss-myhostname radeontop \
+       python3-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Python venv with the TheRock gfx1151 RUNTIME kernels. Debian 13 is PEP668
+# externally-managed, so we install into a venv (preferred, matches therock-torch-base)
+# rather than --break-system-packages. rocm-sdk-libraries-gfx1151 pulls rocm-sdk-core
+# (rocminfo, rocm-sdk CLI, the HIP runtime .so) as a dependency. The wheels carry their
+# own RPATHs, so rocminfo/libamdhip64 resolve without extra LD wiring.
+RUN python3 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH PIP_NO_CACHE_DIR=1
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install --index-url ${ROCM_INDEX_URL} \
+       "rocm-sdk-libraries-${GFX_TARGET}==${ROCM_SDK_LIBRARIES_VERSION}"
+
+# Pin a stable /opt/rocm -> pip SDK root so ROCM_PATH is version/python-agnostic (the real
+# root lives under /opt/venv/lib/pythonX.Y/site-packages/_rocm_sdk_core). `rocm-sdk path`
+# is the SDK's own locator CLI. ld.so wiring lets the runtime .so resolve for non-venv procs.
+RUN ln -sfn "$(rocm-sdk path --root)" /opt/rocm \
+    && printf '/opt/rocm/lib\n/opt/rocm/lib64\n' > /etc/ld.so.conf.d/rocm.conf \
+    && ldconfig
+
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
+    LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64 \
+    PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
+
+# Real /etc/profile.d/rocm.sh (the old llama Containerfile wrote EMPTY here — bug). Activates
+# the venv and re-derives ROCM_PATH from the SDK's own locator at login time (robust across
+# python minor bumps / distrobox), then exports the HIP/PATH/LD env for interactive shells.
+RUN printf '%s\n' \
+    'source /opt/venv/bin/activate' \
+    'ROCM_PATH="$(rocm-sdk path --root 2>/dev/null || echo /opt/rocm)"' \
+    'export ROCM_PATH HIP_PATH="$ROCM_PATH"' \
+    'export PATH="$ROCM_PATH/bin:/opt/venv/bin:$PATH"' \
+    'export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib64:$LD_LIBRARY_PATH"' \
+    > /etc/profile.d/rocm.sh
+
+# No CMD.

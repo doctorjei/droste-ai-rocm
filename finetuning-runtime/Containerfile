@@ -1,0 +1,142 @@
+# finetuning-runtime: the shippable LLM-finetuning toolbox — torch + HF/unsloth stack on the
+# gfx1151 ROCm runtime kernels, with the compiled bitsandbytes + custom RCCL COPY'd from the
+# finetuning-artifacts scratch carrier. Interactive Jupyter toolbox (distrobox/toolbox target),
+# NOT a minimal service image.
+#
+# Translated from the upstream single-stage Dockerfile
+# (github.com/kyuz0/amd-strix-halo-llm-finetuning @ 093a23c0d49418aef08e5053aa19faf65b35236a).
+# UPSTREAM DELTAS (deliberate):
+#   * `/opt/rocm-7.0` TheRock S3 tarball DROPPED — ROCm runtime kernels come from the base
+#     (rocm-runtime-base, rocm-sdk-libraries-gfx1151 in /opt/venv, ROCM_PATH=/opt/rocm).
+#   * torch is installed from the UNIFIED pin (rocm-pin.env), ABI-matched to the runtime kernels,
+#     replacing upstream's v2-staging `--pre torch torchaudio torchvision`.
+#   * The upstream librocm_smi64 overwrite hack is DROPPED: torch and rocm-sdk-libraries share the
+#     same +rocm date here, so there is no SMI symbol mismatch to patch. Likewise the Fedora
+#     LD_PRELOAD=libtcmalloc_minimal.so.4:.../librocm_smi64 line is dropped (gperftools/tcmalloc is
+#     not installed; base profile.d/rocm.sh + the triton env script provide the runtime env).
+#   * bitsandbytes + RCCL are COPY'd from finetuning-artifacts instead of built inline.
+
+ARG BASE_IMAGE=localhost/rocm-runtime-base
+ARG ARTIFACTS_IMAGE=localhost/finetuning-artifacts
+# Local podman builds need a localhost/ prefix (default above); CI can override:
+#   --build-arg BASE_IMAGE=ghcr.io/<owner>/rocm-runtime-base:<tag>
+#   --build-arg ARTIFACTS_IMAGE=ghcr.io/<owner>/finetuning-artifacts:<tag>
+FROM ${ARTIFACTS_IMAGE} AS artifacts
+
+FROM ${BASE_IMAGE}
+
+LABEL description="finetuning-runtime: gfx1151 torch + HF/unsloth finetuning toolbox (bitsandbytes + custom RCCL)"
+
+# --- The unified pin (rocm-pin.env). ARG names MUST match the env keys the wrapper passes. ---
+ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/
+ARG TORCH_VERSION=2.9.1+rocm7.13.0a20260501
+ARG GFX_TARGET=gfx1151
+
+# --- Clone pins (provenance). ------------------------------------------------------------------
+# FLAG (on-host): these float upstream and MUST get sha pins before a reproducible release.
+#   * FLASH_ATTENTION_REPO/REF: ROCm/flash-attention @ main_perf (a moving branch head).
+#   * UNSLOTH_REF is a fixed commit (upstream-chosen, Jan 31) + PR 4109 (RDNA fixes) applied on top;
+#     unsloth_zoo is version-pinned below to match it. Do NOT bump unsloth without re-checking the
+#     unsloth_zoo pin (newer zoo drops sanitize_logprob / device_synchronize the commit relies on).
+ARG FLASH_ATTENTION_REPO=https://github.com/ROCm/flash-attention.git
+ARG FLASH_ATTENTION_REF=main_perf
+ARG UNSLOTH_REPO=https://github.com/unslothai/unsloth.git
+ARG UNSLOTH_REF=07a7ff47b1b2b37c088b8e0d7ed7bf8710d9aa22
+
+# Toolchain for the source installs below (clone + patch). Canopy ships none of these. git/curl
+# clone flash-attention + unsloth and fetch the unsloth PR diff; patch applies it. Kept small —
+# the HF wheels + flash-attn (Triton backend) + unsloth are pure-Python/prebuilt, no C toolchain.
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       git curl patch \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Pinned torch into the base venv (ABI-matched to the runtime kernels via the unified pin).
+RUN pip install --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"
+
+# --- Compiled gfx1151 artifacts (bitsandbytes wheel + custom RCCL) from the scratch carrier. ----
+# Carrier image is the ARTIFACTS_IMAGE ARG above (overridable in CI).
+COPY --from=artifacts /artifacts /artifacts
+
+# bitsandbytes: install the gfx1151 wheel (no deps — torch already present), then apply the
+# upstream version-parse fixup — bitsandbytes searches fixed fallback names (rocm7.12 / rocm82)
+# that won't match our built lib's name, so symlink the real .so to those names.
+RUN pip install --no-deps /artifacts/wheels/bitsandbytes-*.whl \
+    && BNB_SO="$(ls /opt/venv/lib*/python*/site-packages/bitsandbytes/libbitsandbytes_rocm*.so | head -n1)" \
+    && BNB_DIR="$(dirname "$BNB_SO")" \
+    && ln -sf "$BNB_SO" "$BNB_DIR/libbitsandbytes_rocm7.12.so" \
+    && ln -sf "$BNB_SO" "$BNB_DIR/libbitsandbytes_rocm82.so"
+
+# Custom RCCL: overwrite the SDK's stock librccl (both the /opt/rocm view and the real file(s)
+# under the venv's _rocm_sdk_libraries_gfx1151). find-based so it is robust to the exact path.
+RUN if [ -e "${ROCM_PATH}/lib/librccl.so.1.0" ]; then \
+        cp -fv /artifacts/lib64/librccl.so.1 "${ROCM_PATH}/lib/librccl.so.1.0"; \
+    fi \
+    && find /opt/venv -name "librccl.so.1" -exec cp -fv /artifacts/lib64/librccl.so.1 {} + \
+    && ldconfig
+
+# --- HF finetuning stack (pins carried verbatim from upstream). --------------------------------
+# datasets added explicitly (needed by the training notebooks; otherwise a transitive dep).
+# unsloth_zoo/tqdm/ipywidgets/ipykernel/traitlets/jupyter_core pinned to match the unsloth commit
+# checked out below (see UNSLOTH_REF note).
+RUN pip install --no-cache-dir \
+       jq \
+       transformers \
+       peft \
+       accelerate \
+       safetensors \
+       sentencepiece \
+       huggingface-hub \
+       datasets \
+       trl \
+       einops \
+       unsloth_zoo==2026.1.4 \
+       tqdm==4.67.1 \
+       ipywidgets==8.1.7 \
+       ipykernel==6.30.1 \
+       traitlets==5.14.3 \
+       jupyter_core==5.8.1 \
+       jupyterlab
+
+# --- Flash-Attention (ROCm Triton backend). ----------------------------------------------------
+# The Triton AMD backend flag MUST be set at build time so setup.py skips the CUDA C++ extension
+# and installs the pure-Python/Triton path (no nvcc, no host compiler needed).
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+RUN git clone "${FLASH_ATTENTION_REPO}" /tmp/flash-attention \
+    && cd /tmp/flash-attention \
+    && git checkout "${FLASH_ATTENTION_REF}" \
+    && pip install --no-cache-dir packaging \
+    && python setup.py install \
+    && rm -rf /tmp/flash-attention
+
+# --- Unsloth (pinned commit + PR 4109 RDNA fixes). ---------------------------------------------
+RUN git clone "${UNSLOTH_REPO}" /tmp/unsloth \
+    && cd /tmp/unsloth \
+    && git checkout "${UNSLOTH_REF}" \
+    && curl -sL https://github.com/unslothai/unsloth/pull/4109.diff | patch -p1 \
+    && pip install --no-cache-dir . \
+    && rm -rf /tmp/unsloth
+
+# --- Workspace (finetuning notebooks + helper scripts). ----------------------------------------
+COPY workspace /opt/workspace
+
+# --- Runtime env scripts (profile.d). ----------------------------------------------------------
+# 01-rocm-env-for-triton.sh: derives Triton HIP lld/clang paths from _rocm_sdk_core + sets the
+#   flash-attn Triton flag. 99-toolbox-banner.sh: login banner. zz-venv-last.sh: keeps
+#   /opt/venv/bin first on PATH. (Base already ships /etc/profile.d/rocm.sh for ROCM_PATH/venv.)
+COPY scripts/01-rocm-env-for-triton.sh /etc/profile.d/01-rocm-env-for-triton.sh
+COPY scripts/99-toolbox-banner.sh      /etc/profile.d/99-toolbox-banner.sh
+COPY scripts/zz-venv-last.sh           /etc/profile.d/zz-venv-last.sh
+RUN chmod 0644 /etc/profile.d/*.sh \
+    && printf 'ulimit -S -c 0\n' > /etc/profile.d/90-nocoredump.sh \
+    && chmod 0644 /etc/profile.d/90-nocoredump.sh
+
+# World-writable /opt so a distrobox-injected host user can write into the workspace/venv.
+RUN chmod -R a+rwX /opt \
+    && pip cache purge || true
+
+# Jupyter kernel points at the venv python; friendly display name (upstream parity).
+RUN /opt/venv/bin/python -m ipykernel install --name=python3 --display-name "Python (venv)" --prefix=/opt/venv
+
+CMD ["/bin/bash"]

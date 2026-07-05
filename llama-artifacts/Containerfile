@@ -1,0 +1,73 @@
+# llama-artifacts: gfx1151 llama.cpp (TheTom/llama-cpp-turboquant fork) compiled against the
+# TheRock ROCm SDK from rocm-build-base, captured as a scratch carrier. The build stage clones
+# the fork, applies the two turboquant patches, and cmake-builds with GGML_HIP for gfx1151; the
+# final `FROM scratch` stage holds ONLY /artifacts (bins + libllama*.so + the vram helper), which
+# llama-runtime consumes via COPY --from. NO ROCm/-dev installs here — hipcc/amdclang++, the HIP
+# headers, rocblas/hipblas/hipblaslt and the device bitcode all come from rocm-build-base's pip
+# SDK (ROCM_PATH=/opt/rocm, /opt/venv on PATH, GFX_TARGET=gfx1151 — all inherited as ENV).
+ARG BASE_IMAGE=localhost/rocm-build-base
+FROM ${BASE_IMAGE} AS builder
+# Local podman builds need a localhost/ prefix (already the default above); CI can override:
+#   --build-arg BASE_IMAGE=ghcr.io/<owner>/rocm-build-base:<tag>
+
+LABEL description="llama-artifacts: gfx1151 llama.cpp (turboquant fork) build output [scratch carrier]"
+
+# --- llama.cpp source pin ---
+# The fork carries the turboquant quant kernels; upstream ships no BRANCH arg (fork default branch).
+# LLAMA_REF pins the clone to a fixed commit for reproducibility. It is EMPTY by default because the
+# fork floats HEAD upstream (no fixed sha is published); the toolbox repo that vendors these assets
+# was itself at submodule commit 6318f02422ebcc40829d222107352934a6cc2fae — that is the provenance
+# of the patches/helper here, NOT a llama.cpp sha. FLAG: pin LLAMA_REF to a real fork sha on-host.
+ARG LLAMA_REPO=https://github.com/TheTom/llama-cpp-turboquant.git
+ARG LLAMA_REF=
+
+# The consumed asset lives alongside this Containerfile (copied from the upstream toolbox
+# submodule so the build context is self-contained). It patches relative to the repo root (-p1).
+# NOTE: hip-rocm7rc.patch was dropped as non-upstream (no upstream Dockerfile applies it; the
+# turboquant build succeeds on ROCm 7.x / HIP 7 without it). Re-add it (and its COPY) only if an
+# on-host HIP7 build failure shows it's needed.
+COPY llama-grammar.patch /tmp/
+
+# Clone the fork with its submodules, optionally pin to LLAMA_REF, then re-materialize submodules.
+WORKDIR /opt/llama.cpp
+RUN git clone --single-branch --recursive "${LLAMA_REPO}" . \
+    && if [ -n "${LLAMA_REF}" ]; then \
+         git checkout --recurse-submodules "${LLAMA_REF}"; \
+       fi \
+    && git submodule update --recursive
+
+# Apply the turboquant grammar patch: llama-grammar.patch raises MAX_REPETITION_THRESHOLD for
+# complex tool schemas. This is the ONLY patch upstream's turboquant Dockerfile applies.
+RUN patch -p1 < /tmp/llama-grammar.patch
+
+# HIP build for gfx1151. ROCM_PATH/HIP_PATH resolve the pip SDK root (symlinked in rocm-build-base);
+# AMDGPU_TARGETS=${GFX_TARGET} is the gfx1151 from the base ENV. RPC + HIP UMA + unified memory are
+# the turboquant/Strix-Halo flags (128 GB unified mem). FLAG (on-host): that HIP cmake resolves
+# hip-config.cmake / amdgcn bitcode from the pip SDK (CMAKE_PREFIX_PATH/HIP_DEVICE_LIB_PATH set in base).
+RUN cmake -S . -B build \
+       -DGGML_HIP=ON \
+       -DAMDGPU_TARGETS=${GFX_TARGET} \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DGGML_RPC=ON \
+       -DLLAMA_HIP_UMA=ON \
+       -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=ON \
+       -DROCM_PATH=/opt/rocm \
+       -DHIP_PATH=/opt/rocm \
+       -DHIP_PLATFORM=amd \
+    && cmake --build build --config Release -- -j"$(nproc)"
+
+# Collect ONLY llama.cpp's own outputs into /artifacts/{bin,lib64,share} (the seam: ROCm runtime
+# .so come from rocm-runtime-base, NOT this carrier). bin = build/bin/* incl the rpc-* binaries;
+# lib64 = every lib*.so* under build (libllama/libggml*).
+RUN mkdir -p /artifacts/bin /artifacts/lib64 /artifacts/share \
+    && cp -a build/bin/. /artifacts/bin/ \
+    && find build -type f -name 'lib*.so*' -exec cp -a {} /artifacts/lib64/ \;
+
+# The vram helper ships from the build context (not the repo) — copy it into share/ (the runtime
+# installs it to /usr/local/bin) and mark it executable.
+COPY gguf-vram-estimator.py /artifacts/share/gguf-vram-estimator.py
+RUN chmod +x /artifacts/share/gguf-vram-estimator.py
+
+# --- scratch carrier: ONLY /artifacts crosses into llama-runtime ---
+FROM scratch
+COPY --from=builder /artifacts /artifacts

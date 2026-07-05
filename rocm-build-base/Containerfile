@@ -1,0 +1,59 @@
+# rocm-build-base: TheRock gfx1151 ROCm SDK (rocm-sdk-devel) + host toolchain for native
+# gfx1151 builds. Replaces amd-build-base. Builds FROM rocm-runtime-base so it inherits the
+# de-divert + GNU coreutils, the /opt/venv, and the runtime kernels — the de-divert happens
+# exactly once and anything compiled here ABI-matches the runtime libs it will ship against.
+# rocm-sdk-devel installs into the SAME venv, so the devel headers/compilers sit next to the
+# runtime wheels. NOT a shipped image — builder stage only. NO apt ROCm repo, NO S3 tarball.
+ARG BASE_IMAGE=localhost/rocm-runtime-base
+FROM ${BASE_IMAGE}
+# Local podman builds need a localhost/ prefix (already the default above); CI can override:
+#   --build-arg BASE_IMAGE=ghcr.io/<owner>/rocm-runtime-base:<tag>
+
+LABEL description="rocm-build-base: TheRock gfx1151 ROCm SDK (rocm-sdk-devel) + toolchain"
+
+# --- The unified pin (rocm-pin.env). ARG names MUST match the env keys the wrapper passes. ---
+ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/
+ARG ROCM_SDK_DEVEL_VERSION=7.13.0a20260501
+ARG GFX_TARGET=gfx1151
+
+# Host compilers + build tools. These are Debian-main (NOT ROCm) — the ROCm compiler
+# (amdclang++/hipcc) comes from the rocm-sdk-devel wheel below. Kept broad from amd-build-base
+# for now (trim later): lld/clang + libclang{,-rt}-dev give a host clang alongside ROCm's;
+# libcurl4-openssl-dev / libomp{-dev,1} are direct build deps of the ports (llama curl, ds4
+# rocWMMA OpenMP at /usr/lib/x86_64-linux-gnu/libomp.so). git/patch/rsync for clone+patch+collect.
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       gcc g++ make cmake ninja-build git patch rsync \
+       lld clang libclang-dev libclang-rt-dev \
+       libcurl4-openssl-dev libomp-dev libomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# TheRock ROCm SDK (build toolchain: amdclang++/hipcc, HIP headers, device bitcode, cmake
+# configs) into the SAME venv as the runtime kernels. The devel wheel's tree is expanded
+# LAZILY — `rocm-sdk init` eagerly materializes it (headers + device-lib links) so cmake/hipcc
+# work in later RUN layers. `rocm-sdk init` needs NO GPU (do NOT run `rocm-sdk test`, which does).
+RUN pip install --index-url ${ROCM_INDEX_URL} \
+       "rocm-sdk-devel==${ROCM_SDK_DEVEL_VERSION}" \
+    && rocm-sdk init
+
+# Re-point the stable symlinks now that devel is expanded, and stamp a cmake-config symlink so
+# HIP cmake builds in non-login RUN layers (profile.d is NOT sourced there) find hip-config.cmake.
+#   /opt/rocm         -> rocm-sdk path --root   (SDK root == ROCM_PATH; amdclang++ under lib/llvm/bin)
+#   /opt/rocm-cmake   -> rocm-sdk path --cmake  (dir containing hip-config.cmake -> CMAKE_PREFIX_PATH)
+RUN ln -sfn "$(rocm-sdk path --root)"  /opt/rocm \
+    && ln -sfn "$(rocm-sdk path --cmake)" /opt/rocm-cmake
+
+# Build env so `cmake -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151` / ds4 `make ROCM_PATH=` resolve
+# the pip-installed compiler + device libs. hipcc/amdclang++ are on /opt/venv/bin (PATH). The
+# device-lib + clang paths are best-effort under the SDK root (validate on-host — see notes).
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
+    HIP_CLANG_PATH=/opt/rocm/lib/llvm/bin \
+    HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode \
+    CMAKE_PREFIX_PATH=/opt/rocm-cmake:/opt/rocm \
+    PATH=/opt/venv/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
+
+# gfx1151-only. Ports read this to pass -DAMDGPU_TARGETS / --offload-arch=${GFX_TARGET}.
+ENV GFX_TARGET=${GFX_TARGET}
+
+# No CMD: builder stage only.

@@ -1,0 +1,155 @@
+# comfyui-toolbox: interactive ComfyUI + AMD studios on the unified ROCm base.
+# Ported from the Fedora source (_fedora-src/comfyui-toolbox.Containerfile) and the REAL
+# upstream Dockerfile (droste-ai-rocm/upstream/comfyui, submodule commit
+#   c2ef528b05e474491845fe27715315cec287d80c).
+#
+# SINGLE interactive image — NOT split build/runtime — because it keeps a compiler
+# toolchain (gcc/g++/make/binutils/python3-dev) for Triton JIT AT RUNTIME.
+#
+# FROM rocm-runtime-base: canopy + de-divert + venv /opt/venv with the TheRock gfx1151
+# ROCm RUNTIME kernels (rocm-sdk-libraries-gfx1151). comfyui is a torch app, so we add the
+# torch stack (torch/torchvision/torchaudio) pinned from the SAME index into that base venv.
+# torch's own bundled ROCm coexists with the base runtime kernels — do NOT add a system
+# ROCm SDK, and do NOT re-add libnss-myhostname (the base already provides it for distrobox).
+ARG BASE_IMAGE=localhost/rocm-runtime-base
+FROM ${BASE_IMAGE}
+
+LABEL description="comfyui-toolbox: ComfyUI + qwen/wan studios, torch on TheRock gfx1151 (interactive, Triton JIT toolchain kept)"
+
+# --- The unified pin (rocm-pin.env). A build wrapper sources rocm-pin.env and passes each
+# key as --build-arg; these ARG names MUST match the env keys. TORCHVISION/TORCHAUDIO are
+# left blank in the pin (not yet locked) — when empty we install them unpinned so pip's
+# resolver picks the wheel matching the pinned torch on the same +rocm date. ---
+ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/
+ARG TORCH_VERSION=2.9.1+rocm7.13.0a20260501
+ARG TORCHVISION_VERSION=
+ARG TORCHAUDIO_VERSION=
+# transformers is pinned by the app; gguf floats.
+ARG TRANSFORMERS_VERSION=4.56.2
+
+# App-level deps + Triton runtime toolchain + pip. The base already ships python3-venv/pip,
+# but pip is re-listed for explicitness. gcc/g++/make/binutils/python3-dev are the Triton
+# JIT toolchain kept at runtime (this is why comfyui is not split build/runtime). Fedora
+# translations applied: ffmpeg-free->ffmpeg, libdrm-devel->libdrm2 (runtime, not -dev),
+# gcc-c++->g++, python3.13-devel->python3-dev; python3.13(-venv) dropped (interpreter+venv
+# already present in the base).
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       ffmpeg dialog git curl rsync libdrm2 pkg-config vim \
+       gcc g++ make binutils python3-dev \
+       python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# torch stack into the BASE venv (/opt/venv is on PATH from the base's ENV). Pinned torch;
+# torchvision/torchaudio pinned only when their ARG is set, else unpinned (--pre lets pip
+# see the nightly/pre-release wheels). torch bundles its own ROCm; the base runtime kernels
+# coexist. (Fedora installed torchaudio "for resolver; remove later" and never removed it —
+# we keep it installed, drop the misleading comment; wan-video-studio pulls audio deps.)
+RUN pip install --pre --index-url ${ROCM_INDEX_URL} \
+       "torch==${TORCH_VERSION}" \
+       "torchvision${TORCHVISION_VERSION:+==${TORCHVISION_VERSION}}" \
+       "torchaudio${TORCHAUDIO_VERSION:+==${TORCHAUDIO_VERSION}}"
+
+# Pinned transformers + gguf (from PyPI, not the ROCm index).
+RUN pip install gguf "transformers==${TRANSFORMERS_VERSION}"
+
+# --- ComfyUI + custom nodes + AMD studios ---
+# NOTE(on-host): every clone below floats HEAD upstream (--depth=1). Each has an ARG *_REF
+# so a specific sha/tag can be pinned at build time; leave blank = latest HEAD. These MUST
+# be sha-pinned on-host for reproducible builds — the provenance sha in the header pins only
+# THIS toolbox repo, not ComfyUI or the node/studio repos.
+ARG COMFYUI_REF=
+ARG ESSENTIALS_REF=
+ARG AMDGPUMONITOR_REF=
+ARG GGUF_REF=
+ARG QWEN_STUDIO_REF=
+ARG WAN_STUDIO_REF=
+
+# ComfyUI core.
+RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
+    && if [ -n "${COMFYUI_REF}" ]; then \
+         git -C /opt/ComfyUI fetch --depth=1 origin "${COMFYUI_REF}" \
+         && git -C /opt/ComfyUI checkout "${COMFYUI_REF}"; \
+       fi
+WORKDIR /opt/ComfyUI
+RUN pip install -r requirements.txt \
+    && pip install --prefer-binary \
+       pillow opencv-python-headless imageio imageio-ffmpeg scipy \
+       "huggingface_hub[hf_transfer]" pyyaml websocket-client
+
+# ComfyUI custom nodes.
+WORKDIR /opt/ComfyUI/custom_nodes
+RUN git clone --depth=1 https://github.com/cubiq/ComfyUI_essentials /opt/ComfyUI/custom_nodes/ComfyUI_essentials \
+    && if [ -n "${ESSENTIALS_REF}" ]; then \
+         git -C /opt/ComfyUI/custom_nodes/ComfyUI_essentials fetch --depth=1 origin "${ESSENTIALS_REF}" \
+         && git -C /opt/ComfyUI/custom_nodes/ComfyUI_essentials checkout "${ESSENTIALS_REF}"; \
+       fi
+RUN git clone --depth=1 https://github.com/kyuz0/ComfyUI-AMDGPUMonitor /opt/ComfyUI/custom_nodes/ComfyUI-AMDGPUMonitor \
+    && if [ -n "${AMDGPUMONITOR_REF}" ]; then \
+         git -C /opt/ComfyUI/custom_nodes/ComfyUI-AMDGPUMonitor fetch --depth=1 origin "${AMDGPUMONITOR_REF}" \
+         && git -C /opt/ComfyUI/custom_nodes/ComfyUI-AMDGPUMonitor checkout "${AMDGPUMONITOR_REF}"; \
+       fi
+RUN git clone --depth=1 https://github.com/city96/ComfyUI-GGUF /opt/ComfyUI/custom_nodes/ComfyUI-GGUF \
+    && if [ -n "${GGUF_REF}" ]; then \
+         git -C /opt/ComfyUI/custom_nodes/ComfyUI-GGUF fetch --depth=1 origin "${GGUF_REF}" \
+         && git -C /opt/ComfyUI/custom_nodes/ComfyUI-GGUF checkout "${GGUF_REF}"; \
+       fi
+
+# Qwen Image Studio.
+WORKDIR /opt
+RUN git clone --depth=1 https://github.com/kyuz0/qwen-image-studio /opt/qwen-image-studio \
+    && if [ -n "${QWEN_STUDIO_REF}" ]; then \
+         git -C /opt/qwen-image-studio fetch --depth=1 origin "${QWEN_STUDIO_REF}" \
+         && git -C /opt/qwen-image-studio checkout "${QWEN_STUDIO_REF}"; \
+       fi \
+    && pip install -r /opt/qwen-image-studio/requirements.txt
+
+# Wan Video Studio (explicit dep list per upstream, not its requirements.txt).
+RUN git clone --depth=1 https://github.com/kyuz0/wan-video-studio /opt/wan-video-studio \
+    && if [ -n "${WAN_STUDIO_REF}" ]; then \
+         git -C /opt/wan-video-studio fetch --depth=1 origin "${WAN_STUDIO_REF}" \
+         && git -C /opt/wan-video-studio checkout "${WAN_STUDIO_REF}"; \
+       fi \
+    && pip install --prefer-binary \
+       opencv-python-headless diffusers tokenizers accelerate \
+       "imageio[ffmpeg]" easydict ftfy dashscope imageio-ffmpeg decord librosa
+
+# --- Consumed asset trees (copied into this build context from upstream/comfyui) ---
+# Helper scripts (ComfyUI-only) -> /opt.
+COPY scripts/get_wan22.sh /opt/
+COPY scripts/set_extra_paths.sh /opt/
+COPY scripts/get_qwen_image.sh /opt/
+COPY scripts/get_hunyuan15.sh /opt/
+COPY scripts/get_ltx2.sh /opt/
+COPY scripts/benchmark_workflows.py /opt/
+COPY scripts/collect_perf_logs.py /opt/
+COPY scripts/model_manager.py /opt/
+
+# API workflow definitions + example inputs + UI workflows.
+COPY workflows/API /opt/comfy-workflows
+COPY workflows/input/ai-server.jpg /opt/ComfyUI/input/
+COPY workflows/input/ai-server-2.png /opt/ComfyUI/input/
+COPY workflows/input/example2.jpg /opt/ComfyUI/input/
+COPY workflows/*.json /opt/ComfyUI/user/default/workflows/
+
+# Permissions & trims (keep compilers/headers for Triton JIT at runtime).
+RUN chmod -R a+rwX /opt && chmod +x /opt/*.sh || true \
+    && find /opt/venv -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true \
+    && find /opt/venv -type d -name "__pycache__" -prune -exec rm -rf {} + \
+    && pip cache purge || true \
+    && rm -rf /root/.cache/pip || true
+
+# --- Interactive login shell wiring (/etc/profile.d) ---
+# The base already writes /etc/profile.d/rocm.sh (activates the venv + exports ROCM_PATH),
+# so the Fedora venv.sh is intentionally NOT ported. These add torch/AOTriton env, the login
+# banner, a PATH-last guard, and core-dump suppression.
+COPY scripts/01-rocm-envs.sh /etc/profile.d/01-rocm-envs.sh
+COPY scripts/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
+COPY scripts/zz-venv-last.sh /etc/profile.d/zz-venv-last.sh
+RUN chmod 0644 /etc/profile.d/01-rocm-envs.sh /etc/profile.d/99-toolbox-banner.sh /etc/profile.d/zz-venv-last.sh \
+    && printf 'ulimit -S -c 0\n' > /etc/profile.d/90-nocoredump.sh \
+    && chmod 0644 /etc/profile.d/90-nocoredump.sh
+
+WORKDIR /opt
+CMD ["/bin/bash"]

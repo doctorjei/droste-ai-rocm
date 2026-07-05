@@ -1,0 +1,128 @@
+name: build-rocm
+
+# Staged build. Phase 1 (this workflow): the two bases + a HIP-compile probe — the
+# go/no-go that pip `rocm-sdk-devel` actually compiles HIP for gfx1151 on x86 (no GPU
+# needed; HIP is ahead-of-time cross-compiled). The five ports join the matrix once
+# this is green. Images push to GHCR under ghcr.io/<owner>/droste-ai-rocm-<name>.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '*/Containerfile'
+      - '*/**'
+      - 'rocm-pin.env'
+      - '.github/workflows/build-rocm.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # ghcr.io/doctorjei/droste-ai-rocm-<name>
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+concurrency:
+  group: build-rocm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime-base:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load pin
+        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+      - name: Build & push rocm-runtime-base
+        run: |
+          IMG="${IMAGE_PREFIX}-runtime-base"
+          docker build \
+            --build-arg ROCM_INDEX_URL="${ROCM_INDEX_URL}" \
+            --build-arg ROCM_SDK_LIBRARIES_VERSION="${ROCM_SDK_LIBRARIES_VERSION}" \
+            --build-arg GFX_TARGET="${GFX_TARGET}" \
+            -f rocm-runtime-base/Containerfile \
+            -t "${IMG}:${GITHUB_SHA}" -t "${IMG}:latest" \
+            rocm-runtime-base
+          docker push "${IMG}:${GITHUB_SHA}"
+          docker push "${IMG}:latest"
+
+  build-base:
+    needs: runtime-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load pin
+        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+      - name: Build & push rocm-build-base
+        run: |
+          IMG="${IMAGE_PREFIX}-build-base"
+          docker build \
+            --build-arg BASE_IMAGE="${IMAGE_PREFIX}-runtime-base:${GITHUB_SHA}" \
+            --build-arg ROCM_INDEX_URL="${ROCM_INDEX_URL}" \
+            --build-arg ROCM_SDK_DEVEL_VERSION="${ROCM_SDK_DEVEL_VERSION}" \
+            --build-arg GFX_TARGET="${GFX_TARGET}" \
+            -f rocm-build-base/Containerfile \
+            -t "${IMG}:${GITHUB_SHA}" -t "${IMG}:latest" \
+            rocm-build-base
+          docker push "${IMG}:${GITHUB_SHA}"
+          docker push "${IMG}:latest"
+
+  hip-probe:
+    needs: build-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: HIP gfx1151 compile probe (the go/no-go)
+        run: |
+          docker run --rm "${IMAGE_PREFIX}-build-base:${GITHUB_SHA}" bash -lc '
+            set -euo pipefail
+            echo "== which hipcc / amdclang++ =="
+            command -v hipcc && command -v amdclang++
+            echo "== rocm-sdk path =="
+            rocm-sdk path --root && rocm-sdk path --cmake
+
+            echo "== hipcc device compile for gfx1151 =="
+            cat > /tmp/k.hip <<EOF
+          #include <hip/hip_runtime.h>
+          __global__ void add1(float* a){ a[threadIdx.x] += 1.0f; }
+          int main(){ return 0; }
+          EOF
+            hipcc --offload-arch=gfx1151 /tmp/k.hip -o /tmp/k
+            echo "HIPCC gfx1151 device compile: OK"
+
+            echo "== cmake find_package(hip) =="
+            mkdir -p /tmp/cm && cd /tmp/cm
+            cat > CMakeLists.txt <<EOF
+          cmake_minimum_required(VERSION 3.21)
+          project(probe LANGUAGES CXX)
+          find_package(hip REQUIRED)
+          message(STATUS "hip FOUND version=\${hip_VERSION}")
+          EOF
+            cmake -B build -DCMAKE_PREFIX_PATH="/opt/rocm-cmake;/opt/rocm" . >/dev/null
+            echo "find_package(hip): OK"
+            echo "=== CORE BET VALIDATED: pip rocm-sdk-devel compiles HIP for gfx1151 ==="
+          '
