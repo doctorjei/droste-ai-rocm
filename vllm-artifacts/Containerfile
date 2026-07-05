@@ -23,14 +23,18 @@ ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/
 ARG TORCH_VERSION=2.9.1+rocm7.13.0a20260501
 ARG GFX_TARGET=gfx1151
 
-# --- Clone pins. flash-attention/vLLM float their branch HEAD by default — FLAG: pin these to
-# a sha on-host for reproducibility (a flash-attention sha transitively pins its aiter +
-# composable_kernel submodules via the gitlink). FP8 kernels are pinned to upstream's default. ---
+# --- Clone pins. VLLM_REF is pinned to v0.16.0 — the newest vLLM stable tag that targets
+# torch 2.9.1 (its requirements/cuda.txt: torch==2.9.1). v0.16.1rc0+ bump to torch 2.10.0 and
+# add the csrc/libtorch_stable extension, which needs torch/csrc/stable/device.h (torch-2.10 ABI)
+# and fails to compile against our pinned torch 2.9.1. flash-attention still floats main_perf —
+# FLAG: pin FLASH_ATTENTION_REF to a ~Feb-2026 (v0.16.0-era) sha on-host for reproducibility (a
+# flash-attn sha transitively pins its aiter + composable_kernel submodules via the gitlink).
+# FP8 kernels are pinned to upstream's default. ---
 ARG FLASH_ATTENTION_REPO=https://github.com/ROCm/flash-attention.git
 ARG FLASH_ATTENTION_BRANCH=main_perf
 ARG FLASH_ATTENTION_REF=
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_REF=
+ARG VLLM_REF=v0.16.0
 ARG FP8_KERNELS_REPO=https://github.com/leonyurko/vllm-fp8-strix-halo-kernel-support.git
 ARG FP8_KERNELS_REF=50424f5525b8382353551e3301d0da56eca0be2b
 
