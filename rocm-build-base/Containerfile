@@ -30,19 +30,29 @@ RUN apt-get -qq update \
     && apt-get clean
 
 # TheRock ROCm SDK (build toolchain: amdclang++/hipcc, HIP headers, device bitcode, cmake
-# configs) into the SAME venv as the runtime kernels. The devel wheel's tree is expanded
-# LAZILY — `rocm-sdk init` eagerly materializes it (headers + device-lib links) so cmake/hipcc
-# work in later RUN layers. `rocm-sdk init` needs NO GPU (do NOT run `rocm-sdk test`, which does).
+# configs) into the SAME venv as the runtime kernels. rocm-sdk-devel overlays a separate
+# _rocm_sdk_devel tree (cmake configs that core lacks). That tree is expanded LAZILY — the
+# rocm-sdk locator CLI does NOT exist at this pin, so materialize it via the rocm_sdk_core
+# python API (_expand_devel_module, which is exactly what `rocm-sdk init` did): headers +
+# device-lib links so cmake/hipcc work in later RUN layers. No GPU needed (do NOT run tests).
 RUN pip install --index-url ${ROCM_INDEX_URL} \
        "rocm-sdk-devel==${ROCM_SDK_DEVEL_VERSION}" \
-    && rocm-sdk init
+    && python3 -c "from rocm_sdk_core._cli import _expand_devel_module as e; e()"
 
-# Re-point the stable symlinks now that devel is expanded, and stamp a cmake-config symlink so
-# HIP cmake builds in non-login RUN layers (profile.d is NOT sourced there) find hip-config.cmake.
-#   /opt/rocm         -> rocm-sdk path --root   (SDK root == ROCM_PATH; amdclang++ under lib/llvm/bin)
-#   /opt/rocm-cmake   -> rocm-sdk path --cmake  (dir containing hip-config.cmake -> CMAKE_PREFIX_PATH)
-RUN ln -sfn "$(rocm-sdk path --root)"  /opt/rocm \
-    && ln -sfn "$(rocm-sdk path --cmake)" /opt/rocm-cmake
+# Re-point /opt/rocm to the DEVEL tree now that it is expanded (build needs headers + hipcc +
+# cmake configs, which live under _rocm_sdk_devel, not core). No rocm-sdk CLI at this pin, so
+# resolve via the python API (_get_devel_module_path). cmake auto-appends lib/cmake/<pkg> under
+# each CMAKE_PREFIX_PATH entry, so we expose the SIBLING _rocm_sdk_* tree ROOTS at fixed,
+# python-version-agnostic paths for the static CMAKE_PREFIX_PATH below: /opt/rocm already covers
+# the devel tree (hip-config.cmake at /opt/rocm/lib/cmake); /opt/rocm-libs -> the libraries tree
+# root (discovered via glob) covers any rocBLAS/hipBLASLt configs shipped under the split
+# libraries wheel. (Cannot glob inside a Dockerfile ENV, so we bind fixed names here.)
+#   /opt/rocm      -> _get_devel_module_path()   (SDK root == ROCM_PATH; amdclang++ under lib/llvm/bin)
+#   /opt/rocm-libs -> _rocm_sdk_libraries_* tree  (extra cmake prefix for the runtime kernel wheel)
+RUN ROCM_DEVEL="$(python3 -c 'from rocm_sdk_core._cli import _get_devel_module_path as p; print(p())')" \
+    && ln -sfn "$ROCM_DEVEL" /opt/rocm \
+    && ROCM_LIBS="$(python3 -c "import sysconfig,glob,os; sp=sysconfig.get_paths()['purelib']; g=sorted(glob.glob(os.path.join(sp,'_rocm_sdk_libraries_*'))); print(g[0] if g else '')")" \
+    && [ -n "$ROCM_LIBS" ] && ln -sfn "$ROCM_LIBS" /opt/rocm-libs || true
 
 # Build env so `cmake -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151` / ds4 `make ROCM_PATH=` resolve
 # the pip-installed compiler + device libs. hipcc/amdclang++ are on /opt/venv/bin (PATH). The
@@ -50,7 +60,7 @@ RUN ln -sfn "$(rocm-sdk path --root)"  /opt/rocm \
 ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
     HIP_CLANG_PATH=/opt/rocm/lib/llvm/bin \
     HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode \
-    CMAKE_PREFIX_PATH=/opt/rocm-cmake:/opt/rocm \
+    CMAKE_PREFIX_PATH=/opt/rocm:/opt/rocm-libs \
     PATH=/opt/venv/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
 
 # gfx1151-only. Ports read this to pass -DAMDGPU_TARGETS / --offload-arch=${GFX_TARGET}.
