@@ -19,7 +19,8 @@ LABEL description="llama-artifacts: gfx1151 llama.cpp (turboquant fork) build ou
 # was itself at submodule commit 6318f02422ebcc40829d222107352934a6cc2fae — that is the provenance
 # of the patches/helper here, NOT a llama.cpp sha. FLAG: pin LLAMA_REF to a real fork sha on-host.
 ARG LLAMA_REPO=https://github.com/TheTom/llama-cpp-turboquant.git
-ARG LLAMA_REF=
+# LLAMA_REF resolved from branch feature/turboquant-kv-cache [default HEAD] (pinned 2026-07-05)
+ARG LLAMA_REF=337f08e82a861194fd5fc93121205c7c6bc81ddf
 
 # The consumed asset lives alongside this Containerfile (copied from the upstream toolbox
 # submodule so the build context is self-contained). It patches relative to the repo root (-p1).

@@ -23,8 +23,10 @@ LABEL description="ds4-artifacts: ds4 (gfx1151) compiled outputs as a FROM-scrat
 # ROCWMMA_REF: upstream used the branch `release/rocm-rel-7.2`. Kept as the default, but our SDK is
 #   now 7.13.0a (TheRock nightly) — rocWMMA-vs-SDK version alignment needs an on-host build test
 #   (see report). A branch is mutable; pin to a SHA once a known-good commit is confirmed on-host.
-ARG DS4_REF=rocm-multi-node
-ARG ROCWMMA_REF=release/rocm-rel-7.2
+# DS4_REF resolved from branch rocm-multi-node (pinned 2026-07-05)
+ARG DS4_REF=00e64ea8522aebb5d54e968cfcb3e27adcbaad57
+# ROCWMMA_REF resolved from branch release/rocm-rel-7.2 (pinned 2026-07-05)
+ARG ROCWMMA_REF=48b7db12a9ade97f0b7ab2ff9321ba0cbb4e5b77
 ARG DS4_REPO=https://github.com/kyuz0/ds4.git
 ARG ROCWMMA_REPO=https://github.com/ROCm/rocWMMA.git
 
@@ -36,8 +38,9 @@ ARG ROCWMMA_REPO=https://github.com/ROCm/rocWMMA.git
 # Debian OpenMP fix vs the Fedora source: /usr/lib64/libomp.so -> /usr/lib/x86_64-linux-gnu/libomp.so
 # (libomp-dev, already in rocm-build-base). Installed into $ROCM_PATH, then discarded with this
 # builder stage — nothing from rocWMMA reaches the /artifacts carrier.
-RUN git clone -b ${ROCWMMA_REF} --single-branch --depth 1 ${ROCWMMA_REPO} /tmp/rocWMMA \
-    && cd /tmp/rocWMMA \
+RUN mkdir -p /tmp/rocWMMA && cd /tmp/rocWMMA \
+    && git init -q && git remote add origin ${ROCWMMA_REPO} \
+    && git fetch --depth 1 origin ${ROCWMMA_REF} && git checkout -q FETCH_HEAD \
     && CC=amdclang CXX=amdclang++ \
        cmake -B build -S . -G Ninja \
          -DCMAKE_BUILD_TYPE=Release \

@@ -39,7 +39,8 @@ ARG GFX_TARGET=gfx1151
 #     unsloth_zoo is version-pinned below to match it. Do NOT bump unsloth without re-checking the
 #     unsloth_zoo pin (newer zoo drops sanitize_logprob / device_synchronize the commit relies on).
 ARG FLASH_ATTENTION_REPO=https://github.com/ROCm/flash-attention.git
-ARG FLASH_ATTENTION_REF=main_perf
+# FLASH_ATTENTION_REF resolved from branch main_perf (pinned 2026-07-05)
+ARG FLASH_ATTENTION_REF=3f94643fb41bcedded28c85185a8e11d42ef1592
 ARG UNSLOTH_REPO=https://github.com/unslothai/unsloth.git
 ARG UNSLOTH_REF=07a7ff47b1b2b37c088b8e0d7ed7bf8710d9aa22
 

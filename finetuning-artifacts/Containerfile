@@ -39,9 +39,11 @@ ARG GFX_TARGET=gfx1151
 #   * RCCL_REPO/RCCL_REF: kyuz0/rocm-systems @ branch gfx1151-rccl (a moving branch head).
 # Override with an immutable commit sha via --build-arg once locked on the Strix Halo / CI builder.
 ARG BITSANDBYTES_REPO=https://github.com/bitsandbytes-foundation/bitsandbytes.git
-ARG BITSANDBYTES_REF=main
+# BITSANDBYTES_REF resolved from branch main (pinned 2026-07-05)
+ARG BITSANDBYTES_REF=8ab26f751931610043f34938720d423bc80f5896
 ARG RCCL_REPO=https://github.com/kyuz0/rocm-systems.git
-ARG RCCL_REF=gfx1151-rccl
+# RCCL_REF resolved from branch gfx1151-rccl (pinned 2026-07-05)
+ARG RCCL_REF=a2686c9f41e44a75459e4771b7f380358432b294
 
 # Pinned torch into the build venv. bitsandbytes' hip build/packaging detects the installed ROCm
 # (and, for the runtime lib name, the torch/ROCm version) via the same interpreter it ships for.
@@ -85,8 +87,10 @@ RUN git clone "${BITSANDBYTES_REPO}" bitsandbytes \
 # hardcoded $ROCM_PATH/bin/hipcc, whose presence under the pip SDK root is unconfirmed (see notes).
 # Collect the real SONAME file (cp -L dereferences the librccl.so.1 symlink) into lib64.
 WORKDIR /opt
-RUN git clone -b "${RCCL_REF}" "${RCCL_REPO}" rocm-systems \
-    && cd rocm-systems/projects/rccl \
+RUN mkdir -p rocm-systems && cd rocm-systems \
+    && git init -q && git remote add origin "${RCCL_REPO}" \
+    && git fetch --depth 1 origin "${RCCL_REF}" && git checkout -q FETCH_HEAD \
+    && cd projects/rccl \
     && mkdir -p build_gfx1151 && cd build_gfx1151 \
     && HIPCC="$(command -v hipcc)" \
     && CXX="${HIPCC}" cmake .. \

@@ -32,7 +32,8 @@ ARG GFX_TARGET=gfx1151
 # FP8 kernels are pinned to upstream's default. ---
 ARG FLASH_ATTENTION_REPO=https://github.com/ROCm/flash-attention.git
 ARG FLASH_ATTENTION_BRANCH=main_perf
-ARG FLASH_ATTENTION_REF=
+# FLASH_ATTENTION_REF resolved from branch main_perf (pinned 2026-07-05)
+ARG FLASH_ATTENTION_REF=3f94643fb41bcedded28c85185a8e11d42ef1592
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 ARG VLLM_REF=v0.16.0
 ARG FP8_KERNELS_REPO=https://github.com/leonyurko/vllm-fp8-strix-halo-kernel-support.git

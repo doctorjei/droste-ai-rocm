@@ -59,12 +59,19 @@ RUN pip install gguf "transformers==${TRANSFORMERS_VERSION}"
 # so a specific sha/tag can be pinned at build time; leave blank = latest HEAD. These MUST
 # be sha-pinned on-host for reproducible builds — the provenance sha in the header pins only
 # THIS toolbox repo, not ComfyUI or the node/studio repos.
-ARG COMFYUI_REF=
-ARG ESSENTIALS_REF=
-ARG AMDGPUMONITOR_REF=
-ARG GGUF_REF=
-ARG QWEN_STUDIO_REF=
-ARG WAN_STUDIO_REF=
+# All resolved from each repo's default-branch HEAD (pinned 2026-07-05):
+# COMFYUI_REF: comfyanonymous/ComfyUI branch master
+# ESSENTIALS_REF: cubiq/ComfyUI_essentials branch main
+# AMDGPUMONITOR_REF: kyuz0/ComfyUI-AMDGPUMonitor branch main
+# GGUF_REF: city96/ComfyUI-GGUF branch main
+# QWEN_STUDIO_REF: kyuz0/qwen-image-studio branch main
+# WAN_STUDIO_REF: kyuz0/wan-video-studio branch main
+ARG COMFYUI_REF=985fb9d6adc974df9783d3d355cf86b992956212
+ARG ESSENTIALS_REF=9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
+ARG AMDGPUMONITOR_REF=0c584ed28ed3678d96f631a6eff91be397c0baa4
+ARG GGUF_REF=6ea2651e7df66d7585f6ffee804b20e92fb38b8a
+ARG QWEN_STUDIO_REF=5e6659aab39b88f27334cf6eaebbe9b6dbc2eefe
+ARG WAN_STUDIO_REF=b496fa3aa73b0aa628f1acb3d0b8f6de17570798
 
 # ComfyUI core.
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
