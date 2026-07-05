@@ -51,6 +51,11 @@ RUN pip install --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"
 # Carrier layout mirrors the other ports: wheels/ for pip-installables, lib64/ for raw .so.
 RUN mkdir -p /artifacts/wheels /artifacts/lib64
 
+# PEP517 build backends for the wheel repackage steps below. bitsandbytes main uses
+# scikit_build_core.setuptools.build_meta, and `pip wheel --no-build-isolation` requires the
+# backend to be importable in the venv already (torch does not pull it).
+RUN pip install --upgrade scikit-build-core setuptools wheel
+
 # --- bitsandbytes (ROCm / hip backend, gfx1151) ------------------------------------------------
 # In-source cmake (COMPUTE_BACKEND=hip) emits libbitsandbytes_rocm*.so into the package tree;
 # `pip wheel` then bundles that prebuilt .so. hipcc/HIP come from rocm-sdk-devel (ROCM_PATH set by

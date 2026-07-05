@@ -136,10 +136,12 @@ jobs:
           '
 
   # ── Ports, phase 2 ────────────────────────────────────────────────────────
-  # artifacts: real compiles against build-base (HIP/rocWMMA/flash-attn/aiter/
-  # bitsandbytes/RCCL). FROM-scratch carriers pushed to GHCR so the matching
-  # runtime job can COPY --from them. These are the heavy jobs.
-  artifacts:
+  # One job per port: build+push the artifacts carrier (heavy compiles against
+  # build-base — HIP/rocWMMA/flash-attn/aiter/bitsandbytes/RCCL), then build+push
+  # the runtime (FROM runtime-base + COPY --from the just-pushed artifacts). Each
+  # port is isolated (fail-fast:false) so one port's failure never skips another's
+  # runtime — a green artifacts always gets its runtime built in the same job.
+  port:
     needs: build-base
     runs-on: ubuntu-latest
     permissions:
@@ -182,35 +184,6 @@ jobs:
             GFX_TARGET=${{ env.GFX_TARGET }}
           cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:buildcache,mode=max
-
-  # runtimes: thin toolbox on runtime-base, COPY --from the pushed artifacts carrier.
-  runtimes:
-    needs: artifacts
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        name: [ds4, llama, vllm, finetuning]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          sudo docker image prune -af || true
-          df -h /
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Load pin
-        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v3
       - name: Build & push ${{ matrix.name }}-runtime
         uses: docker/build-push-action@v6
         with:

@@ -85,9 +85,11 @@ RUN mkdir -p /artifacts/wheels \
 # ---------------------------------------------------------------------------------------------
 # Rust toolchain for vLLM's PyO3/_rust_*.so parser extensions (setuptools-rust backend).
 # Fedora `dnf install rust cargo` -> Debian rustc/cargo. Kept after the flash-attn/aiter layers
-# so those stay cacheable.
+# so those stay cacheable. python3.13-dev supplies Python.h + the cp313 dev components CMake
+# FindPython(Development.Module/SABIModule) needs to configure vLLM's C++/HIP extensions against
+# the venv interpreter (rocm-build-base ships no python dev headers; only vLLM compiles _C here).
 RUN apt-get -qq update \
-    && apt-get -qq install -y --no-install-recommends rustc cargo \
+    && apt-get -qq install -y --no-install-recommends rustc cargo python3.13-dev \
     && rm -rf /var/lib/apt/lists/* && apt-get clean \
     && pip install "setuptools-rust>=1.9.0"
 
