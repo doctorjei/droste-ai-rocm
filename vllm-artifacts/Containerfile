@@ -88,8 +88,10 @@ RUN mkdir -p /artifacts/wheels \
 # so those stay cacheable. python3.13-dev supplies Python.h + the cp313 dev components CMake
 # FindPython(Development.Module/SABIModule) needs to configure vLLM's C++/HIP extensions against
 # the venv interpreter (rocm-build-base ships no python dev headers; only vLLM compiles _C here).
+# libdrm-dev: torch's LoadHIP.cmake runs pkg_check_modules(libdrm) via rocm_smi-config.cmake
+# when vLLM does find_package(Torch); needs libdrm.pc + headers (rocm-build-base ships neither).
 RUN apt-get -qq update \
-    && apt-get -qq install -y --no-install-recommends rustc cargo python3.13-dev \
+    && apt-get -qq install -y --no-install-recommends rustc cargo python3.13-dev libdrm-dev \
     && rm -rf /var/lib/apt/lists/* && apt-get clean \
     && pip install "setuptools-rust>=1.9.0"
 

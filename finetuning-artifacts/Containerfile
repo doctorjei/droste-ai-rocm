@@ -56,6 +56,13 @@ RUN mkdir -p /artifacts/wheels /artifacts/lib64
 # backend to be importable in the venv already (torch does not pull it).
 RUN pip install --upgrade scikit-build-core setuptools wheel
 
+# libdrm-dev: RCCL's rocm_smi headers include <libdrm/drm.h>, and torch's LoadHIP.cmake runs
+# pkg_check_modules(libdrm) via rocm_smi-config.cmake. Provides the headers + libdrm.pc for the
+# bitsandbytes/RCCL/flash-attn compiles below (rocm-build-base ships neither).
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends libdrm-dev \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean
+
 # --- bitsandbytes (ROCm / hip backend, gfx1151) ------------------------------------------------
 # In-source cmake (COMPUTE_BACKEND=hip) emits libbitsandbytes_rocm*.so into the package tree;
 # `pip wheel` then bundles that prebuilt .so. hipcc/HIP come from rocm-sdk-devel (ROCM_PATH set by
