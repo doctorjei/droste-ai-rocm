@@ -40,13 +40,14 @@ RUN pip install --index-url ${ROCM_INDEX_URL} \
        "rocm[devel]==${ROCM_SDK_DEVEL_VERSION}" \
     && rocm-sdk init
 
-# Point /opt/rocm at the SDK root and /opt/rocm-cmake at the cmake dir, both via the `rocm-sdk
-# path` CLI (now available from the meta). After `init`, the root is the full expanded tree —
-# headers + hipcc + cmake configs. cmake auto-appends lib/cmake/<pkg> under each prefix entry.
-#   /opt/rocm       -> rocm-sdk path --root   (ROCM_PATH; amdclang++ under lib/llvm/bin)
-#   /opt/rocm-cmake -> rocm-sdk path --cmake  (dir with hip-config.cmake -> CMAKE_PREFIX_PATH)
-RUN ln -sfn "$(rocm-sdk path --root)"  /opt/rocm \
-    && ln -sfn "$(rocm-sdk path --cmake)" /opt/rocm-cmake
+# Point /opt/rocm at the SDK root via `rocm-sdk path --root` (available from the meta; after
+# `init` the root is the full expanded tree — headers + hipcc + cmake configs at lib/cmake).
+# Do NOT create a separate /opt/rocm-cmake symlink to `path --cmake`: hip-config.cmake computes
+# its package prefix by walking UP from its own location (<root>/lib/cmake/hip -> ../../.. ->
+# <root>), so a flattened symlink to the cmake dir makes that walk-up overshoot to '/', yielding
+# an empty prefix (hip_INCLUDE_DIR=//include -> CMake Error). Pointing CMAKE_PREFIX_PATH at the
+# tree ROOT lets cmake find lib/cmake/hip AND resolve the prefix back to <root>/include.
+RUN ln -sfn "$(rocm-sdk path --root)" /opt/rocm
 
 # Build env so `cmake -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151` / ds4 `make ROCM_PATH=` resolve
 # the pip-installed compiler + device libs. hipcc/amdclang++ are on /opt/venv/bin (PATH). The
@@ -54,7 +55,7 @@ RUN ln -sfn "$(rocm-sdk path --root)"  /opt/rocm \
 ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
     HIP_CLANG_PATH=/opt/rocm/lib/llvm/bin \
     HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode \
-    CMAKE_PREFIX_PATH=/opt/rocm-cmake:/opt/rocm \
+    CMAKE_PREFIX_PATH=/opt/rocm \
     PATH=/opt/venv/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH
 
 # gfx1151-only. Ports read this to pass -DAMDGPU_TARGETS / --offload-arch=${GFX_TARGET}.

@@ -130,7 +130,7 @@ jobs:
           find_package(hip REQUIRED)
           message(STATUS "hip FOUND version=\${hip_VERSION}")
           EOF
-            cmake -B build -DCMAKE_PREFIX_PATH="/opt/rocm-cmake;/opt/rocm" . >/dev/null
+            cmake -B build -DCMAKE_PREFIX_PATH="/opt/rocm" . >/dev/null
             echo "find_package(hip): OK"
             echo "=== CORE BET VALIDATED: pip rocm-sdk-devel compiles HIP for gfx1151 ==="
           '
