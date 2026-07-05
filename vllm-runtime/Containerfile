@@ -40,10 +40,14 @@ COPY patch_aiter_headers.py /opt/patch_aiter_headers.py
 #     used by aiter's RUNTIME JIT on gfx1151 (the artifacts stage patched its own copy; the
 #     shipped wheel is pre-patch, so patch it again here).
 #  3. vLLM wheel WITH deps so pip resolves transformers/etc. from PyPI (torch already satisfied).
+#     vLLM's dependency graph overflows pip resolvelib's default 1000-frame recursion limit
+#     (RecursionError in _has_route_to_root), so run this one install through python with a raised
+#     limit, inside a large-stack thread so the deeper recursion doesn't hit the C stack ceiling.
 #  4. ray (upstream installs it explicitly; used by the cluster launcher paths).
 RUN pip install --no-deps /tmp/wheels/amd_aiter*.whl /tmp/wheels/flash_attn*.whl \
     && python /opt/patch_aiter_headers.py \
-    && pip install /tmp/wheels/vllm*.whl \
+    && VLLM_WHL="$(ls /tmp/wheels/vllm*.whl)" \
+    && python -c "import sys, threading; sys.setrecursionlimit(100000); threading.stack_size(512*1024*1024); from pip._internal.cli.main import main; r=[]; t=threading.Thread(target=lambda: r.append(main(['install', sys.argv[1]]))); t.start(); t.join(); sys.exit(r[0] if r else 1)" "$VLLM_WHL" \
     && pip install ray \
     && rm -rf /tmp/wheels /root/.cache/pip
 
