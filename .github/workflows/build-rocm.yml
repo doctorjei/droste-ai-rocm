@@ -40,18 +40,22 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Load pin
         run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
       - name: Build & push rocm-runtime-base
-        run: |
-          IMG="${IMAGE_PREFIX}-runtime-base"
-          docker build \
-            --build-arg ROCM_INDEX_URL="${ROCM_INDEX_URL}" \
-            --build-arg ROCM_SDK_LIBRARIES_VERSION="${ROCM_SDK_LIBRARIES_VERSION}" \
-            --build-arg GFX_TARGET="${GFX_TARGET}" \
-            -f rocm-runtime-base/Containerfile \
-            -t "${IMG}:${GITHUB_SHA}" -t "${IMG}:latest" \
-            rocm-runtime-base
-          docker push "${IMG}:${GITHUB_SHA}"
-          docker push "${IMG}:latest"
+        uses: docker/build-push-action@v6
+        with:
+          context: rocm-runtime-base
+          file: rocm-runtime-base/Containerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}-runtime-base:latest
+          build-args: |
+            ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
+            ROCM_SDK_LIBRARIES_VERSION=${{ env.ROCM_SDK_LIBRARIES_VERSION }}
+            GFX_TARGET=${{ env.GFX_TARGET }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-runtime-base:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-runtime-base:buildcache,mode=max
 
   build-base:
     needs: runtime-base
@@ -69,19 +73,23 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Load pin
         run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
       - name: Build & push rocm-build-base
-        run: |
-          IMG="${IMAGE_PREFIX}-build-base"
-          docker build \
-            --build-arg BASE_IMAGE="${IMAGE_PREFIX}-runtime-base:${GITHUB_SHA}" \
-            --build-arg ROCM_INDEX_URL="${ROCM_INDEX_URL}" \
-            --build-arg ROCM_SDK_DEVEL_VERSION="${ROCM_SDK_DEVEL_VERSION}" \
-            --build-arg GFX_TARGET="${GFX_TARGET}" \
-            -f rocm-build-base/Containerfile \
-            -t "${IMG}:${GITHUB_SHA}" -t "${IMG}:latest" \
-            rocm-build-base
-          docker push "${IMG}:${GITHUB_SHA}"
-          docker push "${IMG}:latest"
+        uses: docker/build-push-action@v6
+        with:
+          context: rocm-build-base
+          file: rocm-build-base/Containerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-build-base:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}-build-base:latest
+          build-args: |
+            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
+            ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
+            ROCM_SDK_DEVEL_VERSION=${{ env.ROCM_SDK_DEVEL_VERSION }}
+            GFX_TARGET=${{ env.GFX_TARGET }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-build-base:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-build-base:buildcache,mode=max
 
   hip-probe:
     needs: build-base

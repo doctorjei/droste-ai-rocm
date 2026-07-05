@@ -45,26 +45,22 @@ RUN apt-get -qq update \
 
 # Python venv with the TheRock gfx1151 RUNTIME kernels. Debian 13 is PEP668
 # externally-managed, so we install into a venv (preferred, matches therock-torch-base)
-# rather than --break-system-packages. Install BOTH rocm-sdk-core (rocminfo, rocm-smi,
-# hipcc, offload-arch console scripts + the HIP runtime .so / full _rocm_sdk_core tree)
-# AND rocm-sdk-libraries-gfx1151 (rocBLAS/hipBLASLt/MIOpen in its own _rocm_sdk_libraries_
-# gfx1151 tree) at the SAME date pin. NOTE: the rocm-sdk META package / locator CLI is NOT
-# published at this nightly — path resolution is done via the rocm_sdk_core python API below.
+# rather than --break-system-packages. Install the `rocm` meta with the [libraries] extra:
+# `rocm[libraries]` == rocm (provides the `rocm-sdk` CLI + rocm_sdk module) + rocm-sdk-core
+# (rocminfo/rocm-smi/hipcc console scripts + the HIP runtime .so / _rocm_sdk_core tree) +
+# rocm-sdk-libraries-gfx1151 (rocBLAS/hipBLASLt/MIOpen in its own _rocm_sdk_libraries_gfx1151
+# tree). Installing the meta (not the bare leaves) is what makes `rocm-sdk path` work below.
 RUN python3 -m venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH PIP_NO_CACHE_DIR=1
 RUN pip install --upgrade pip setuptools wheel \
     && pip install --index-url ${ROCM_INDEX_URL} \
-       "rocm-sdk-core==${ROCM_SDK_LIBRARIES_VERSION}" \
-       "rocm-sdk-libraries-${GFX_TARGET}==${ROCM_SDK_LIBRARIES_VERSION}"
+       "rocm[libraries]==${ROCM_SDK_LIBRARIES_VERSION}"
 
-# Pin a stable /opt/rocm -> pip SDK core root so ROCM_PATH is version/python-agnostic (the
-# real root lives under /opt/venv/lib/pythonX.Y/site-packages/_rocm_sdk_core). There is no
-# rocm-sdk locator CLI at this pin, so resolve the core root via the rocm_sdk_core python API
-# (_get_core_module_path). ld.so wiring lets the runtime .so resolve for non-venv procs: emit
-# /opt/rocm/lib{,64} FIRST, then every sibling _rocm_sdk_*/lib tree (so rocBLAS/hipBLASLt/MIOpen
-# from the split libraries wheel resolve too), then ldconfig.
-RUN ROCM_CORE="$(python3 -c 'from rocm_sdk_core._cli import _get_core_module_path as p; print(p())')" \
-    && ln -sfn "$ROCM_CORE" /opt/rocm \
+# Pin a stable /opt/rocm -> pip SDK root (version/python-agnostic) via the `rocm-sdk path` CLI
+# (available now that the meta is installed). ld.so wiring lets the runtime .so resolve for
+# non-venv procs: emit /opt/rocm/lib{,64} FIRST, then every sibling _rocm_sdk_*/lib tree (so
+# rocBLAS/hipBLASLt/MIOpen from the split libraries wheel resolve too), then ldconfig.
+RUN ln -sfn "$(rocm-sdk path --root)" /opt/rocm \
     && printf '/opt/rocm/lib\n/opt/rocm/lib64\n' > /etc/ld.so.conf.d/rocm.conf \
     && python3 -c "import sysconfig,glob,os; sp=sysconfig.get_paths()['purelib']; print('\n'.join(glob.glob(os.path.join(sp,'_rocm_sdk_*','lib'))))" >> /etc/ld.so.conf.d/rocm.conf \
     && ldconfig
@@ -74,12 +70,11 @@ ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
     PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
 
 # Real /etc/profile.d/rocm.sh (the old llama Containerfile wrote EMPTY here — bug). Activates
-# the venv and re-derives ROCM_PATH from the rocm_sdk_core python API at login time (robust
-# across python minor bumps / distrobox; there is no rocm-sdk CLI at this pin), falling back to
-# /opt/rocm, then exports the HIP/PATH/LD env for interactive shells.
+# the venv and re-derives ROCM_PATH from `rocm-sdk path` at login time (robust across python
+# minor bumps / distrobox), falling back to /opt/rocm, then exports the HIP/PATH/LD env.
 RUN printf '%s\n' \
     'source /opt/venv/bin/activate' \
-    'ROCM_PATH="$(python3 -c '\''from rocm_sdk_core._cli import _get_core_module_path as p; print(p())'\'' 2>/dev/null || echo /opt/rocm)"' \
+    'ROCM_PATH="$(rocm-sdk path --root 2>/dev/null || echo /opt/rocm)"' \
     'export ROCM_PATH HIP_PATH="$ROCM_PATH"' \
     'export PATH="$ROCM_PATH/bin:/opt/venv/bin:$PATH"' \
     'export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib64:$LD_LIBRARY_PATH"' \
