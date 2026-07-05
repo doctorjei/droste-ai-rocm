@@ -48,7 +48,7 @@ ARG UNSLOTH_REF=07a7ff47b1b2b37c088b8e0d7ed7bf8710d9aa22
 # the HF wheels + flash-attn (Triton backend) + unsloth are pure-Python/prebuilt, no C toolchain.
 RUN apt-get -qq update \
     && apt-get -qq install -y --no-install-recommends \
-       git curl patch \
+       git curl patch libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
