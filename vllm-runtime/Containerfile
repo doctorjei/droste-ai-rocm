@@ -24,9 +24,11 @@ ARG GFX_TARGET=gfx1151
 # exact torch that 2.9.1 doesn't satisfy, pip will try to replace it — reconcile on-host.
 RUN pip install --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"
 
-# vLLM's numa runtime dep (libnuma.so.1). Small; keeps `import vllm` from failing on numa lookup.
+# Runtime libs: libnuma (vLLM numa lookup on `import vllm`) + libgomp1 — torch links
+# libgomp.so.1 (OpenMP), which the lean rocm-runtime-base does NOT carry, so `import torch`
+# (and thus `import vllm`) fails without it. Verified on gfx1151 hardware 2026-07-06.
 RUN apt-get -qq update \
-    && apt-get -qq install -y --no-install-recommends libnuma1 numactl \
+    && apt-get -qq install -y --no-install-recommends libnuma1 numactl libgomp1 \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 
 # Prebuilt wheels + the pure-python FP8 kernel tree from vllm-artifacts.

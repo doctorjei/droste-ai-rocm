@@ -14,6 +14,13 @@ FROM ${BASE_IMAGE}
 
 LABEL description="llama-runtime: gfx1151 llama.cpp (turboquant) toolbox on rocm-runtime-base"
 
+# libgomp1: llama-server links libgomp.so.1 (OpenMP); the lean rocm-runtime-base doesn't carry
+# it, so the binary fails at load with "libgomp.so.1: cannot open shared object file". Verified
+# on gfx1151 hardware 2026-07-06.
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean
+
 # Drop llama.cpp's compiled outputs onto the runtime: bins → /usr/local/bin, libllama/libggml
 # → /usr/local/lib64, vram helper → /usr/local/bin (executable). /usr/local/lib{,64} are already
 # on the base's ld path via /etc/ld.so.conf.d (rocm.conf) — add local.conf + ldconfig to be sure.
