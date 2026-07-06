@@ -99,4 +99,4 @@ RUN echo "=== /artifacts/wheels ===" && ls -1 /artifacts/wheels
 # --- Final carrier: ONLY the wheels + FP8 kernel tree
 FROM scratch
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
-COPY --from=build /artifacts /artifacts
+COPY --from=builder /artifacts /artifacts

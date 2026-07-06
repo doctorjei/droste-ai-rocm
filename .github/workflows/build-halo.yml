@@ -1,27 +1,33 @@
-name: build-rocm
+name: build-halo
 
-# Staged build. Phase 1 (this workflow): the two bases + a HIP-compile probe — the
-# go/no-go that pip `rocm-sdk-devel` actually compiles HIP for gfx1151 on x86 (no GPU
-# needed; HIP is ahead-of-time cross-compiled). The five ports join the matrix once
-# this is green. Images push to GHCR under ghcr.io/<owner>/droste-ai-rocm-<name>.
+# Staged build for the droste *-halo (gfx1151 / Strix Halo) image set.
+#   base/        → droste-runtime-base-halo, droste-build-base-halo
+#   scaffolding/ → droste-<app>-build-halo   (FROM scratch carriers)
+#   targets/     → droste-<app>-halo         (shippable runtimes + comfyui)
+# Images push to GHCR as ghcr.io/<owner>/droste-<name>-halo.
+# Image names follow the Containerfile ARG scheme ${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}.
 
 on:
   push:
     branches: [main]
     paths:
-      - '*/Containerfile'
-      - '*/**'
-      - 'rocm-pin.env'
-      - '.github/workflows/build-rocm.yml'
+      - 'base/**'
+      - 'scaffolding/**'
+      - '!scaffolding/check-rocm.sh'
+      - '!scaffolding/_fedora-src/**'
+      - 'targets/**'
+      - 'ci/**'
+      - 'rocm-version.env'
+      - '.github/workflows/build-halo.yml'
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  # ghcr.io/doctorjei/droste-ai-rocm-<name>
-  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+  # ghcr.io/<owner>/droste-<name>-halo
+  NS: ghcr.io/${{ github.repository_owner }}
 
 concurrency:
-  group: build-rocm-${{ github.ref }}
+  group: build-halo-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -39,23 +45,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Load pin
-        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+        run: |
+          set -a; . ./rocm-version.env; set +a
+          for k in GFX_TARGET ROCM_INDEX_URL ROCM_PIN TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION ROCM_SDK_DEVEL_VERSION ROCM_SDK_LIBRARIES_VERSION; do
+            printf '%s=%s\n' "$k" "${!k}" >> "$GITHUB_ENV"
+          done
       - uses: docker/setup-buildx-action@v3
-      - name: Build & push rocm-runtime-base
+      - name: Build & push droste-runtime-base-halo
         uses: docker/build-push-action@v6
         with:
-          context: rocm-runtime-base
-          file: rocm-runtime-base/Containerfile
+          context: ci/empty
+          file: base/Container.runtime
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
-            ${{ env.IMAGE_PREFIX }}-runtime-base:latest
+            ${{ env.NS }}/droste-runtime-base-halo:${{ github.sha }}
+            ${{ env.NS }}/droste-runtime-base-halo:latest
           build-args: |
             ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
             ROCM_SDK_LIBRARIES_VERSION=${{ env.ROCM_SDK_LIBRARIES_VERSION }}
             GFX_TARGET=${{ env.GFX_TARGET }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-runtime-base:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-runtime-base:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.NS }}/droste-runtime-base-halo:buildcache
+          cache-to: type=registry,ref=${{ env.NS }}/droste-runtime-base-halo:buildcache,mode=max
 
   build-base:
     needs: runtime-base
@@ -72,24 +82,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Load pin
-        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+        run: |
+          set -a; . ./rocm-version.env; set +a
+          for k in GFX_TARGET ROCM_INDEX_URL ROCM_PIN TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION ROCM_SDK_DEVEL_VERSION ROCM_SDK_LIBRARIES_VERSION; do
+            printf '%s=%s\n' "$k" "${!k}" >> "$GITHUB_ENV"
+          done
       - uses: docker/setup-buildx-action@v3
-      - name: Build & push rocm-build-base
+      - name: Build & push droste-build-base-halo
         uses: docker/build-push-action@v6
         with:
-          context: rocm-build-base
-          file: rocm-build-base/Containerfile
+          context: ci/empty
+          file: base/Container.build
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}-build-base:${{ github.sha }}
-            ${{ env.IMAGE_PREFIX }}-build-base:latest
+            ${{ env.NS }}/droste-build-base-halo:${{ github.sha }}
+            ${{ env.NS }}/droste-build-base-halo:latest
           build-args: |
-            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
+            BASE_IMAGE=${{ env.NS }}/droste-runtime-base-halo:${{ github.sha }}
             ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
             ROCM_SDK_DEVEL_VERSION=${{ env.ROCM_SDK_DEVEL_VERSION }}
             GFX_TARGET=${{ env.GFX_TARGET }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-build-base:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-build-base:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.NS }}/droste-build-base-halo:buildcache
+          cache-to: type=registry,ref=${{ env.NS }}/droste-build-base-halo:buildcache,mode=max
 
   hip-probe:
     needs: build-base
@@ -106,7 +120,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: HIP gfx1151 compile probe (the go/no-go)
         run: |
-          docker run --rm "${IMAGE_PREFIX}-build-base:${GITHUB_SHA}" bash -lc '
+          docker run --rm "${NS}/droste-build-base-halo:${GITHUB_SHA}" bash -lc '
             set -euo pipefail
             echo "== which hipcc / amdclang++ =="
             command -v hipcc && command -v amdclang++
@@ -137,10 +151,10 @@ jobs:
 
   # ── Ports, phase 2 ────────────────────────────────────────────────────────
   # One job per port: build+push the artifacts carrier (heavy compiles against
-  # build-base — HIP/rocWMMA/flash-attn/aiter/bitsandbytes/RCCL), then build+push
-  # the runtime (FROM runtime-base + COPY --from the just-pushed artifacts). Each
-  # port is isolated (fail-fast:false) so one port's failure never skips another's
-  # runtime — a green artifacts always gets its runtime built in the same job.
+  # build-base), then build+push the runtime (FROM runtime-base + COPY --from the
+  # just-pushed artifacts). fail-fast:false so one port never skips another.
+  # art_ctx / rt_ctx name each stage's build context: ci/empty for asset-less
+  # images, the asset dir for ones that COPY local files.
   port:
     needs: build-base
     runs-on: ubuntu-latest
@@ -150,7 +164,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [ds4, llama, vllm, finetuning]
+        include:
+          - { name: ds4,        art_ctx: ci/empty,                    rt_ctx: ci/empty }
+          - { name: llama,      art_ctx: scaffolding/llama-artifacts, rt_ctx: ci/empty }
+          - { name: vllm,       art_ctx: scaffolding/vllm-artifacts,  rt_ctx: targets/vllm }
+          - { name: finetuning, art_ctx: ci/empty,                    rt_ctx: targets/finetuning }
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -166,41 +184,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Load pin
-        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+        run: |
+          set -a; . ./rocm-version.env; set +a
+          for k in GFX_TARGET ROCM_INDEX_URL ROCM_PIN TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION ROCM_SDK_DEVEL_VERSION ROCM_SDK_LIBRARIES_VERSION; do
+            printf '%s=%s\n' "$k" "${!k}" >> "$GITHUB_ENV"
+          done
       - uses: docker/setup-buildx-action@v3
-      - name: Build & push ${{ matrix.name }}-artifacts
+      - name: Build & push droste-${{ matrix.name }}-build-halo
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.name }}-artifacts
-          file: ${{ matrix.name }}-artifacts/Containerfile
+          context: ${{ matrix.art_ctx }}
+          file: scaffolding/Container.${{ matrix.name }}-build
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:${{ github.sha }}
-            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:latest
+            ${{ env.NS }}/droste-${{ matrix.name }}-build-halo:${{ github.sha }}
+            ${{ env.NS }}/droste-${{ matrix.name }}-build-halo:latest
           build-args: |
-            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-build-base:${{ github.sha }}
+            BASE_IMAGE=${{ env.NS }}/droste-build-base-halo:${{ github.sha }}
             ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
             TORCH_VERSION=${{ env.TORCH_VERSION }}
             GFX_TARGET=${{ env.GFX_TARGET }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:buildcache,mode=max
-      - name: Build & push ${{ matrix.name }}-runtime
+          cache-from: type=registry,ref=${{ env.NS }}/droste-${{ matrix.name }}-build-halo:buildcache
+          cache-to: type=registry,ref=${{ env.NS }}/droste-${{ matrix.name }}-build-halo:buildcache,mode=max
+      - name: Build & push droste-${{ matrix.name }}-halo
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.name }}-runtime
-          file: ${{ matrix.name }}-runtime/Containerfile
+          context: ${{ matrix.rt_ctx }}
+          file: targets/Container.${{ matrix.name }}
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:${{ github.sha }}
-            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:latest
+            ${{ env.NS }}/droste-${{ matrix.name }}-halo:${{ github.sha }}
+            ${{ env.NS }}/droste-${{ matrix.name }}-halo:latest
           build-args: |
-            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
-            ARTIFACTS_IMAGE=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-artifacts:${{ github.sha }}
+            BASE_IMAGE=${{ env.NS }}/droste-runtime-base-halo:${{ github.sha }}
+            ARTIFACTS_IMAGE=${{ env.NS }}/droste-${{ matrix.name }}-build-halo:${{ github.sha }}
             ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
             TORCH_VERSION=${{ env.TORCH_VERSION }}
             GFX_TARGET=${{ env.GFX_TARGET }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.name }}-runtime:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.NS }}/droste-${{ matrix.name }}-halo:buildcache
+          cache-to: type=registry,ref=${{ env.NS }}/droste-${{ matrix.name }}-halo:buildcache,mode=max
 
   # comfyui: single interactive image (no compile; torch wheels + pip). FROM runtime-base.
   comfyui:
@@ -224,22 +246,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Load pin
-        run: grep -vE '^\s*(#|$)' rocm-pin.env | sed 's/[[:space:]]*#.*//' >> "$GITHUB_ENV"
+        run: |
+          set -a; . ./rocm-version.env; set +a
+          for k in GFX_TARGET ROCM_INDEX_URL ROCM_PIN TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION ROCM_SDK_DEVEL_VERSION ROCM_SDK_LIBRARIES_VERSION; do
+            printf '%s=%s\n' "$k" "${!k}" >> "$GITHUB_ENV"
+          done
       - uses: docker/setup-buildx-action@v3
-      - name: Build & push comfyui-toolbox
+      - name: Build & push droste-comfyui-halo
         uses: docker/build-push-action@v6
         with:
-          context: comfyui-toolbox
-          file: comfyui-toolbox/Containerfile
+          context: targets/comfyui
+          file: targets/Container.comfyui
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}-comfyui:${{ github.sha }}
-            ${{ env.IMAGE_PREFIX }}-comfyui:latest
+            ${{ env.NS }}/droste-comfyui-halo:${{ github.sha }}
+            ${{ env.NS }}/droste-comfyui-halo:latest
           build-args: |
-            BASE_IMAGE=${{ env.IMAGE_PREFIX }}-runtime-base:${{ github.sha }}
+            BASE_IMAGE=${{ env.NS }}/droste-runtime-base-halo:${{ github.sha }}
             ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
             TORCH_VERSION=${{ env.TORCH_VERSION }}
             TORCHVISION_VERSION=${{ env.TORCHVISION_VERSION }}
             TORCHAUDIO_VERSION=${{ env.TORCHAUDIO_VERSION }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-comfyui:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}-comfyui:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.NS }}/droste-comfyui-halo:buildcache
+          cache-to: type=registry,ref=${{ env.NS }}/droste-comfyui-halo:buildcache,mode=max

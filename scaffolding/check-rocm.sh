@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# check-rocm.sh — runtime validation sweep for the droste-ai-rocm gfx1151 images.
+# check-rocm.sh — runtime validation sweep for the droste *-halo (gfx1151 / Strix Halo) images.
 #
 # CI proves these images BUILD and ahead-of-time COMPILE for gfx1151 on x86 (no GPU).
 # This script proves they RUN on real hardware — the one thing CI cannot do. Run it ON a
 # gfx1151 host (Strix Halo) that exposes /dev/kfd + /dev/dri (or a rootful LXC on such a host).
 #
-# It sweeps only the RUNNABLE images. The four *-artifacts images are FROM scratch (they carry
-# only /artifacts for the matching -runtime to COPY --from) and cannot run anything, so they are
+# It sweeps only the RUNNABLE images. The four *-build carriers are FROM scratch (they carry
+# only /artifacts for the matching runtime to COPY --from) and cannot run anything, so they are
 # skipped by design. build-base is a compile toolchain, not a runtime, and is skipped too.
+#
+# Image names follow the ${SERIES}-<tier>-${ARCH} scheme (default droste-<tier>-halo), matching
+# the Containerfile ARG convention. Flip --arch when a future gfx target ships.
 #
 # Checks are two tiers:
 #   CORE  — deterministic, must pass: GPU enumerates as gfx1151; torch sees the GPU.
@@ -19,7 +22,8 @@ set -euo pipefail
 # ── Config (env or flags) ────────────────────────────────────────────────────
 REGISTRY="${REGISTRY:-ghcr.io}"
 OWNER="${OWNER:-doctorjei}"
-PREFIX="${PREFIX:-droste-ai-rocm}"   # image base name: <REGISTRY>/<OWNER>/<PREFIX>-<tier>
+SERIES="${SERIES:-droste}"            # image name: <REGISTRY>/<OWNER>/<SERIES>-<tier>-<ARCH>
+ARCH="${ARCH:-halo}"                  # hardware line (halo = Strix Halo / gfx1151)
 TAG="${TAG:-latest}"
 RUNTIME="${RUNTIME:-podman}"          # podman | docker
 PULL=0                                # --pull: pull each image before checking
@@ -27,7 +31,7 @@ GFX="${GFX:-gfx1151}"
 
 usage() {
   cat <<EOF
-check-rocm.sh — runtime validation sweep for the droste-ai-rocm gfx1151 images.
+check-rocm.sh — runtime validation sweep for the droste *-halo (gfx1151) images.
 
 USAGE:
   ./check-rocm.sh [options]
@@ -36,7 +40,8 @@ OPTIONS:
   --tag <tag>         Image tag to check (default: ${TAG}; e.g. a commit sha for a pinned run)
   --owner <owner>     GHCR owner/org (default: ${OWNER})
   --registry <reg>    Registry host (default: ${REGISTRY})
-  --prefix <name>     Image name prefix (default: ${PREFIX})
+  --series <name>     Image series prefix (default: ${SERIES})
+  --arch <name>       Hardware-line suffix (default: ${ARCH})
   --runtime <r>       Container runtime: podman or docker (default: ${RUNTIME})
   --pull              Pull each image before checking
   -h, --help          Show this help
@@ -56,7 +61,8 @@ while [[ $# -gt 0 ]]; do
     --tag)      TAG="$2"; shift 2 ;;
     --owner)    OWNER="$2"; shift 2 ;;
     --registry) REGISTRY="$2"; shift 2 ;;
-    --prefix)   PREFIX="$2"; shift 2 ;;
+    --series)   SERIES="$2"; shift 2 ;;
+    --arch)     ARCH="$2"; shift 2 ;;
     --runtime)  RUNTIME="$2"; shift 2 ;;
     --pull)     PULL=1; shift ;;
     -h|--help)  usage; exit 0 ;;
@@ -74,11 +80,11 @@ if [[ "$RUNTIME" == "podman" ]]; then
   DEVICE_ARGS+=(--group-add keep-groups --security-opt seccomp=unconfined)
 fi
 
-img() { echo "${REGISTRY}/${OWNER}/${PREFIX}-$1:${TAG}"; }
+img() { echo "${REGISTRY}/${OWNER}/${SERIES}-$1-${ARCH}:${TAG}"; }
 
 PASS=0 ; FAIL=0 ; FAILED_NAMES=""
 
-# run_check <label> <tier-image-suffix> <shell-command-run-via-bash-lc>
+# run_check <label> <tier> <shell-command-run-via-bash-lc>   (tier → <SERIES>-<tier>-<ARCH>)
 run_check() {
   local label="$1" tier="$2" cmd="$3" image out rc
   image="$(img "$tier")"
@@ -99,7 +105,7 @@ run_check() {
   fi
 }
 
-echo "=== droste-ai-rocm runtime validation — tag ${TAG}, runtime ${RUNTIME} ==="
+echo "=== ${SERIES}-*-${ARCH} runtime validation — tag ${TAG}, runtime ${RUNTIME} ==="
 echo
 
 # ── CORE: GPU enumerates + torch sees it (deterministic) ─────────────────────
@@ -108,26 +114,26 @@ run_check "gpu-enumerate (base)" runtime-base \
 
 # torch.cuda on every torch-carrying tier
 TORCH_PROBE='python -c "import torch; ok=torch.cuda.is_available(); print((\"gpu=\"+torch.cuda.get_device_name(0)) if ok else \"NO GPU VISIBLE\"); import sys; sys.exit(0 if ok else 1)"'
-run_check "torch.cuda (comfyui)"      comfyui            "$TORCH_PROBE"
-run_check "torch.cuda (vllm)"         vllm-runtime       "$TORCH_PROBE"
-run_check "torch.cuda (finetuning)"   finetuning-runtime "$TORCH_PROBE"
+run_check "torch.cuda (comfyui)"      comfyui      "$TORCH_PROBE"
+run_check "torch.cuda (vllm)"         vllm         "$TORCH_PROBE"
+run_check "torch.cuda (finetuning)"   finetuning   "$TORCH_PROBE"
 
 # ── APP smoke (per-toolbox; tune the commands here if a tool's CLI differs) ───
 # llama.cpp turboquant: llama-server ships in /usr/local/bin.
-run_check "llama-server --version" llama-runtime \
+run_check "llama-server --version" llama \
   "llama-server --version"
 
 # ds4: confirm the binary is present + its shared libs (hip/rocblas/hipblaslt) all resolve.
 # (ds4's inference CLI needs a model to do more; library resolution is the meaningful GPU-stack probe.)
-run_check "ds4 binary + ldd" ds4-runtime \
+run_check "ds4 binary + ldd" ds4 \
   'B="$(command -v ds4-bench || command -v ds4-server || command -v ds4)"; echo "bin=$B"; ldd "$B" | grep -q "not found" && { ldd "$B" | grep "not found"; exit 1; }; echo "libs resolve"'
 
 # vLLM: import the package + confirm torch GPU in the same interpreter.
-run_check "import vllm + torch.cuda" vllm-runtime \
+run_check "import vllm + torch.cuda" vllm \
   'python -c "import vllm, torch; print(\"vllm\", vllm.__version__, \"cuda\", torch.cuda.is_available()); import sys; sys.exit(0 if torch.cuda.is_available() else 1)"'
 
 # bitsandbytes (finetuning): imports its gfx1151 .so against the runtime.
-run_check "import bitsandbytes" finetuning-runtime \
+run_check "import bitsandbytes" finetuning \
   'python -c "import bitsandbytes as b; print(\"bitsandbytes\", getattr(b,\"__version__\",\"?\"))"'
 
 # ── Summary ──────────────────────────────────────────────────────────────────

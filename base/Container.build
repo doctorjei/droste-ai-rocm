@@ -20,7 +20,7 @@ ARG ROCM_SDK_DEVEL_VERSION=7.13.0a20260501
 
 # Host compilers + build tools & libraries
 RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
-      gcc g++ make cmake ninja-build git patch rsync lld clang
+      gcc g++ make cmake ninja-build git patch rsync lld clang \
       libclang-dev libclang-rt-dev libcurl4-openssl-dev libomp-dev \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 

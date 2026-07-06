@@ -27,7 +27,7 @@ FROM ${BASE_IMAGE}
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 # Dependency installation (tools, libgomp1, torch)
-RUN apt-get -qq update \ apt-get -qq install -y --no-install-recommends \
+RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
       git curl patch libgomp1 && rm -rf /var/lib/apt/lists/* && apt-get clean
 RUN pip install --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"
 
