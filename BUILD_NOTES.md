@@ -161,6 +161,28 @@ compiled here ABI-matches the runtime libs it ships against.
   `--offload-arch=${GFX_TARGET}`.
 - No `CMD`: builder stage only.
 
+### base/Container.torch
+Shared torch layer. `FROM` the runtime base + one `pip install torch==$TORCH_VERSION`
+from the gfx1151 index — nothing else. The three Python targets (comfyui, vllm,
+finetuning) build FROM this instead of installing torch themselves; llama and ds4
+stay torch-free on the runtime base and do NOT go through here.
+
+- **Why it exists:** all three consumers pinned the *identical*
+  `torch==2.9.1+rocm7.13.0a20260501`, but each installed it in its own `RUN` →
+  three distinct layer digests → OCI stored the ~1 GiB wheel 3× in GHCR and 3× on
+  any host pulling all three. Installing once here gives ONE layer digest that all
+  three share.
+- **What it does NOT do:** it does not shrink any single image (comfyui/vllm/
+  finetuning still need torch, so each is still ~torch-sized). The win is
+  cross-image dedup — one stored copy instead of three (~2 GiB saved in the
+  registry / on a host with all three) — plus the three stop rebuilding and
+  re-pulling torch on changes unrelated to the torch pin.
+- **Scope = torch only.** torchvision/torchaudio are comfyui-only (vllm/finetuning
+  don't want them) so they stay in comfyui, NOT here. gguf/transformers likewise
+  stay in comfyui.
+- Pins are declared after `FROM` (in-stage), so no ARG-scope import needed.
+- No `CMD`: intermediate base, never run directly.
+
 ---
 
 ## Scaffolding (build carriers)

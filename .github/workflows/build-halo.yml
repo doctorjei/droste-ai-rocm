@@ -105,6 +105,43 @@ jobs:
           cache-from: type=registry,ref=${{ env.NS }}/droste-build-base-halo:buildcache
           cache-to: type=registry,ref=${{ env.NS }}/droste-build-base-halo:buildcache,mode=max
 
+  torch-base:
+    needs: runtime-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load pin
+        run: |
+          set -a; . ./rocm-version.env; set +a
+          for k in GFX_TARGET ROCM_INDEX_URL ROCM_PIN TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION ROCM_SDK_DEVEL_VERSION ROCM_SDK_LIBRARIES_VERSION; do
+            printf '%s=%s\n' "$k" "${!k}" >> "$GITHUB_ENV"
+          done
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push droste-torch-base-halo
+        uses: docker/build-push-action@v6
+        with:
+          context: ci/empty
+          file: base/Container.torch
+          push: true
+          tags: |
+            ${{ env.NS }}/droste-torch-base-halo:${{ github.sha }}
+            ${{ env.NS }}/droste-torch-base-halo:latest
+          build-args: |
+            BASE_IMAGE=${{ env.NS }}/droste-runtime-base-halo:${{ github.sha }}
+            ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
+            TORCH_VERSION=${{ env.TORCH_VERSION }}
+          cache-from: type=registry,ref=${{ env.NS }}/droste-torch-base-halo:buildcache
+          cache-to: type=registry,ref=${{ env.NS }}/droste-torch-base-halo:buildcache,mode=max
+
   hip-probe:
     needs: build-base
     runs-on: ubuntu-latest
@@ -156,7 +193,7 @@ jobs:
   # art_ctx / rt_ctx name each stage's build context: ci/empty for asset-less
   # images, the asset dir for ones that COPY local files.
   port:
-    needs: build-base
+    needs: [build-base, torch-base]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -165,10 +202,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: ds4,        art_ctx: ci/empty,                    rt_ctx: ci/empty }
-          - { name: llama,      art_ctx: scaffolding/llama-artifacts, rt_ctx: ci/empty }
-          - { name: vllm,       art_ctx: scaffolding/vllm-artifacts,  rt_ctx: targets/vllm }
-          - { name: finetuning, art_ctx: ci/empty,                    rt_ctx: targets/finetuning }
+          - { name: ds4,        art_ctx: ci/empty,                    rt_ctx: ci/empty,            rt_base: runtime-base }
+          - { name: llama,      art_ctx: scaffolding/llama-artifacts, rt_ctx: ci/empty,            rt_base: runtime-base }
+          - { name: vllm,       art_ctx: scaffolding/vllm-artifacts,  rt_ctx: targets/vllm,        rt_base: torch-base }
+          - { name: finetuning, art_ctx: ci/empty,                    rt_ctx: targets/finetuning,  rt_base: torch-base }
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -216,7 +253,7 @@ jobs:
             ${{ env.NS }}/droste-${{ matrix.name }}-halo:${{ github.sha }}
             ${{ env.NS }}/droste-${{ matrix.name }}-halo:latest
           build-args: |
-            BASE_IMAGE=${{ env.NS }}/droste-runtime-base-halo:${{ github.sha }}
+            BASE_IMAGE=${{ env.NS }}/droste-${{ matrix.rt_base }}-halo:${{ github.sha }}
             ARTIFACTS_IMAGE=${{ env.NS }}/droste-${{ matrix.name }}-build-halo:${{ github.sha }}
             ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
             TORCH_VERSION=${{ env.TORCH_VERSION }}
@@ -224,9 +261,9 @@ jobs:
           cache-from: type=registry,ref=${{ env.NS }}/droste-${{ matrix.name }}-halo:buildcache
           cache-to: type=registry,ref=${{ env.NS }}/droste-${{ matrix.name }}-halo:buildcache,mode=max
 
-  # comfyui: single interactive image (no compile; torch wheels + pip). FROM runtime-base.
+  # comfyui: single interactive image (no compile; torch wheels + pip). FROM torch-base.
   comfyui:
-    needs: runtime-base
+    needs: torch-base
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -262,7 +299,7 @@ jobs:
             ${{ env.NS }}/droste-comfyui-halo:${{ github.sha }}
             ${{ env.NS }}/droste-comfyui-halo:latest
           build-args: |
-            BASE_IMAGE=${{ env.NS }}/droste-runtime-base-halo:${{ github.sha }}
+            BASE_IMAGE=${{ env.NS }}/droste-torch-base-halo:${{ github.sha }}
             ROCM_INDEX_URL=${{ env.ROCM_INDEX_URL }}
             TORCH_VERSION=${{ env.TORCH_VERSION }}
             TORCHVISION_VERSION=${{ env.TORCHVISION_VERSION }}

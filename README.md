@@ -28,20 +28,26 @@ is arch-specific, so it is also far leaner than the all-arch apt ROCm stack.
 
 ## Topology
 
-Two bases feed everything; **torch is a layer added where needed**, not a base fork.
+Two bases feed everything; **torch is a shared layer added where needed**
+(`droste-torch-base-halo`), not a base fork.
 
 ```
 canopy ─ droste-runtime-base-halo   (de-divert + rocm-sdk-libraries-gfx1151 runtime kernels, venv)
-           ├─ droste-comfyui-halo         (+ torch; single interactive image, Triton JIT)
            ├─ droste-llama-halo           ← COPY --from droste-llama-build-halo       (no torch)
            ├─ droste-ds4-halo             ← COPY --from droste-ds4-build-halo         (no torch)
-           ├─ droste-vllm-halo     (+torch) ← COPY --from droste-vllm-build-halo
-           └─ droste-finetuning-halo (+torch) ← COPY --from droste-finetuning-build-halo
+           └─ droste-torch-base-halo  (+ shared torch wheel, installed once)
+                 ├─ droste-comfyui-halo         (+ torchvision/audio; single interactive image, Triton JIT)
+                 ├─ droste-vllm-halo            ← COPY --from droste-vllm-build-halo
+                 └─ droste-finetuning-halo      ← COPY --from droste-finetuning-build-halo
 
 droste-runtime-base-halo ─ droste-build-base-halo  (+ rocm-sdk-devel compilers + host toolchain)
            ├─ droste-llama-build-halo / droste-ds4-build-halo        [scratch: /artifacts/{bin,lib64,share}]
            └─ droste-vllm-build-halo / droste-finetuning-build-halo  [scratch: /artifacts/wheels]
 ```
+
+torch is pip-installed once in `droste-torch-base-halo` and shared by comfyui/vllm/
+finetuning (one stored layer instead of three identical copies). llama/ds4 stay
+torch-free on the runtime base.
 
 **Artifact-carrier pattern:** heavy compiles happen in `droste-build-base-halo`; outputs
 are captured in minimal `FROM scratch` `-build` carriers (holding only `/artifacts`); thin
@@ -57,15 +63,16 @@ Published as `ghcr.io/doctorjei/droste-<name>-halo`. Containerfiles are named
 |---|---|---|---|
 | `droste-runtime-base-halo` | `base/Container.runtime` | `gemet/canopy` | ROCm runtime kernels (pip), de-divert, venv `/opt/venv` |
 | `droste-build-base-halo` | `base/Container.build` | `droste-runtime-base-halo` | + `rocm-sdk-devel` (hipcc/clang) + host toolchain |
+| `droste-torch-base-halo` | `base/Container.torch` | `droste-runtime-base-halo` | + shared `torch` wheel (installed once; comfyui/vllm/finetuning build FROM this) |
 | `droste-llama-build-halo` | `scaffolding/Container.llama-build` | build base | llama.cpp turboquant fork, gfx1151 HIP build [scratch carrier] |
 | `droste-llama-halo` | `targets/Container.llama` | runtime base | llama runtime (no torch); `COPY --from` build carrier |
 | `droste-ds4-build-halo` | `scaffolding/Container.ds4-build` | build base | ds4 + rocWMMA build [scratch carrier] |
 | `droste-ds4-halo` | `targets/Container.ds4` | runtime base | ds4 runtime (no torch); cockpit via pipx |
-| `droste-comfyui-halo` | `targets/Container.comfyui` | runtime base | single image; keeps compilers for Triton JIT at runtime |
+| `droste-comfyui-halo` | `targets/Container.comfyui` | torch base | single image; +torchvision/audio; keeps compilers for Triton JIT at runtime |
 | `droste-vllm-build-halo` | `scaffolding/Container.vllm-build` | build base | flash-attn + aiter + vllm wheels [scratch carrier] |
-| `droste-vllm-halo` | `targets/Container.vllm` | runtime base | vllm runtime (+torch) |
+| `droste-vllm-halo` | `targets/Container.vllm` | torch base | vllm runtime (torch from base) |
 | `droste-finetuning-build-halo` | `scaffolding/Container.finetuning-build` | build base | bitsandbytes + custom RCCL wheels [scratch carrier] |
-| `droste-finetuning-halo` | `targets/Container.finetuning` | runtime base | HF/unsloth stack (+torch) |
+| `droste-finetuning-halo` | `targets/Container.finetuning` | torch base | HF/unsloth stack (torch from base) |
 
 The `-build` carriers are `FROM scratch` images holding only `/artifacts`.
 

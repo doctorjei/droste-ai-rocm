@@ -1,0 +1,20 @@
+# droste-torch-base-halo: shared TheRock gfx1151 torch wheel for the Python targets
+# (comfyui/vllm/finetuning FROM this; llama/ds4 stay torch-free on runtime-base)
+
+# Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
+ARG SERIES_NAME=droste
+ARG ARCH_NAME=halo
+ARG TARGET_NAME=torch-base
+ARG DESCRIPTION="Shared TheRock gfx1151 torch wheel"
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
+
+FROM ${BASE_IMAGE}
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
+
+# ROCM / Torch pin
+ARG GFX_TARGET=gfx1151
+ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/${GFX_TARGET}/
+ARG TORCH_VERSION=2.9.1+rocm7.13.0a20260501
+
+RUN pip install --pre --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"

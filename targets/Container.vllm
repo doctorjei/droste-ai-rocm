@@ -8,7 +8,7 @@ ARG TARGET_NAME=vllm
 ARG DESCRIPTION="vLLM toolbox (TheRock torch & prebuilt wheels)"
 
 # Image Names
-ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-torch-base-${ARCH_NAME}
 ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build-${ARCH_NAME}
 
 # Build image
@@ -21,9 +21,6 @@ LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 ARG GFX_TARGET=gfx1151
 ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/${GFX_TARGET}/
 ARG TORCH_VERSION=2.9.1+rocm7.13.0a20260501
-
-# Install torch
-RUN pip install --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"
 
 # Runtime libraries
 RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \

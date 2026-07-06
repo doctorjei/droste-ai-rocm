@@ -6,7 +6,7 @@ ARG SERIES_NAME=droste
 ARG ARCH_NAME=halo
 ARG TARGET_NAME=comfyui
 ARG DESCRIPTION="ComfyUI (interactive, Triton JIT)"
-ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-torch-base-${ARCH_NAME}
 
 # Overrideable Arguemnts - ROCM / TORCH
 ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/gfx1151/
@@ -35,13 +35,12 @@ LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 ## Dependencies: General / Media & Triton JIT (required at runtime)
 RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
-            ffmpeg dialog git curl rsync libdrm2 pkg-config vim python3-pip \
+            ffmpeg dialog git curl rsync libdrm2 pkg-config python3-pip \
             gcc g++ make binutils python3-dev && \
     rm -rf /var/lib/apt/lists/* && apt-get clean
 
 ## PIP: Torch Stack, GGUF, & Transformers (pinned if set) 
 RUN pip install --pre --index-url ${ROCM_INDEX_URL} \
-       "torch==${TORCH_VERSION}" \
        "torchvision${TORCHVISION_VERSION:+==${TORCHVISION_VERSION}}" \
        "torchaudio${TORCHAUDIO_VERSION:+==${TORCHAUDIO_VERSION}}" && \
     pip install gguf "transformers==${TRANSFORMERS_VERSION}"

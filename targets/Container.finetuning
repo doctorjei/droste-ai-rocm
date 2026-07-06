@@ -8,7 +8,7 @@ ARG TARGET_NAME=finetuning
 ARG DESCRIPTION="LLM-Finetuning (${ARCH_NAME}): interactive, torch + HF/unsloth, custom RCCL"
 
 # Image Names
-ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-torch-base-${ARCH_NAME}
 ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build-${ARCH_NAME}
 
 # Pinned (Torch version)
@@ -31,7 +31,6 @@ LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 # Dependency installation (tools, libgomp1, torch)
 RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
       git curl patch libgomp1 && rm -rf /var/lib/apt/lists/* && apt-get clean
-RUN pip install --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"
 
 # Copy artifacts
 COPY --from=artifacts /artifacts /artifacts
