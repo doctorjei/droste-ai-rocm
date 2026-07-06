@@ -18,6 +18,7 @@ ARG COCKPIT_REPO=https://github.com/kyuz0/strix-halo-ds4-toolbox.git
 FROM ${ARTIFACTS_IMAGE} AS artifacts
 FROM ${BASE_IMAGE}
 ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
+ARG COCKPIT_REF COCKPIT_REPO
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 COPY --from=artifacts /artifacts/bin/   /usr/local/bin/
