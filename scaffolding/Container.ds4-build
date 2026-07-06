@@ -1,0 +1,56 @@
+# droste-ds4-build: builds ds4 (https://github.com/kyuz0/ds4) against pinned TheRock SDK & emits outputs
+
+# Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
+ARG SERIES_NAME=droste
+ARG ARCH_NAME=halo
+ARG TARGET_NAME=ds4-build
+ARG BUILDER_DESC="builder image for ds4 outputs"
+ARG DESCRIPTION="compiled outputs for ds4 image"
+
+# Image Names
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-build-base-${ARCH_NAME}
+
+# Build image
+FROM ${BASE_IMAGE} AS builder
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${BUILDER_DESC}"
+
+# Pinned dependencies
+ARG DS4_REF=00e64ea8522aebb5d54e968cfcb3e27adcbaad57
+ARG ROCWMMA_REF=48b7db12a9ade97f0b7ab2ff9321ba0cbb4e5b77
+ARG DS4_REPO=https://github.com/kyuz0/ds4.git
+ARG ROCWMMA_REPO=https://github.com/ROCm/rocWMMA.git
+
+# rocWMMA
+RUN mkdir -p /tmp/rocWMMA && cd /tmp/rocWMMA \
+    && git init -q && git remote add origin ${ROCWMMA_REPO} \
+    && git fetch --depth 1 origin ${ROCWMMA_REF} && git checkout -q FETCH_HEAD \
+    && CC=amdclang CXX=amdclang++ \
+       cmake -B build -S . -G Ninja \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_INSTALL_PREFIX=${ROCM_PATH} \
+         -DROCWMMA_BUILD_TESTS=OFF \
+         -DROCWMMA_BUILD_SAMPLES=OFF \
+         -DGPU_TARGETS="${GFX_TARGET}" \
+         -DOpenMP_CXX_FLAGS="-fopenmp=libomp" \
+         -DOpenMP_C_FLAGS="-fopenmp=libomp" \
+         -DOpenMP_omp_LIBRARY="/usr/lib/x86_64-linux-gnu/libomp.so" \
+         -DOpenMP_CXX_LIB_NAMES="omp" \
+         -DOpenMP_C_LIB_NAMES="omp" \
+    && cmake --install build \
+    && rm -rf /tmp/rocWMMA
+
+# Clone & build DS4
+WORKDIR /opt/ds4
+RUN git clone ${DS4_REPO} . \
+    && git checkout ${DS4_REF} \
+    && git clean -xdf \
+    && make rocm ROCM_ARCH=${GFX_TARGET} ROCM_PATH=${ROCM_PATH}
+
+RUN mkdir -p /artifacts/bin /artifacts/lib64 /artifacts/share \
+    && cp ds4 ds4-server ds4-bench download_model.sh /artifacts/bin/ \
+    && find /opt/ds4 -maxdepth 2 -name 'lib*.so*' -exec cp -av {} /artifacts/lib64/ \; \
+    && chmod +x /artifacts/bin/*
+
+FROM scratch
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
+COPY --from=builder /artifacts /artifacts

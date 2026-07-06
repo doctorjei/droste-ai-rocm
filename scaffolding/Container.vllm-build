@@ -1,0 +1,102 @@
+# droste-llama-build: builds llama.cpp (TheTom/llama-cpp-turboquant) against pinned SDK
+
+# Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
+ARG SERIES_NAME=droste
+ARG ARCH_NAME=halo
+ARG TARGET_NAME=vllm-build
+ARG BUILDER_DESC="builder image for vLLM (flash-attension, aiter, vLLM wheels)"
+ARG DESCRIPTION="compiled outputs for vLLM image"
+
+# Image Names
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-build-base-${ARCH_NAME}
+
+# Build image
+FROM ${BASE_IMAGE} AS builder
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${BUILDER_DESC}"
+
+# ROCm Pin
+ARG GFX_TARGET=gfx1151
+ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/${GFX_TARGET}/
+ARG TORCH_VERSION=2.9.1+rocm7.13.0a20260501
+
+# Pinned Dependencies
+ARG FLASH_ATTENTION_REPO=https://github.com/ROCm/flash-attention.git
+ARG FLASH_ATTENTION_BRANCH=main_perf
+ARG FLASH_ATTENTION_REF=3f94643fb41bcedded28c85185a8e11d42ef1592
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_REF=v0.16.0
+ARG FP8_KERNELS_REPO=https://github.com/leonyurko/vllm-fp8-strix-halo-kernel-support.git
+ARG FP8_KERNELS_REF=50424f5525b8382353551e3301d0da56eca0be2b
+
+# Install Torch
+RUN pip install --index-url ${ROCM_INDEX_URL} "torch==${TORCH_VERSION}"
+
+# Python build backends
+RUN pip install --upgrade \
+      cmake ninja packaging wheel numpy "setuptools-scm>=8" "setuptools<80.0.0" \
+      scikit-build-core pybind11 numba scipy
+
+# Flash attention
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+    LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
+
+COPY patch_aiter_headers.py /opt/patch_aiter_headers.py
+
+RUN mkdir -p /artifacts/wheels \
+    && git clone "${FLASH_ATTENTION_REPO}" /opt/flash-attention \
+    && cd /opt/flash-attention \
+    && if [ -n "${FLASH_ATTENTION_REF}" ]; then git checkout "${FLASH_ATTENTION_REF}"; \
+       else git checkout "${FLASH_ATTENTION_BRANCH}"; fi \
+    && git submodule update --init third_party/aiter \
+    && cd third_party/aiter \
+    && git submodule update --init 3rdparty/composable_kernel \
+    && export CK_DIR="$(pwd)/3rdparty/composable_kernel" \
+    && python -m pip wheel --no-build-isolation --no-deps -w /artifacts/wheels -v . \
+    && python -m pip install --force-reinstall /artifacts/wheels/amd_aiter*.whl \
+    && python /opt/patch_aiter_headers.py \
+    && cd /opt/flash-attention \
+    && python -c "import re; f=open('setup.py','r'); t=f.read(); f.close(); t=re.sub(r'subprocess\.run\([\s\S]*?third_party/aiter[\s\S]*?check=True,\s*\)', 'pass # patched', t); f=open('setup.py','w'); f.write(t)" \
+    && python -m pip wheel --no-build-isolation --no-deps -w /artifacts/wheels -v .
+
+# vLLM
+RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
+      rustc cargo python3.13-dev libdrm-dev && rm -rf /var/lib/apt/lists/* && apt-get clean \
+      && pip install "setuptools-rust>=1.9.0"
+
+COPY patch_strix.py       /opt/patch_strix.py
+COPY patch_fp8_kernels.py /opt/patch_fp8_kernels.py
+RUN git clone "${VLLM_REPO}" /opt/vllm \
+    && cd /opt/vllm \
+    && if [ -n "${VLLM_REF}" ]; then git checkout "${VLLM_REF}"; fi \
+    && cp /opt/patch_strix.py /opt/patch_fp8_kernels.py . \
+    && python patch_strix.py \
+    && python patch_fp8_kernels.py
+
+# Build the vLLM wheel
+ENV ROCM_HOME=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    HIP_PLATFORM=amd \
+    VLLM_TARGET_DEVICE=rocm \
+    PYTORCH_ROCM_ARCH=gfx1151 \
+    HIP_ARCHITECTURES=gfx1151 \
+    AMDGPU_TARGETS=gfx1151 \
+    MAX_JOBS=4 \
+    CC=/opt/rocm/lib/llvm/bin/clang \
+    CXX=/opt/rocm/lib/llvm/bin/clang++
+RUN cd /opt/vllm \
+    && export HIP_DEVICE_LIB_PATH="$(find /opt/rocm -type d -name bitcode -print -quit)" \
+    && echo "Compiling vLLM with bitcode: ${HIP_DEVICE_LIB_PATH}, clang: ${CC}" \
+    && export CMAKE_ARGS="-DROCM_PATH=/opt/rocm -DHIP_PATH=/opt/rocm -DAMDGPU_TARGETS=gfx1151 -DHIP_ARCHITECTURES=gfx1151" \
+    && python -m pip wheel --no-build-isolation --no-deps -w /artifacts/wheels -v .
+
+# Pure-python FP8 Triton kernels (leonyurko)
+RUN git clone "${FP8_KERNELS_REPO}" /artifacts/fp8 \
+    && cd /artifacts/fp8 && git checkout "${FP8_KERNELS_REF}" \
+    && rm -rf /artifacts/fp8/.git
+
+RUN echo "=== /artifacts/wheels ===" && ls -1 /artifacts/wheels
+
+# --- Final carrier: ONLY the wheels + FP8 kernel tree
+FROM scratch
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
+COPY --from=build /artifacts /artifacts

@@ -1,0 +1,39 @@
+# droste-ds4-halo: interactive DS4 +  cockpit TUI on halo (Max 3xx/4xx)
+# Ported from https://github.com/kyuz0/strix-halo-ds4-toolbox
+
+# Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
+ARG SERIES_NAME=droste
+ARG ARCH_NAME=halo
+ARG TARGET_NAME=ds4
+ARG DESCRIPTION="DS4 (${ARCH_NAME} (interactive, cockpit TUI)"
+
+# Image Names
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
+ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build
+
+# Pinned cockpit reference (reproducibility)
+ARG COCKPIT_REF=84a580d8c8b03602143a9f2a14183f3b45e3bbc1
+ARG COCKPIT_REPO=https://github.com/kyuz0/strix-halo-ds4-toolbox.git
+
+FROM ${ARTIFACTS_IMAGE} AS artifacts
+FROM ${BASE_IMAGE}
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
+
+COPY --from=artifacts /artifacts/bin/   /usr/local/bin/
+COPY --from=artifacts /artifacts/lib64/ /usr/local/lib64/
+COPY --from=artifacts /artifacts/share/ /usr/local/share/
+
+# Make ds4's shared libs resolvable without touching environment
+RUN printf '/usr/local/lib\n/usr/local/lib64\n' > /etc/ld.so.conf.d/ds4-local.conf && ldconfig
+
+# Install git, pipx, & python runtime (into the base's /opt/venv)
+RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean
+RUN pip install --no-cache-dir pipx 'huggingface_hub[hf_xet]'
+
+# DS4 Cockpit TUI
+RUN pipx install --global "git+${COCKPIT_REPO}@${COCKPIT_REF}#subdirectory=ds4-strix-halo-cockpit"
+
+# Prevent ~/.local/lib/python* from shadowing container-installed packages; add entrypoint.
+ENV PYTHONNOUSERSITE=1
+CMD ["/bin/bash"]

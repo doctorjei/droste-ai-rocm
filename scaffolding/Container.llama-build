@@ -1,0 +1,62 @@
+# droste-llama-build: builds llama.cpp (TheTom/llama-cpp-turboquant) against pinned SDK
+
+# Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
+ARG SERIES_NAME=droste
+ARG ARCH_NAME=halo
+ARG TARGET_NAME=llama-build
+ARG BUILDER_DESC="builder image for llama.cpp (turboquant)"
+ARG DESCRIPTION="compiled outputs for llama image"
+
+# Image Names
+ARG BASE_IMAGE=localhost/${SERIES_NAME}-build-base-${ARCH_NAME}
+
+# Build image
+FROM ${BASE_IMAGE} AS builder
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${BUILDER_DESC}"
+
+# ROCm Pin
+ARG GFX_TARGET=gfx1151
+
+# llama pin
+ARG LLAMA_REPO=https://github.com/TheTom/llama-cpp-turboquant.git
+ARG LLAMA_REF=337f08e82a861194fd5fc93121205c7c6bc81ddf
+
+# Re-add if needed
+COPY llama-grammar.patch /tmp/
+
+# Clone fork with its submodules, then re-materialize submodules.
+WORKDIR /opt/llama.cpp
+RUN git clone --single-branch --recursive "${LLAMA_REPO}" . \
+    && if [ -n "${LLAMA_REF}" ]; then \
+         git checkout --recurse-submodules "${LLAMA_REF}"; \
+       fi \
+    && git submodule update --recursive
+
+# Apply the turboquant grammar patch.
+RUN patch -p1 < /tmp/llama-grammar.patch
+
+# HIP build
+RUN cmake -S . -B build \
+       -DGGML_HIP=ON \
+       -DAMDGPU_TARGETS=${GFX_TARGET} \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DGGML_RPC=ON \
+       -DLLAMA_HIP_UMA=ON \
+       -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=ON \
+       -DROCM_PATH=/opt/rocm \
+       -DHIP_PATH=/opt/rocm \
+       -DHIP_PLATFORM=amd \
+    && cmake --build build --config Release -- -j"$(nproc)"
+
+# Collect llama.cpp's outputs
+RUN mkdir -p /artifacts/bin /artifacts/lib64 /artifacts/share \
+    && cp -a build/bin/. /artifacts/bin/ \
+    && find build -type f -name 'lib*.so*' -exec cp -a {} /artifacts/lib64/ \;
+
+# VRAM helper
+COPY gguf-vram-estimator.py /artifacts/share/gguf-vram-estimator.py
+RUN chmod +x /artifacts/share/gguf-vram-estimator.py
+
+FROM scratch
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
+COPY --from=builder /artifacts /artifacts

@@ -1,0 +1,63 @@
+# droste-runtime-base-halo: TheRock gfx1151 ROCm RUNTIME kernels
+
+# Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
+ARG SERIES_NAME=droste
+ARG ARCH_NAME=halo
+ARG TARGET_NAME=runtime-base
+ARG DESCRIPTION="TheRock gfx1151 ROCm runtime kernels"
+ARG BASE_IMAGE=ghcr.io/doctorjei/gemet/canopy:1.7.3
+
+FROM ${BASE_IMAGE}
+LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
+
+# Remove the .distrib diversions, then rehydrate GNU coreutils before any other installations
+RUN while IFS= read -r orig && IFS= read -r div && IFS= read -r owner; do \
+        case "$div" in \
+            *.distrib) dpkg-divert --quiet --no-rename --remove "$orig" ;; \
+        esac; \
+    done < /var/lib/dpkg/diversions
+
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       coreutils grep sed findutils gzip diffutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# ROCm libraries
+ARG GFX_TARGET=gfx1151
+ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/${GFX_TARGET}/
+ARG ROCM_SDK_LIBRARIES_VERSION=7.13.0a20260501
+
+# Re-add exactly what canopy purges, plus the venv toolchain.
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends \
+       sudo procps libnss-myhostname radeontop \
+       python3-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Python venv with the TheRock gfx1151 RUNTIME kernels, with venv
+RUN python3 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH PIP_NO_CACHE_DIR=1
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install --index-url ${ROCM_INDEX_URL} \
+       "rocm[libraries]==${ROCM_SDK_LIBRARIES_VERSION}"
+
+# Pin a stable /opt/rocm -> the ROCm core tree. NOTE: `rocm-sdk path --root` CANNOT be used here
+RUN ln -sfn "$(python3 -c "import sysconfig,os; print(os.path.join(sysconfig.get_paths()['purelib'],'_rocm_sdk_core'))")" /opt/rocm \
+    && printf '/opt/rocm/lib\n/opt/rocm/lib64\n' > /etc/ld.so.conf.d/rocm.conf \
+    && python3 -c "import sysconfig,glob,os; sp=sysconfig.get_paths()['purelib']; print('\n'.join(glob.glob(os.path.join(sp,'_rocm_sdk_*','lib'))))" >> /etc/ld.so.conf.d/rocm.conf \
+    && ldconfig
+
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
+    LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64 \
+    PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
+
+# /etc/profile.d/rocm.sh; activates venv and exports ROCM_PATH, HIP/PATH/LD env for interactive shells.
+RUN printf '%s\n' \
+    'source /opt/venv/bin/activate' \
+    'ROCM_PATH=/opt/rocm' \
+    'export ROCM_PATH HIP_PATH="$ROCM_PATH"' \
+    'export PATH="$ROCM_PATH/bin:/opt/venv/bin:$PATH"' \
+    'export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib64:$LD_LIBRARY_PATH"' \
+    > /etc/profile.d/rocm.sh
