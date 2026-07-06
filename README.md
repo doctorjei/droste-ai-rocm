@@ -66,10 +66,29 @@ captured in minimal `FROM scratch` carriers; thin runtimes `COPY --from` them on
 ROCm/HIP is **ahead-of-time cross-compiled** — images build on any x86 host (no GPU).
 Only runtime checks (`rocminfo`, `torch.cuda`, inference) need a real gfx1151 device.
 
-CI (`.github/workflows/build-rocm.yml`) is **staged**: it builds the two bases and runs a
-`hipcc --offload-arch=gfx1151` + `find_package(hip)` probe — the go/no-go that the pip
-`rocm-sdk-devel` actually compiles HIP for gfx1151. The five ports join the matrix once
-that is green.
+CI (`.github/workflows/build-rocm.yml`) builds the two bases, runs a
+`hipcc --offload-arch=gfx1151` + `find_package(hip)` probe (the go/no-go that pip
+`rocm-sdk-devel` compiles HIP for gfx1151), then builds all five ports — one isolated
+job per port (artifacts → runtime). All jobs are green; every gfx1151 HIP compile
+(rocWMMA, llama.cpp, vLLM, RCCL, bitsandbytes, aiter/flash-attn) succeeds on x86.
 
-App-source clones default to floating branches; pin them via `--build-arg <NAME>_REF=<sha>`
-for reproducible builds (see per-image `ARG *_REF`).
+App-source clones are pinned to the SHAs that built green (per-image `ARG *_REF`);
+override with `--build-arg <NAME>_REF=<sha>` to bump.
+
+## Runtime validation
+
+CI proves the images build + AOT-compile; it cannot prove they **run** (no GPU). On a
+gfx1151 host that exposes `/dev/kfd` + `/dev/dri`, run the sweep:
+
+```bash
+./check-rocm.sh              # checks :latest via podman
+./check-rocm.sh --tag <sha> --runtime docker --pull
+./check-rocm.sh --help       # all options
+```
+
+It skips the `*-artifacts` images (they are `FROM scratch` — nothing to run) and checks the
+runnable tiers in two tiers: **CORE** (deterministic — GPU enumerates as `gfx1151`; `torch.cuda`
+sees it on comfyui/vllm/finetuning) and **APP** (per-toolbox smoke: `llama-server --version`,
+ds4 binary+`ldd`, `import vllm`, `import bitsandbytes`). Exits non-zero on any failure. The
+per-toolbox smoke commands are the first thing to adjust if a tool's CLI differs — see the
+comments in `check-rocm.sh`.
