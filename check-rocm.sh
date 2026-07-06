@@ -104,7 +104,7 @@ echo
 
 # ── CORE: GPU enumerates + torch sees it (deterministic) ─────────────────────
 run_check "gpu-enumerate (base)" runtime-base \
-  "rocminfo | grep -i '${GFX}' | head -1"
+  "rocminfo | grep -i -m1 '${GFX}'"
 
 # torch.cuda on every torch-carrying tier
 TORCH_PROBE='python -c "import torch; ok=torch.cuda.is_available(); print((\"gpu=\"+torch.cuda.get_device_name(0)) if ok else \"NO GPU VISIBLE\"); import sys; sys.exit(0 if ok else 1)"'
@@ -115,7 +115,7 @@ run_check "torch.cuda (finetuning)"   finetuning-runtime "$TORCH_PROBE"
 # ── APP smoke (per-toolbox; tune the commands here if a tool's CLI differs) ───
 # llama.cpp turboquant: llama-server ships in /usr/local/bin.
 run_check "llama-server --version" llama-runtime \
-  "llama-server --version 2>&1 | head -1"
+  "llama-server --version"
 
 # ds4: confirm the binary is present + its shared libs (hip/rocblas/hipblaslt) all resolve.
 # (ds4's inference CLI needs a model to do more; library resolution is the meaningful GPU-stack probe.)
