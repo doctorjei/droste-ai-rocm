@@ -12,6 +12,7 @@ ARG BASE_IMAGE=localhost/${SERIES_NAME}-build-base-${ARCH_NAME}
 
 # Build image
 FROM ${BASE_IMAGE} AS builder
+ARG SERIES_NAME TARGET_NAME ARCH_NAME BUILDER_DESC
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${BUILDER_DESC}"
 
 # ROCm Pin
@@ -58,5 +59,6 @@ COPY gguf-vram-estimator.py /artifacts/share/gguf-vram-estimator.py
 RUN chmod +x /artifacts/share/gguf-vram-estimator.py
 
 FROM scratch
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 COPY --from=builder /artifacts /artifacts

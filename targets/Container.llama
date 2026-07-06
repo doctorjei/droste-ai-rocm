@@ -9,11 +9,12 @@ ARG DESCRIPTION="llama.cpp toolbox (turboquant)"
 
 # Image Names
 ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
-ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build
+ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build-${ARCH_NAME}
 
 # Build image
 FROM ${ARTIFACTS_IMAGE} AS artifacts
 FROM ${BASE_IMAGE}
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 # Install libgomp1

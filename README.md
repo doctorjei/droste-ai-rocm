@@ -31,35 +31,46 @@ is arch-specific, so it is also far leaner than the all-arch apt ROCm stack.
 Two bases feed everything; **torch is a layer added where needed**, not a base fork.
 
 ```
-canopy ─ rocm-runtime-base   (de-divert + rocm-sdk-libraries-gfx1151 runtime kernels, venv)
-           ├─ comfyui-toolbox          (+ torch; single interactive image, Triton JIT)
-           ├─ llama-runtime            ← COPY --from llama-artifacts        (no torch)
-           ├─ ds4-runtime              ← COPY --from ds4-artifacts          (no torch)
-           ├─ vllm-runtime      (+torch) ← COPY --from vllm-artifacts
-           └─ finetuning-runtime (+torch) ← COPY --from finetuning-artifacts
+canopy ─ droste-runtime-base-halo   (de-divert + rocm-sdk-libraries-gfx1151 runtime kernels, venv)
+           ├─ droste-comfyui-halo         (+ torch; single interactive image, Triton JIT)
+           ├─ droste-llama-halo           ← COPY --from droste-llama-build-halo       (no torch)
+           ├─ droste-ds4-halo             ← COPY --from droste-ds4-build-halo         (no torch)
+           ├─ droste-vllm-halo     (+torch) ← COPY --from droste-vllm-build-halo
+           └─ droste-finetuning-halo (+torch) ← COPY --from droste-finetuning-build-halo
 
-rocm-runtime-base ─ rocm-build-base  (+ rocm-sdk-devel compilers + host toolchain)
-           ├─ llama-artifacts / ds4-artifacts        [scratch: /artifacts/{bin,lib64,share}]
-           └─ vllm-artifacts / finetuning-artifacts  [scratch: /artifacts/wheels]
+droste-runtime-base-halo ─ droste-build-base-halo  (+ rocm-sdk-devel compilers + host toolchain)
+           ├─ droste-llama-build-halo / droste-ds4-build-halo        [scratch: /artifacts/{bin,lib64,share}]
+           └─ droste-vllm-build-halo / droste-finetuning-build-halo  [scratch: /artifacts/wheels]
 ```
 
-**Artifact-carrier pattern:** heavy compiles happen in `rocm-build-base`; outputs are
-captured in minimal `FROM scratch` carriers; thin runtimes `COPY --from` them onto
-`rocm-runtime-base`. Shipped runtimes carry no SDK/toolchain.
+**Artifact-carrier pattern:** heavy compiles happen in `droste-build-base-halo`; outputs
+are captured in minimal `FROM scratch` `-build` carriers (holding only `/artifacts`); thin
+runtimes `COPY --from` them onto `droste-runtime-base-halo`. Shipped runtimes carry no
+SDK/toolchain.
 
 ## Images
 
-| Image | Base | Notes |
-|---|---|---|
-| `rocm-runtime-base` | `gemet/canopy` | ROCm runtime kernels (pip), de-divert, venv `/opt/venv` |
-| `rocm-build-base` | `rocm-runtime-base` | + `rocm-sdk-devel` (hipcc/clang) + host toolchain |
-| `llama-{artifacts,runtime}` | build/runtime | llama.cpp turboquant fork, gfx1151 HIP build |
-| `ds4-{artifacts,runtime}` | build/runtime | ds4 + rocWMMA build; cockpit via pipx |
-| `comfyui-toolbox` | runtime | single image; keeps compilers for Triton JIT at runtime |
-| `vllm-{artifacts,runtime}` | build/runtime | flash-attn + aiter + vllm wheels |
-| `finetuning-{artifacts,runtime}` | build/runtime | bitsandbytes + custom RCCL; HF/unsloth stack |
+Published as `ghcr.io/doctorjei/droste-<name>-halo`. Containerfiles are named
+`Container.<name>` under `base/`, `scaffolding/`, and `targets/`.
 
-`_fedora-src/` holds the original Fedora Containerfiles as a translation reference (not built).
+| Image | Containerfile | Base | Notes |
+|---|---|---|---|
+| `droste-runtime-base-halo` | `base/Container.runtime` | `gemet/canopy` | ROCm runtime kernels (pip), de-divert, venv `/opt/venv` |
+| `droste-build-base-halo` | `base/Container.build` | `droste-runtime-base-halo` | + `rocm-sdk-devel` (hipcc/clang) + host toolchain |
+| `droste-llama-build-halo` | `scaffolding/Container.llama-build` | build base | llama.cpp turboquant fork, gfx1151 HIP build [scratch carrier] |
+| `droste-llama-halo` | `targets/Container.llama` | runtime base | llama runtime (no torch); `COPY --from` build carrier |
+| `droste-ds4-build-halo` | `scaffolding/Container.ds4-build` | build base | ds4 + rocWMMA build [scratch carrier] |
+| `droste-ds4-halo` | `targets/Container.ds4` | runtime base | ds4 runtime (no torch); cockpit via pipx |
+| `droste-comfyui-halo` | `targets/Container.comfyui` | runtime base | single image; keeps compilers for Triton JIT at runtime |
+| `droste-vllm-build-halo` | `scaffolding/Container.vllm-build` | build base | flash-attn + aiter + vllm wheels [scratch carrier] |
+| `droste-vllm-halo` | `targets/Container.vllm` | runtime base | vllm runtime (+torch) |
+| `droste-finetuning-build-halo` | `scaffolding/Container.finetuning-build` | build base | bitsandbytes + custom RCCL wheels [scratch carrier] |
+| `droste-finetuning-halo` | `targets/Container.finetuning` | runtime base | HF/unsloth stack (+torch) |
+
+The `-build` carriers are `FROM scratch` images holding only `/artifacts`.
+
+`scaffolding/_fedora-src/` holds the original Fedora Containerfiles as a translation
+reference (not built).
 
 ## Building
 
@@ -86,7 +97,7 @@ scaffolding/check-rocm.sh --tag <sha> --runtime docker --pull
 scaffolding/check-rocm.sh --help       # all options
 ```
 
-It skips the `*-artifacts` images (they are `FROM scratch` — nothing to run) and checks the
+It skips the `*-build` carriers (they are `FROM scratch` — nothing to run) and checks the
 runnable tiers in two tiers: **CORE** (deterministic — GPU enumerates as `gfx1151`; `torch.cuda`
 sees it on comfyui/vllm/finetuning) and **APP** (per-toolbox smoke: `llama-server --version`,
 ds4 binary+`ldd`, `import vllm`, `import bitsandbytes`). Exits non-zero on any failure. The

@@ -1,15 +1,15 @@
-# droste-finetuning-halo: interactive, Jupyter LLM-finetuning toolbox (torth + HF/unsloth on halo)
+# droste-finetuning-halo: interactive, Jupyter LLM-finetuning toolbox (torch + HF/unsloth on halo)
 # Ported from github.com/kyuz0/amd-strix-halo-llm-finetuning
 
 # Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
 ARG SERIES_NAME=droste
 ARG ARCH_NAME=halo
 ARG TARGET_NAME=finetuning
-ARG DESCRIPTION="LLM-Finetuning (${ARCH_NAME} (interactive, torth + HF/unsloth, custom RCCL)"
+ARG DESCRIPTION="LLM-Finetuning (${ARCH_NAME}): interactive, torch + HF/unsloth, custom RCCL"
 
 # Image Names
 ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
-ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build
+ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build-${ARCH_NAME}
 
 # Pinned (Torch version)
 ARG GFX_TARGET=gfx1151
@@ -24,6 +24,7 @@ ARG UNSLOTH_REF=07a7ff47b1b2b37c088b8e0d7ed7bf8710d9aa22
 
 FROM ${ARTIFACTS_IMAGE} AS artifacts
 FROM ${BASE_IMAGE}
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 # Dependency installation (tools, libgomp1, torch)

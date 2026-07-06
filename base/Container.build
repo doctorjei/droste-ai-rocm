@@ -11,6 +11,7 @@ ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
 
 # Build image
 FROM ${BASE_IMAGE}
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 # Torch pinned version

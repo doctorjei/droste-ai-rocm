@@ -8,6 +8,7 @@ ARG DESCRIPTION="TheRock gfx1151 ROCm runtime kernels"
 ARG BASE_IMAGE=ghcr.io/doctorjei/gemet/canopy:1.7.3
 
 FROM ${BASE_IMAGE}
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 # Remove the .distrib diversions, then rehydrate GNU coreutils before any other installations

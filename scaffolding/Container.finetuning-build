@@ -7,13 +7,14 @@ ARG TARGET_NAME=finetuning-build
 ARG BUILDER_DESC="builder image for bitsandbytes & custom RCCL"
 
 
-ARG DESCRIPTION="compiled outputs for ds4 image"
+ARG DESCRIPTION="compiled outputs for finetuning image"
 
 # Image Names
 ARG BASE_IMAGE=localhost/${SERIES_NAME}-build-base-${ARCH_NAME}
 
 # Build image
 FROM ${BASE_IMAGE} AS builder
+ARG SERIES_NAME TARGET_NAME ARCH_NAME BUILDER_DESC
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${BUILDER_DESC}"
 
 # ROCm Pin
@@ -69,5 +70,6 @@ RUN mkdir -p rocm-systems && cd rocm-systems \
 
 # Copy artifacts
 FROM scratch
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 COPY --from=builder /artifacts /artifacts

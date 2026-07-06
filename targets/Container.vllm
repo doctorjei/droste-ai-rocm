@@ -1,4 +1,4 @@
-# droste-llama-halo: llama.cpp toolbox on halo.
+# droste-vllm-halo: vLLM toolbox (TheRock torch + prebuilt wheels) on halo.
 # Ported from github.com/kyuz0/amd-strix-halo-toolboxes
 
 # Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
@@ -9,11 +9,12 @@ ARG DESCRIPTION="vLLM toolbox (TheRock torch & prebuilt wheels)"
 
 # Image Names
 ARG BASE_IMAGE=localhost/${SERIES_NAME}-runtime-base-${ARCH_NAME}
-ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build
+ARG ARTIFACTS_IMAGE=localhost/${SERIES_NAME}-${TARGET_NAME}-build-${ARCH_NAME}
 
 # Build image
 FROM ${ARTIFACTS_IMAGE} AS artifacts
 FROM ${BASE_IMAGE}
+ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 # ROCM / Torch Pin
