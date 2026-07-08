@@ -184,10 +184,13 @@ not baked. comfyui's `scripts/tests/` is repo-only (never COPY'd).
 - **llama** — `llama.env` is BUILD-generated from the pinned llama-server's own
   arg table (`scripts/gen_llama_env.sh`: `--help` parse with a binary-string-scan
   fallback), so the commented flag list can't drift from the pinned binary; the
-  build FAILS LOUDLY if `LLAMA_ARG_{HOST,PORT,SLOT_SAVE_PATH,MODEL}` vanish
-  upstream. `LLAMA_CACHE` is deliberately UNSET — it is first in llama.cpp's
+  build FAILS LOUDLY if `LLAMA_ARG_{HOST,PORT,MODEL}` vanish upstream.
+  `LLAMA_CACHE` is deliberately UNSET — it is first in llama.cpp's
   cache-path resolution and setting it would re-separate the shared HF cache.
-  The slot store dir (`LLAMA_ARG_SLOT_SAVE_PATH=/opt/data/cache/slots`) is
+  Slot save/restore: the pinned fork ships `--slot-save-path` with NO env
+  annotation (verified by the first CI run failing loudly, as designed), so
+  the entrypoint launch line passes `--slot-save-path /opt/data/cache/slots`
+  (user override = own flag in LLAMA_EXTRA_ARGS; later flags win); the dir is
   pre-created in PRE_LAUNCH.
 - **ds4** — ds4 has no native per-flag env vars, so PRE_LAUNCH translates
   `DS4_DROSTE_*` → argv (arity source-verified against pinned kyuz0/ds4

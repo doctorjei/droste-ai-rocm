@@ -29,11 +29,18 @@ note() { printf 'gen_llama_env: %s\n' "$*" >&2; }
 # because CLI flags override env in llama.cpp — env lines keep user edits winning.
 ACTIVE_HOST=0.0.0.0
 ACTIVE_PORT=8080
-ACTIVE_SLOTS=/opt/data/cache/slots
+# Slot save/restore: the pinned fork ships --slot-save-path with NO env
+# annotation, so there is no LLAMA_ARG_SLOT_SAVE_PATH to set here — the flag is
+# added by the entrypoint's launch line instead (targets/llama/build-spec,
+# llama_pre_launch). This path only feeds the explanatory comment block below.
+SLOTS_DIR=/opt/data/cache/slots
 # Vars that MUST exist in the pinned llama-server's arg table (build fails if not).
-REQUIRED_VARS=(LLAMA_ARG_HOST LLAMA_ARG_PORT LLAMA_ARG_SLOT_SAVE_PATH LLAMA_ARG_MODEL)
-# Vars excluded from the generic commented list (they get dedicated blocks above it).
-SPECIAL_VARS="LLAMA_ARG_HOST LLAMA_ARG_PORT LLAMA_ARG_SLOT_SAVE_PATH LLAMA_ARG_MODEL"
+REQUIRED_VARS=(LLAMA_ARG_HOST LLAMA_ARG_PORT LLAMA_ARG_MODEL)
+# Vars excluded from the generic commented list (they get dedicated blocks above
+# it). LLAMA_ARG_SLOT_SAVE_PATH is deliberately NOT excluded: absent from the
+# current pin, but if a future pin gains it, it should flow through as an
+# ordinary enumerated (commented) flag — never REQUIRED.
+SPECIAL_VARS="LLAMA_ARG_HOST LLAMA_ARG_PORT LLAMA_ARG_MODEL"
 
 TAB=$(printf '\t')
 
@@ -108,7 +115,12 @@ mkdir -p "$(dirname "$OUT")"
         "# ── active defaults (droste) ─────────────────────────────────────────────────" \
         "LLAMA_ARG_HOST=$ACTIVE_HOST" \
         "LLAMA_ARG_PORT=$ACTIVE_PORT" \
-        "LLAMA_ARG_SLOT_SAVE_PATH=$ACTIVE_SLOTS" \
+        "" \
+        "# ── slot save/restore ────────────────────────────────────────────────────────" \
+        "# Slot save/restore is enabled via the launch flag --slot-save-path $SLOTS_DIR," \
+        "# added by the entrypoint's launch line (no env line needed here). To change" \
+        "# the location, put your own '--slot-save-path <dir>' in LLAMA_EXTRA_ARGS" \
+        "# below — later flags win in llama-server's parser." \
         ""
     printf '%s\n' \
         "# ── model ────────────────────────────────────────────────────────────────────" \

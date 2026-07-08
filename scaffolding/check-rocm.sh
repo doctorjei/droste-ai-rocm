@@ -91,7 +91,10 @@ run_check() {
   printf '── %-28s %s\n' "$label" "$image"
   if [[ "$PULL" -eq 1 ]]; then "$RUNTIME" pull -q "$image" >/dev/null 2>&1 || true; fi
   set +e
-  out="$("$RUNTIME" run "${DEVICE_ARGS[@]}" "$image" bash -lc "$cmd" 2>&1)"
+  # ALLOW_EPHEMERAL: the shared entrypoint hard-errors on unbound critical
+  # mounts before running the probe command; smoke probes are deliberately
+  # bind-less, so downgrade the criticals to warnings.
+  out="$("$RUNTIME" run -e ALLOW_EPHEMERAL=1 "${DEVICE_ARGS[@]}" "$image" bash -lc "$cmd" 2>&1)"
   rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
