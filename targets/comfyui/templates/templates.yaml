@@ -1,0 +1,16 @@
+# templates.yaml — comfyui seed manifest, applied by the shared apply_templates.py
+# AFTER mounts (restricted subset: flat `src: dest` maps; src relative to this dir,
+# dest absolute; see base/resolve/apply_templates.py).
+#
+# if_empty  — copy iff dest is a COMPLETELY EMPTY (or missing) directory.
+# if_missing — copy iff dest does not exist. Never overwrites.
+#
+# (mount_shared_models_here is NOT listed here — it is the /opt/models marker BODY,
+#  picked up by name by the resolver's OPTIONAL primitive.)
+
+if_empty:
+  input: /opt/ComfyUI/input
+  user: /opt/ComfyUI/user
+
+if_missing:
+  extra_model_paths.yaml: /opt/data/extra_model_paths.yaml

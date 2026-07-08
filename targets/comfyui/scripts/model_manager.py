@@ -7,9 +7,9 @@ import subprocess
 from pathlib import Path
 
 # --- Configuration ---
-# Hardcoded paths for Docker environment
-SCRIPT_DIR = Path("/opt")
-WORKFLOW_DIR = Path("/opt/comfy-workflows")
+# Hardcoded paths for the container environment
+SCRIPT_DIR = Path("/opt/resources/scripts")
+WORKFLOW_DIR = Path("/opt/resources/api_workflows")
 
 # --- Model Families Configuration ---
 # Group workflows by "Functionality". 

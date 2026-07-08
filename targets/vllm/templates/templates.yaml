@@ -1,0 +1,5 @@
+# vLLM template manifest — consumed by apply_templates.py (restricted YAML subset).
+# Seed the build-generated default config to the persisted /opt/data volume on first
+# run only; never overwrite the user's edited copy.
+if_missing:
+  vllm_config.yaml: /opt/data/vllm_config.yaml

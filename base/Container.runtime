@@ -62,3 +62,19 @@ RUN printf '%s\n' \
     'export PATH="$ROCM_PATH/bin:/opt/venv/bin:$PATH"' \
     'export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib64:$LD_LIBRARY_PATH"' \
     > /etc/profile.d/rocm.sh
+
+# Shared runtime resolver + entrypoint + template applier. Baked under the
+# /opt/resources umbrella (with build-spec/templates/scripts) so all 5 ports inherit
+# ONE copy; the dir is on PATH so `droste-entrypoint.sh` is invocable bare (ports set
+# their own ENTRYPOINT). Base sets no ENTRYPOINT (ports opt in).
+COPY resolve/droste-resolve.sh resolve/droste-entrypoint.sh \
+     resolve/droste-init-hook.sh resolve/apply_templates.py \
+     /opt/resources/resolve/
+RUN chmod +x /opt/resources/resolve/droste-entrypoint.sh \
+             /opt/resources/resolve/droste-init-hook.sh \
+             /opt/resources/resolve/apply_templates.py
+ENV PATH=/opt/resources/resolve:$PATH
+
+# The one container-specific volume, shared by all ports: auto-anonymous-volume when
+# unbound (entrypoint warns), user binds -v <host>:/opt/data to persist.
+VOLUME /opt/data

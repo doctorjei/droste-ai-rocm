@@ -1,0 +1,77 @@
+# this container's mounts + service, both lanes  (vLLM)
+#
+# build-spec — per-port runtime declaration, sourced by the shared resolver.
+# Baked at /opt/resources/build-spec. See base/resolve/build-spec.example for the
+# full contract. SOURCED bash: plain arrays/vars, zero dependencies.
+
+# ── SERVICE (required) ───────────────────────────────────────────────────────
+# vLLM serves the model named in the config file. $VLLM_CONFIG is a deliberate env
+# knob (a config-file SELECTOR with a smart default — not a raw path the user must
+# know); $VLLM_EXTRA_ARGS (folded in by PRE_LAUNCH below) is the other. Default =
+# the persisted /opt/data copy that templates.yaml seeds (if_missing) from the
+# build-generated template. User may point it elsewhere.
+# No model in the config => vLLM exits immediately with "model is required" — a natural,
+# self-explanatory failure (the template's model line is REQUIRED + prominent), so we add
+# no custom pre-flight for it.
+: "${VLLM_CONFIG:=/opt/data/vllm_config.yaml}"
+export VLLM_CONFIG
+SERVICE=( vllm serve --config "$VLLM_CONFIG" )
+
+# ── ENV_FILE (optional) ──────────────────────────────────────────────────────
+# vLLM's config is a YAML consumed via --config, not a sourced env file.
+ENV_FILE=""
+
+# ── OVERLAYS (optional) — <upper>:<lower> ────────────────────────────────────
+# Overlay the persisted upper over the WHOLE baked venv (captures bin/ console
+# scripts too and avoids pinning a pythonX.Y path) so user pip installs persist
+# without shadowing the baked torch/vllm stack.
+OVERLAYS=(
+    "/opt/data/venv:/opt/venv"
+)
+
+# ── SURFACES (optional) — <src>:<dest> ───────────────────────────────────────
+# No container-specific state surfaces beyond caches/config for vLLM.
+SURFACES=()
+
+# ── CACHES (optional) — <src>:<dest> ─────────────────────────────────────────
+# Persist the torch-stack compute/kernel caches with zero env vars ($HOME-relative so
+# both lanes resolve correctly). Triton default cache is ~/.triton/cache (01-rocm-env-
+# for-triton.sh sets no TRITON_CACHE_DIR, so the default holds). MIOpen writes a user
+# db under ~/.config/miopen in addition to the ~/.cache/miopen kernel cache.
+# vLLM's own ~/.cache/vllm is NOT bound here: VLLM_DISABLE_COMPILE_CACHE=1 suppresses the
+# torch.compile graph store. VERIFY-AT-TEST: if ~/.cache/vllm receives artifacts under our
+# flag set, add "/opt/data/cache/vllm:$HOME/.cache/vllm" here.
+CACHES=(
+    "/opt/data/cache/miopen:$HOME/.cache/miopen"
+    "/opt/data/cache/miopen-config:$HOME/.config/miopen"
+    "/opt/data/cache/triton:$HOME/.triton/cache"
+)
+
+# ── CRITICAL (optional) — <label>:<path> ─────────────────────────────────────
+# HF cache is CRITICAL: unbound => vLLM silently re-downloads multi-GB weights into an
+# anonymous volume that vanishes on recreate. Hard-error unless ALLOW_EPHEMERAL.
+CRITICAL=(
+    "hf-cache:$HOME/.cache/huggingface"
+)
+
+# ── OPTIONAL (optional) — <label>:<path>[:<marker>] ──────────────────────────
+# A directory of local weights the user may bind; tell-once, don't nag. vLLM can serve a
+# model by absolute path (model: /opt/models/...) in the config. Marker body:
+# templates/mount_shared_models_here.
+OPTIONAL=(
+    "models:/opt/models:/opt/models/mount_shared_models_here"
+)
+
+# ── PRE_LAUNCH (optional) ────────────────────────────────────────────────────
+# SERVICE-rebuild (see build-spec.example): fold $VLLM_EXTRA_ARGS into the argv —
+# CLI args placed after --config override the config file's values (vLLM's own
+# CLI-over-config merge), exactly as the generated config header documents.
+# No env->argv translation otherwise (vLLM reads --config natively); the model
+# rides the config; stale-graph handling is a documented one-liner (compile cache
+# is disabled), not an automated pre-launch step.
+PRE_LAUNCH="vllm_pre_launch"
+vllm_pre_launch() {
+    # Deliberate word-split, unset-safe; quoting inside the value is not honoured.
+    # shellcheck disable=SC2206
+    SERVICE=( vllm serve --config "$VLLM_CONFIG" ${VLLM_EXTRA_ARGS:-} )
+}

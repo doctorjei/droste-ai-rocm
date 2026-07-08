@@ -1,11 +1,11 @@
-# droste-comfyui-halo: interactive ComfyUI + AMD studios on the unified ROCm base
+# droste-comfyui-halo: ComfyUI server on the unified ROCm base
 # Ported from https://github.com/kyuz0/amd-strix-halo-comfyui-toolboxes
 
 # Overrideable Arguments - General Build (override with '--build-arg <ARG_NAME>=<VALUE>'
 ARG SERIES_NAME=droste
 ARG ARCH_NAME=halo
 ARG TARGET_NAME=comfyui
-ARG DESCRIPTION="ComfyUI (interactive, Triton JIT)"
+ARG DESCRIPTION="ComfyUI (server, Triton JIT)"
 ARG BASE_IMAGE=localhost/${SERIES_NAME}-torch-base-${ARCH_NAME}
 
 # Overrideable Arguemnts - ROCM / TORCH
@@ -15,22 +15,19 @@ ARG TORCHVISION_VERSION=
 ARG TORCHAUDIO_VERSION=
 ARG TRANSFORMERS_VERSION=4.56.2
 
-## ComfyUI, Custom Nodes, & AMD Studios (Pinned 2026-07-05)
+## ComfyUI & Custom Nodes (Pinned 2026-07-05)
 #### COMFYUI_REF: comfyanonymous/ComfyUI        ESSENTIALS_REF: cubiq/ComfyUI_essentials
 #### GGUF_REF: city96/ComfyUI-GGUF              AMDGPUMONITOR_REF: kyuz0/ComfyUI-AMDGPUMonitor
-#### QWEN_STUDIO_REF: kyuz0/qwen-image-studio   WAN_STUDIO_REF: kyuz0/wan-video-studio
 ARG COMFYUI_REF=985fb9d6adc974df9783d3d355cf86b992956212
 ARG ESSENTIALS_REF=9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
 ARG AMDGPUMONITOR_REF=0c584ed28ed3678d96f631a6eff91be397c0baa4
 ARG GGUF_REF=6ea2651e7df66d7585f6ffee804b20e92fb38b8a
-ARG QWEN_STUDIO_REF=5e6659aab39b88f27334cf6eaebbe9b6dbc2eefe
-ARG WAN_STUDIO_REF=b496fa3aa73b0aa628f1acb3d0b8f6de17570798
 
 # --- IMAGE BUILD BEGINS HERE ---
 FROM ${BASE_IMAGE}
 ARG SERIES_NAME TARGET_NAME ARCH_NAME DESCRIPTION
 ARG ROCM_INDEX_URL TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION TRANSFORMERS_VERSION
-ARG COMFYUI_REF ESSENTIALS_REF AMDGPUMONITOR_REF GGUF_REF QWEN_STUDIO_REF WAN_STUDIO_REF
+ARG COMFYUI_REF ESSENTIALS_REF AMDGPUMONITOR_REF GGUF_REF
 LABEL description="${SERIES_NAME}-${TARGET_NAME}-${ARCH_NAME}: ${DESCRIPTION}"
 
 ## Dependencies: General / Media & Triton JIT (required at runtime)
@@ -39,7 +36,7 @@ RUN apt-get -qq update && apt-get -qq install -y --no-install-recommends \
             gcc g++ make binutils python3-dev && \
     rm -rf /var/lib/apt/lists/* && apt-get clean
 
-## PIP: Torch Stack, GGUF, & Transformers (pinned if set) 
+## PIP: Torch Stack, GGUF, & Transformers (pinned if set)
 RUN pip install --pre --index-url ${ROCM_INDEX_URL} \
        "torchvision${TORCHVISION_VERSION:+==${TORCHVISION_VERSION}}" \
        "torchaudio${TORCHAUDIO_VERSION:+==${TORCHAUDIO_VERSION}}" && \
@@ -75,57 +72,46 @@ RUN git clone --depth=1 https://github.com/city96/ComfyUI-GGUF /opt/ComfyUI/cust
          && git -C /opt/ComfyUI/custom_nodes/ComfyUI-GGUF checkout "${GGUF_REF}"; \
        fi
 
-# Qwen Image Studio
-WORKDIR /opt
-RUN git clone --depth=1 https://github.com/kyuz0/qwen-image-studio /opt/qwen-image-studio \
-    && if [ -n "${QWEN_STUDIO_REF}" ]; then \
-         git -C /opt/qwen-image-studio fetch --depth=1 origin "${QWEN_STUDIO_REF}" \
-         && git -C /opt/qwen-image-studio checkout "${QWEN_STUDIO_REF}"; \
-       fi \
-    && pip install -r /opt/qwen-image-studio/requirements.txt
-
-# Wan Video Studio (explicit dep; not its requirements.txt).
-RUN git clone --depth=1 https://github.com/kyuz0/wan-video-studio /opt/wan-video-studio \
-    && if [ -n "${WAN_STUDIO_REF}" ]; then \
-         git -C /opt/wan-video-studio fetch --depth=1 origin "${WAN_STUDIO_REF}" \
-         && git -C /opt/wan-video-studio checkout "${WAN_STUDIO_REF}"; \
-       fi \
-    && pip install --prefer-binary \
-       opencv-python-headless diffusers tokenizers accelerate \
-       "imageio[ffmpeg]" easydict ftfy dashscope imageio-ffmpeg decord librosa
+# Relocate the 11 baked SD/SD2 config yamls OUT of the models tree (the runtime
+# model-tree bind replaces models/); they register back via the seeded
+# /opt/data/extra_model_paths.yaml -> /opt/resources/model_configs. models/configs/
+# stays (empty): users may drop their own .yaml into their models bind.
+RUN mkdir -p /opt/resources/model_configs \
+    && mv /opt/ComfyUI/models/configs/*.yaml /opt/resources/model_configs/
 
 # --- Assets (copied into build context from upstream/comfyui) ---
-# Helper scripts (ComfyUI-only) -> /opt.
-COPY scripts/get_wan22.sh /opt/
-COPY scripts/set_extra_paths.sh /opt/
-COPY scripts/get_qwen_image.sh /opt/
-COPY scripts/get_hunyuan15.sh /opt/
-COPY scripts/get_ltx2.sh /opt/
-COPY scripts/benchmark_workflows.py /opt/
-COPY scripts/collect_perf_logs.py /opt/
-COPY scripts/model_manager.py /opt/
+# Helper scripts: baked RO on PATH/PYTHONPATH, never seeded.
+COPY scripts/get_wan22.sh scripts/get_qwen_image.sh scripts/get_hunyuan15.sh \
+     scripts/get_ltx2.sh scripts/benchmark_workflows.py scripts/collect_perf_logs.py \
+     scripts/model_manager.py scripts/model_scanner.py /opt/resources/scripts/
+ENV PATH=/opt/resources/scripts:$PATH PYTHONPATH=/opt/resources/scripts
 
-# API workflow definitions + example inputs + UI workflows.
-COPY workflows/API /opt/comfy-workflows
-COPY workflows/input/ai-server.jpg /opt/ComfyUI/input/
-COPY workflows/input/ai-server-2.png /opt/ComfyUI/input/
-COPY workflows/input/example2.jpg /opt/ComfyUI/input/
-COPY workflows/*.json /opt/ComfyUI/user/default/workflows/
+# API-format workflow definitions (baked RO reference; 1:1 with the get_*.sh models).
+COPY api_workflows /opt/resources/api_workflows
+
+# Runtime contract: per-port spec for the shared resolver + seed templates
+# (demo inputs, UI workflow set, extra_model_paths.yaml, /opt/models marker body).
+COPY build-spec /opt/resources/build-spec
+COPY templates /opt/resources/templates
 
 # Permissions & trims (keep compilers/headers for Triton JIT at runtime).
-RUN chmod -R a+rwX /opt && chmod +x /opt/*.sh || true \
+RUN chmod +x /opt/resources/scripts/* \
     && find /opt/venv -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true \
     && find /opt/venv -type d -name "__pycache__" -prune -exec rm -rf {} + \
     && pip cache purge || true \
     && rm -rf /root/.cache/pip || true
 
 # Interactive login shell wiring (torch/AOTriton env, login banner, guards, core-dump suppression)
-COPY scripts/01-rocm-envs.sh /etc/profile.d/01-rocm-envs.sh
-COPY scripts/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
-COPY scripts/zz-venv-last.sh /etc/profile.d/zz-venv-last.sh
+COPY profile.d/01-rocm-envs.sh /etc/profile.d/01-rocm-envs.sh
+COPY profile.d/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
+COPY profile.d/zz-venv-last.sh /etc/profile.d/zz-venv-last.sh
 RUN chmod 0644 /etc/profile.d/01-rocm-envs.sh /etc/profile.d/99-toolbox-banner.sh /etc/profile.d/zz-venv-last.sh \
     && printf 'ulimit -S -c 0\n' > /etc/profile.d/90-nocoredump.sh \
     && chmod 0644 /etc/profile.d/90-nocoredump.sh
 
-WORKDIR /opt
-CMD ["/bin/bash"]
+# Server by default: the shared entrypoint applies the build-spec (mounts, critical
+# checks, template seeding, model scanner) then execs ComfyUI on :8188. A user
+# command (`podman run IMAGE bash`) still wins; distrobox/toolbx replace pid1 and
+# run the same resolver from init_hooks instead.
+WORKDIR /opt/ComfyUI
+ENTRYPOINT ["/opt/resources/resolve/droste-entrypoint.sh"]

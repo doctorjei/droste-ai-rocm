@@ -1,0 +1,126 @@
+# this container's mounts + service, both lanes
+#
+# build-spec — per-port runtime declaration, sourced by the shared resolver.
+# (Name `build-spec` is a PLACEHOLDER pending a rename.) Baked at
+# /opt/resources/build-spec; the repo holds one per target (targets/<port>/build-spec).
+#
+# This is SOURCED bash — plain arrays/vars, zero dependencies. The shared entrypoint
+# (droste-entrypoint.sh) sources droste-resolve.sh, sources this file, then runs
+# resolve::apply_spec in this EXACT order:
+#
+#   ensure /opt/data (auto-vol + warn)
+#     -> SURFACES + OVERLAYS + CACHES   (mounted; server lane only, no-op in distrobox)
+#     -> CRITICAL                       (hard-error if unbound + ALLOW_EPHEMERAL escape)
+#     -> OPTIONAL                       (INFO once + create marker file)
+#     -> templates.yaml seeding         (AFTER mounts)
+#     -> ENV_FILE source                (if declared and the file exists)
+#     -> PRE_LAUNCH function            (if declared)
+#     -> exec SERVICE                   (or the user's `run IMAGE <cmd>`, which wins)
+#
+# All content SEEDING (default files/dirs) is owned by templates.yaml, NOT this file.
+# There is deliberately no DEFAULTS row. Every path below is EXPLICIT and ABSOLUTE.
+
+# ── SERVICE (required) ───────────────────────────────────────────────────────
+# The service argv. Bash array; exec'd verbatim unless the user passes a command.
+#
+# TIMING: this file is plain sourced bash, so the array's words expand at
+# SPEC-SOURCE time — BEFORE ENV_FILE is sourced. A SERVICE that must carry
+# env-file-derived pieces (e.g. $LLAMA_EXTRA_ARGS) cannot reference them here;
+# use the SERVICE-REBUILD pattern instead: declare a placeholder argv, then have
+# PRE_LAUNCH (which runs AFTER ENV_FILE) rebuild it — see PRE_LAUNCH below.
+SERVICE=( python /opt/ComfyUI/main.py --listen 0.0.0.0 --port 8188 )
+
+# ── ENV_FILE (optional) ──────────────────────────────────────────────────────
+# Absolute path to a file sourced right before PRE_LAUNCH. Used by llama/ds4 whose
+# config is an env file (generated into /opt/data by templates.yaml if_missing).
+# The resolver sources it under `set -a`, so plain VAR= lines are EXPORTED and
+# survive the exec into the service (ports may still belt-and-braces re-export in
+# PRE_LAUNCH so the spec stays self-sufficient under other callers).
+# Leave "" if unused.
+ENV_FILE=""
+# ENV_FILE="/opt/data/llama.env"
+
+# ── OVERLAYS (optional) — <upper>:<lower> ────────────────────────────────────
+# Kernel overlayfs mounted OVER the baked <lower> dir; user writes land in <upper>
+# (a /opt/data subpath, persisted). Server lane only. Use where the baked lower is
+# load-bearing (the whole venv, comfyui custom_nodes). upper = /opt/data side,
+# lower = baked app dir. Overlay the WHOLE venv (captures bin/ entry-points too and
+# avoids pinning a pythonX.Y path), not just site-packages.
+OVERLAYS=(
+    "/opt/data/venv:/opt/venv"
+    "/opt/data/custom_nodes:/opt/ComfyUI/custom_nodes"
+)
+
+# ── SURFACES (optional) — <src>:<dest> ───────────────────────────────────────
+# Plain bind of a /opt/data subpath (src) onto an app-side path (dest). Server lane
+# only. Use for container-specific state with no baked content to preserve (e.g.
+# comfyui user/ and the scanner model-tree). src created if absent.
+SURFACES=(
+    "/opt/data/user:/opt/ComfyUI/user"
+    "/opt/data/model-tree:/opt/ComfyUI/models"
+)
+
+# ── CACHES (optional) — <src>:<dest> ─────────────────────────────────────────
+# Same mechanics as SURFACES, kept as a SEPARATE row by design (future cache-specific
+# behaviour). Binds /opt/data/cache/<x> onto a tool's default ~/.cache/* path so
+# compute/kernel caches persist with zero env vars. Server lane only; silent.
+# Home-relative dests use $HOME (NOT a hardcoded /root): the spec is sourced in
+# BOTH lanes, and only $HOME resolves correctly in each (server /root, distrobox
+# the user's host home).
+CACHES=(
+    "/opt/data/cache/miopen:$HOME/.cache/miopen"
+    "/opt/data/cache/triton:$HOME/.triton/cache"
+    "/opt/data/cache/torch:$HOME/.cache/torch"
+)
+
+# ── CRITICAL (optional) — <label>:<path> ─────────────────────────────────────
+# Hard-error (refuse to start) if <path> is not bound; the message names <label> and
+# shows an example bind flag. ALLOW_EPHEMERAL (bare env name, any value) downgrades
+# every CRITICAL to a warning and continues ephemeral. Both lanes.
+# HF cache is CRITICAL on every port that uses it (unbound => silent 20GB+ re-download).
+# Use $HOME for home-relative paths (lane-correct — under distrobox's whole-$HOME
+# bind the ancestor-walk correctly reads them as bound; /root never would be).
+CRITICAL=(
+    "input:/opt/ComfyUI/input"
+    "output:/opt/ComfyUI/output"
+    "hf-cache:$HOME/.cache/huggingface"
+)
+
+# ── OPTIONAL (optional) — <label>:<path>[:<marker>] ──────────────────────────
+# Tell-once-don't-nag. If <path> is unpopulated (empty or marker-only) AND the marker
+# is absent: emit an INFO line and CREATE the marker (body = templates dir file named
+# like the marker basename, else a built-in one-liner). Unpopulated + marker present:
+# silent. Populated: silent. Marker defaults to <path>/.droste-informed if omitted.
+OPTIONAL=(
+    "opt-models:/opt/models:/opt/models/mount_shared_models_here"
+)
+
+# ── PRE_LAUNCH (optional) ────────────────────────────────────────────────────
+# Name of a bash FUNCTION defined in THIS file; run after ENV_FILE, before exec.
+# Examples: comfyui model_scanner sync; ds4 DS4_DROSTE_* -> argv translation.
+PRE_LAUNCH=""
+# PRE_LAUNCH="port_pre_launch"
+# port_pre_launch() {
+#     model_scanner sync
+# }
+#
+# THE SERVICE-REBUILD PATTERN (how llama/ds4 pass env-derived args):
+# SERVICE expands at spec-source time, BEFORE ENV_FILE — so a spec whose argv
+# depends on env-file values declares a bare placeholder up top and rebuilds the
+# array in PRE_LAUNCH, which runs AFTER the env file is sourced:
+#
+#   SERVICE=( llama-server )                       # placeholder argv
+#   ENV_FILE="/opt/data/llama.env"
+#   PRE_LAUNCH="port_pre_launch"
+#   port_pre_launch() {
+#       # belt-and-braces: re-export the vars the binary reads from its
+#       # environment (the resolver's set -a source already exports ENV_FILE
+#       # assignments; this also covers vars set outside the env file).
+#       local v
+#       for v in $(compgen -v LLAMA_ || true); do export "${v?}"; done
+#       # rebuild the argv now that env-file values are known
+#       # shellcheck disable=SC2206
+#       SERVICE=( llama-server ${LLAMA_EXTRA_ARGS:-} )
+#   }
+#
+# The entrypoint execs whatever SERVICE holds AFTER PRE_LAUNCH returns.

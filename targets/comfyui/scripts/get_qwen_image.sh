@@ -1,36 +1,17 @@
 #!/usr/bin/env bash
-# /opt/get_qwen.sh (resume-friendly, supports Qwen Image + Qwen Image Edit)
+# get_qwen_image.sh — download Qwen Image / Qwen Image Edit models into the shared
+# HF cache (resume-friendly). The startup model scanner links cached models into
+# ComfyUI/models.
 set -euo pipefail
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
-export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"   # persistent HF cache
 HF="/opt/venv/bin/hf"
 
-MODEL_HOME="$HOME/comfy-models"
-STAGE="$MODEL_HOME/.hf_stage_qwen"                      # persistent staging (resume support)
-
-mkdir -p "$MODEL_HOME"/{text_encoders,vae,diffusion_models,loras}
-mkdir -p "$STAGE"
-
 dl() {
-  local repo="$1"; shift
-  local remote="$1"; shift
-  local subdir="$1"; shift
-  local dest="$MODEL_HOME/$subdir/$(basename "$remote")"
-  local staged="$STAGE/$remote"
-
-  if [[ -f "$dest" ]]; then
-    echo "✓ Already present: $dest"
-    return
-  fi
-
-  echo "↓ Downloading $(basename "$remote") → $dest"
-  mkdir -p "$(dirname "$staged")"
-  "$HF" download "$repo" "$remote" \
-      --repo-type model \
-      --cache-dir "$HF_HOME" \
-      --local-dir "$STAGE"
-  mv -f "$staged" "$dest"
+  local repo="$1"
+  local remote="$2"
+  echo "↓ Fetching $repo :: $remote"
+  "$HF" download "$repo" "$remote" --repo-type model
 }
 
 echo "Which Qwen variant do you want to download?"
@@ -56,36 +37,36 @@ case "$choice" in
     REPO="Comfy-Org/Qwen-Image_ComfyUI"
     echo "==> Downloading Qwen-Image 2512 (20B) - $PRECISION"
     if [[ "$PRECISION" == "bf16" ]]; then
-         dl "$REPO" "split_files/diffusion_models/qwen_image_2512_bf16.safetensors" "diffusion_models"
+         dl "$REPO" "split_files/diffusion_models/qwen_image_2512_bf16.safetensors"
     else
-         dl "$REPO" "split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors" "diffusion_models"
+         dl "$REPO" "split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors"
     fi
-    dl "$REPO" "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors" "text_encoders"
-    dl "$REPO" "split_files/vae/qwen_image_vae.safetensors" "vae"
+    dl "$REPO" "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
+    dl "$REPO" "split_files/vae/qwen_image_vae.safetensors"
     ;;
   2)
     REPO="Comfy-Org/Qwen-Image-Edit_ComfyUI"
     echo "==> Downloading Qwen-Image-Edit - $PRECISION"
     # Requires text encoder + VAE from Qwen-Image
     BASE="Comfy-Org/Qwen-Image_ComfyUI"
-    dl "$BASE" "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors" "text_encoders"
-    dl "$BASE" "split_files/vae/qwen_image_vae.safetensors" "vae"
-    
+    dl "$BASE" "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
+    dl "$BASE" "split_files/vae/qwen_image_vae.safetensors"
+
     if [[ "$PRECISION" == "bf16" ]]; then
-        dl "$REPO" "split_files/diffusion_models/qwen_image_edit_2511_bf16.safetensors" "diffusion_models"
+        dl "$REPO" "split_files/diffusion_models/qwen_image_edit_2511_bf16.safetensors"
     else
-        dl "$REPO" "split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors" "diffusion_models"
+        dl "$REPO" "split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors"
     fi
     ;;
   3)
     REPO="lightx2v/Qwen-Image-2512-Lightning"
     echo "==> Downloading Qwen-Image-2512-Lightning LoRA"
-    dl "$REPO" "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors" "loras"
+    dl "$REPO" "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors"
     ;;
   4)
     REPO="lightx2v/Qwen-Image-Edit-2511-Lightning"
     echo "==> Downloading Qwen-Image-Edit-Lightning LoRA"
-    dl "$REPO" "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors" "loras"
+    dl "$REPO" "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
     ;;
   *)
     echo "Invalid choice. Exiting."
@@ -93,4 +74,6 @@ case "$choice" in
     ;;
 esac
 
-echo "✓ Models ready in $MODEL_HOME"
+echo "✓ Done. Files are in the shared HF cache (~/.cache/huggingface)."
+echo "  They appear in ComfyUI after a container restart (the model scanner runs at start),"
+echo "  or immediately after running: model_scanner.py sync"

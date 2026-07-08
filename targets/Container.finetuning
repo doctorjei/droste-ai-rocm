@@ -72,20 +72,32 @@ RUN git clone "${UNSLOTH_REPO}" /tmp/unsloth \
     && pip install --no-cache-dir . \
     && rm -rf /tmp/unsloth
 
-# Workspace (finetuning notebooks + helper scripts)
-COPY workspace /opt/workspace
+# Droste runtime assets under the /opt/resources umbrella:
+#   scripts/   — helper CLIs + lib.py, read-only, on PATH (CLIs) + PYTHONPATH (from lib import ...)
+#   templates/ — templates.yaml + pristine starter notebooks (seed if_empty -> /opt/workspace)
+#   build-spec — this port's mounts + service, consumed by the shared entrypoint
+COPY scripts    /opt/resources/scripts
+COPY templates  /opt/resources/templates
+COPY build-spec /opt/resources/build-spec
+ENV PATH=/opt/resources/scripts:$PATH PYTHONPATH=/opt/resources/scripts
+
+# /opt/workspace = the USER'S workspace bind mountpoint — ships EMPTY (CRITICAL at
+# runtime; the starter notebooks seed in from templates/workspace only when empty).
+RUN mkdir -p /opt/workspace
 
 # Runtime env scripts (profile.d)
-COPY scripts/01-rocm-env-for-triton.sh /etc/profile.d/01-rocm-env-for-triton.sh
-COPY scripts/99-toolbox-banner.sh      /etc/profile.d/99-toolbox-banner.sh
-COPY scripts/zz-venv-last.sh           /etc/profile.d/zz-venv-last.sh
+COPY profile.d/01-rocm-env-for-triton.sh /etc/profile.d/01-rocm-env-for-triton.sh
+COPY profile.d/99-toolbox-banner.sh      /etc/profile.d/99-toolbox-banner.sh
+COPY profile.d/zz-venv-last.sh           /etc/profile.d/zz-venv-last.sh
 RUN chmod 0644 /etc/profile.d/*.sh \
     && printf 'ulimit -S -c 0\n' > /etc/profile.d/90-nocoredump.sh \
     && chmod 0644 /etc/profile.d/90-nocoredump.sh
 
-# World-writable /opt (distrobox-injected host user can write into the workspace/venv)
-RUN chmod -R a+rwX /opt && pip cache purge || true
-
 # Jupyter kernel points at the venv python; friendly display name (upstream parity).
 RUN /opt/venv/bin/python -m ipykernel install --name=python3 --display-name "Python (venv)" --prefix=/opt/venv
-CMD ["/bin/bash"]
+
+# Shared droste entrypoint (server lane): resolves mounts/criticals/templates from
+# /opt/resources/build-spec, then execs JupyterLab on :8888. distrobox/toolbx
+# override the entrypoint and get the interactive lane. Writability comes from the
+# venv overlay + the user's workspace bind — no world-writable /opt.
+ENTRYPOINT ["/opt/resources/resolve/droste-entrypoint.sh"]

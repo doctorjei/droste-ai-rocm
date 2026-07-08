@@ -280,9 +280,11 @@ def launch_training(mode, head_ip, worker_ip, force_ethernet, enable_nccl_debug)
     script_dir = os.path.abspath(os.path.dirname(__file__))
     train_script = os.path.join(script_dir, "train.py")
     
-    # Worker node script path (fixed at /opt/workspace as per toolbox configuration)
-    worker_script_dir = "/opt/workspace"
+    # Worker node script path (baked read-only helper dir, same in every droste image);
+    # the worker still runs FROM the user workspace so relative output-*/ dirs land there.
+    worker_script_dir = "/opt/resources/scripts"
     worker_train_script = f"{worker_script_dir}/train.py"
+    worker_run_dir = "/opt/workspace"
     
     if mode == "Single Node":
         print(f"Launching Single Node Training: {model_id} ({train_type})")
@@ -305,7 +307,7 @@ def launch_training(mode, head_ip, worker_ip, force_ethernet, enable_nccl_debug)
         worker_env = get_rdma_env_script(head_ip, worker_ip, iface_head, force_ethernet, enable_nccl_debug)
         worker_cmd = f"""
         {worker_env}
-        cd {worker_script_dir}
+        cd {worker_run_dir}
         torchrun --nproc_per_node=1 --nnodes=2 --node_rank=1 --master_addr={head_ip} --master_port=12345 {worker_train_script} {train_args}
         """
         

@@ -1,50 +1,26 @@
 #!/usr/bin/env bash
-# /opt/get_wan22.sh  (resume-friendly)
+# get_wan22.sh — download Wan 2.2 models into the shared HF cache (resume-friendly).
+# The startup model scanner links cached models into ComfyUI/models.
 set -euo pipefail
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
-export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"   # persistent HF cache
 HF="/opt/venv/bin/hf"
-
-MODEL_HOME="$HOME/comfy-models"
-STAGE="$MODEL_HOME/.hf_stage_wan22"                     # persistent staging (enables resume)
 
 # Repositories
 REPO_22="Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
 REPO_21="Comfy-Org/Wan_2.1_ComfyUI_repackaged"
 REPO_LORA="lightx2v/Wan2.2-Lightning"
 
-mkdir -p "$MODEL_HOME"/{text_encoders,vae,diffusion_models,loras}
-mkdir -p "$STAGE"
-
 PRECISION="fp8"
 if [[ "${2:-}" == "fp16" ]]; then
   PRECISION="fp16"
 fi
 
-download_if_missing () {
+dl () {
   local repo="$1"
   local remote="$2"
-  local dest_path="$3"  # Relative path under MODEL_HOME, e.g., "text_encoders" or "loras/subdir"
-  
-  local dest_dir="$MODEL_HOME/$dest_path"
-  local dest_file="$dest_dir/$(basename "$remote")"
-  local staged="$STAGE/$remote"
-
-  if [[ -f "$dest_file" ]]; then
-    echo "✓ Already present: $dest_file"
-    return
-  fi
-
-  echo "↓ Downloading $(basename "$remote") → $dest_file"
-  mkdir -p "$(dirname "$staged")"        # ensure stage path exists
-  mkdir -p "$dest_dir"                   # ensure dest dir exists
-
-  "$HF" download "$repo" "$remote" \
-      --repo-type model \
-      --cache-dir "$HF_HOME" \
-      --local-dir "$STAGE"
-  mv -f "$staged" "$dest_file"
+  echo "↓ Fetching $repo :: $remote"
+  "$HF" download "$repo" "$remote" --repo-type model
 }
 
 usage() {
@@ -57,12 +33,10 @@ Targets:
   14b-i2v    14B I2V diffusion models (Defaults to FP8, use 'fp16' as 2nd arg for FP16)
   lora       Wan2.2 Lightning LoRAs
 
-Maintenance:
-  clean-stage   Remove staging folder (keeps final models)
-  clean-cache   Remove Hugging Face cache (~/.cache/huggingface)
-
 Notes:
-- Downloads RESUME automatically via persistent --cache-dir and --local-dir.
+- Downloads land in the shared HF cache (~/.cache/huggingface) and RESUME automatically.
+- Models appear in ComfyUI after a container restart (the model scanner runs at start),
+  or immediately after running: model_scanner.py sync
 USAGE
 }
 
@@ -71,50 +45,42 @@ case "${1:-}" in
     echo "==> text encoder + VAEs"
     if [[ "$PRECISION" == "fp16" ]]; then
          # Use fp16 text encoder if available or if standard
-         download_if_missing "$REPO_22" "split_files/text_encoders/umt5_xxl_fp16.safetensors" "text_encoders"
+         dl "$REPO_22" "split_files/text_encoders/umt5_xxl_fp16.safetensors"
     else
-         download_if_missing "$REPO_21" "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors" "text_encoders"
+         dl "$REPO_21" "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
     fi
-    download_if_missing "$REPO_22" "split_files/vae/wan_2.1_vae.safetensors" "vae"
+    dl "$REPO_22" "split_files/vae/wan_2.1_vae.safetensors"
     ;;
   14b-t2v)
     echo "==> 14B Text→Video ($PRECISION)"
     if [[ "$PRECISION" == "fp16" ]]; then
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors" "diffusion_models"
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors" "diffusion_models"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors"
     else
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors" "diffusion_models"
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors" "diffusion_models"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors"
     fi
     ;;
   14b-i2v)
     echo "==> 14B Image→Video ($PRECISION)"
     if [[ "$PRECISION" == "fp16" ]]; then
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors" "diffusion_models"
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors" "diffusion_models"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"
     else
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors" "diffusion_models"
-        download_if_missing "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors" "diffusion_models"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+        dl "$REPO_22" "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
     fi
     ;;
   lora)
     echo "==> Wan2.2 Lightning LoRAs (Seko V2)"
-    LORA_SUBDIR_T2V="loras/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0"
-    download_if_missing "$REPO_LORA" "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/high_noise_model.safetensors" "$LORA_SUBDIR_T2V"
-    download_if_missing "$REPO_LORA" "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/low_noise_model.safetensors" "$LORA_SUBDIR_T2V"
-
-    LORA_SUBDIR_I2V="loras/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1"
-    download_if_missing "$REPO_LORA" "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors" "$LORA_SUBDIR_I2V"
-    download_if_missing "$REPO_LORA" "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors" "$LORA_SUBDIR_I2V"
-    ;;
-  clean-stage)
-    rm -rf "$STAGE"; echo "✓ Removed stage: $STAGE"
-    ;;
-  clean-cache)
-    rm -rf "$HF_HOME"; echo "✓ Removed HF cache: $HF_HOME"
+    dl "$REPO_LORA" "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/high_noise_model.safetensors"
+    dl "$REPO_LORA" "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/low_noise_model.safetensors"
+    dl "$REPO_LORA" "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors"
+    dl "$REPO_LORA" "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors"
     ;;
   ""|-h|--help|help)
     usage
+    exit 0
     ;;
   *)
     echo "Unknown target: $1" >&2
@@ -123,4 +89,6 @@ case "${1:-}" in
     ;;
 esac
 
-echo "✓ Done."
+echo "✓ Done. Files are in the shared HF cache (~/.cache/huggingface)."
+echo "  They appear in ComfyUI after a container restart (the model scanner runs at start),"
+echo "  or immediately after running: model_scanner.py sync"

@@ -79,12 +79,25 @@ printf 'AMD Ryzen AI Max “Strix Halo” — Image & Video Toolbox (gfx1151, RO
 echo
 printf 'Machine: %s\n' "$MACHINE"
 printf 'GPU    : %s\n\n' "$GPU"
-printf 'Repo   : https://github.com/kyuz0/amd-strix-halo-comfyui-toolboxes\n'
-printf 'Image  : docker.io/kyuz0/amd-strix-halo-comfyui:latest\n\n'
-printf 'Included:\n'
-printf '  - %-16s → %s\n' "ComfyUI"            "start_comfy_ui (http://localhost:8000)"
+printf 'Upstream: https://github.com/kyuz0/amd-strix-halo-comfyui-toolboxes\n'
+printf 'Image   : ghcr.io/doctorjei/droste-comfyui-halo\n\n'
+printf 'ComfyUI server: http://localhost:8188\n'
+printf '  - Run as a container → the server starts automatically (image entrypoint).\n'
+printf '  - In a distrobox/toolbox shell nothing autostarts → use: start_comfy_ui\n'
 echo
-printf 'SSH tip: ssh -L 8000:localhost:8000 user@host\n\n'
+printf 'Model downloaders (shared HF cache; scanner links them in at start):\n'
+printf '  get_wan22.sh · get_qwen_image.sh · get_hunyuan15.sh · get_ltx2.sh\n\n'
+printf 'SSH tip: ssh -L 8188:localhost:8188 user@host\n\n'
 
-# Aliases
-alias start_comfy_ui='cd /opt/ComfyUI && python main.py --port 8000 --output-directory $HOME/comfy-outputs --disable-mmap --gpu-only --disable-smart-memory --cache-none --bf16-vae'
+# Launcher (flags match the container SERVICE line). A function, not an alias:
+# the extra-model-paths config is only seeded where an init hook ran (distrobox);
+# plain toolbox has no /opt/data/extra_model_paths.yaml, and ComfyUI's unguarded
+# open() would crash on the missing file — pass the flag only if the file exists.
+start_comfy_ui() {
+  local extra=()
+  [[ -f /opt/data/extra_model_paths.yaml ]] \
+    && extra=( --extra-model-paths-config /opt/data/extra_model_paths.yaml )
+  cd /opt/ComfyUI && python main.py --listen 0.0.0.0 --port 8188 \
+    --disable-mmap --gpu-only --disable-smart-memory --cache-none --bf16-vae \
+    "${extra[@]}"
+}

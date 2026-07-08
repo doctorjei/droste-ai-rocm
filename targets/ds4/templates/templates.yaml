@@ -1,0 +1,4 @@
+# templates.yaml — ds4 port seeding manifest (restricted subset, see
+# base/resolve/apply_templates.py).
+if_missing:
+  ds4.env: /opt/data/ds4.env

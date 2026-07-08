@@ -16,7 +16,6 @@ on:
       - '!scaffolding/check-rocm.sh'
       - '!scaffolding/_fedora-src/**'
       - 'targets/**'
-      - 'ci/**'
       - 'rocm-version.env'
       - '.github/workflows/build-halo.yml'
   workflow_dispatch:
@@ -54,7 +53,9 @@ jobs:
       - name: Build & push droste-runtime-base-halo
         uses: docker/build-push-action@v6
         with:
-          context: ci/empty
+          # context = base/ (NOT ci/empty): Container.runtime COPYs the shared
+          # resolver/entrypoint from resolve/ (context-relative).
+          context: base
           file: base/Container.runtime
           push: true
           tags: |
@@ -91,7 +92,7 @@ jobs:
       - name: Build & push droste-build-base-halo
         uses: docker/build-push-action@v6
         with:
-          context: ci/empty
+          context: scaffolding/ci/empty
           file: base/Container.build
           push: true
           tags: |
@@ -129,7 +130,7 @@ jobs:
       - name: Build & push droste-torch-base-halo
         uses: docker/build-push-action@v6
         with:
-          context: ci/empty
+          context: scaffolding/ci/empty
           file: base/Container.torch
           push: true
           tags: |
@@ -190,7 +191,7 @@ jobs:
   # One job per port: build+push the artifacts carrier (heavy compiles against
   # build-base), then build+push the runtime (FROM runtime-base + COPY --from the
   # just-pushed artifacts). fail-fast:false so one port never skips another.
-  # art_ctx / rt_ctx name each stage's build context: ci/empty for asset-less
+  # art_ctx / rt_ctx name each stage's build context: scaffolding/ci/empty for asset-less
   # images, the asset dir for ones that COPY local files.
   port:
     needs: [build-base, torch-base]
@@ -202,10 +203,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: ds4,        art_ctx: ci/empty,                    rt_ctx: ci/empty,            rt_base: runtime-base }
-          - { name: llama,      art_ctx: scaffolding/llama-artifacts, rt_ctx: ci/empty,            rt_base: runtime-base }
+          - { name: ds4,        art_ctx: scaffolding/ci/empty,        rt_ctx: targets/ds4,         rt_base: runtime-base }
+          - { name: llama,      art_ctx: scaffolding/llama-artifacts, rt_ctx: targets/llama,       rt_base: runtime-base }
           - { name: vllm,       art_ctx: scaffolding/vllm-artifacts,  rt_ctx: targets/vllm,        rt_base: torch-base }
-          - { name: finetuning, art_ctx: ci/empty,                    rt_ctx: targets/finetuning,  rt_base: torch-base }
+          - { name: finetuning, art_ctx: scaffolding/ci/empty,        rt_ctx: targets/finetuning,  rt_base: torch-base }
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space

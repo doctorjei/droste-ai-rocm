@@ -1,0 +1,14 @@
+# Nothing is bound at /opt/models yet.
+#
+# /opt/models is the OPTIONAL, read-only bind point for a local GGUF collection.
+# Bind a host directory of models to make them available, e.g.
+#   podman run … -v /host/models:/opt/models:ro …
+#   (distrobox.ini:  volume=/host/models:/opt/models:ro)
+# then point llama-server at a file via /opt/data/llama.env:
+#   LLAMA_ARG_MODEL=/opt/models/<file>.gguf
+#
+# Models downloaded with -hf (LLAMA_EXTRA_ARGS) land in the shared HF cache
+# (~/.cache/huggingface) instead — no /opt/models bind needed for those.
+#
+# This file was created to note you have been informed; deleting it re-shows
+# the notice at the next start.

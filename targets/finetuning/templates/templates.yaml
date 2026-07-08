@@ -1,0 +1,12 @@
+# finetuning template manifest — read by /opt/resources/resolve/apply_templates.py
+# (restricted YAML subset: two flat sections, `src: dest`, src relative to this dir).
+#
+# Baked /opt/workspace ships EMPTY (it is the user's bind mountpoint); the pristine
+# starter notebooks live here instead and are seeded ONLY into a completely empty
+# workspace. A user who deleted/moved the starters expressed intent — any entry at
+# all (dotfiles included) skips the seed, so nothing is ever resurrected.
+#
+# No if_missing entries: finetuning has no generated config file.
+
+if_empty:
+  workspace: /opt/workspace

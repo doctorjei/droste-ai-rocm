@@ -42,7 +42,7 @@ def wait_for_server(url, timeout=60):
 
 def main():
     parser = argparse.ArgumentParser(description="Collect ComfyUI per-workflow performance logs")
-    parser.add_argument("--workflow-dir", default="/opt/comfy-workflows", help="Directory containing API-format workflow JSON files")
+    parser.add_argument("--workflow-dir", default="/opt/resources/api_workflows", help="Directory containing API-format workflow JSON files")
     parser.add_argument("--logs-dir", default="perf_logs", help="Output directory for collected logs")
     parser.add_argument("--comfy-dir", default="/opt/ComfyUI", help="ComfyUI installation directory")
     args = parser.parse_args()

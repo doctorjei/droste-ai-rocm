@@ -153,7 +153,7 @@ def wait_for_server(url, timeout=60):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark ComfyUI Workflows")
-    parser.add_argument("--workflow-dir", default="/opt/comfy-workflows", help="Directory containing API-format workflow JSON files")
+    parser.add_argument("--workflow-dir", default="/opt/resources/api_workflows", help="Directory containing API-format workflow JSON files")
     parser.add_argument("--comfy-dir", default="/opt/ComfyUI", help="ComfyUI installation directory")
     parser.add_argument("--server", default="localhost:8000", help="Address of ComfyUI server (host:port)") 
     parser.add_argument("--output", default="benchmark_results.json", help="Output JSON file for results")

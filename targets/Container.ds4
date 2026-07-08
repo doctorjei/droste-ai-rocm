@@ -36,6 +36,28 @@ RUN pip install --no-cache-dir pipx 'huggingface_hub[hf_xet]'
 # DS4 Cockpit TUI
 RUN pipx install --global "git+${COCKPIT_REPO}@${COCKPIT_REF}#subdirectory=ds4-strix-halo-cockpit"
 
-# Prevent ~/.local/lib/python* from shadowing container-installed packages; add entrypoint.
-ENV PYTHONNOUSERSITE=1
-CMD ["/bin/bash"]
+# Shared-resolver runtime assets: per-port build-spec + seed templates + helper scripts
+# (baked RO under /opt/resources; the resolver/entrypoint live in the runtime base).
+COPY build-spec  /opt/resources/build-spec
+COPY templates/  /opt/resources/templates/
+COPY scripts/download_model.sh /opt/resources/scripts/download_model.sh
+
+# Runtime shell banner (interactive/toolbox lane)
+COPY profile.d/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
+
+# The artifacts stage ships upstream's download_model.sh into /usr/local/bin;
+# remove it — superseded by the cache-native rework in /opt/resources/scripts
+# (upstream's --local-dir path bypasses the shared HF cache and its default
+# OUT_DIR breaks under a read-only script dir).
+RUN chmod +x /opt/resources/scripts/download_model.sh \
+    && chmod 0644 /etc/profile.d/99-toolbox-banner.sh \
+    && rm -f /usr/local/bin/download_model.sh
+
+# Prevent ~/.local/lib/python* from shadowing container-installed packages;
+# helper scripts on PATH (per /opt/resources design).
+ENV PYTHONNOUSERSITE=1 \
+    PATH=/opt/resources/scripts:$PATH
+
+# Server by default (distrobox/toolbx override the entrypoint → same image is both);
+# `podman run IMAGE <cmd>` still wins over SERVICE inside the entrypoint.
+ENTRYPOINT ["/opt/resources/resolve/droste-entrypoint.sh"]

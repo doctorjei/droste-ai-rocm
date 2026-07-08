@@ -1,0 +1,5 @@
+# templates.yaml — llama port seeding manifest (restricted subset, see
+# base/resolve/apply_templates.py). llama.env is GENERATED INTO this directory
+# at image build by gen_llama_env.sh.
+if_missing:
+  llama.env: /opt/data/llama.env

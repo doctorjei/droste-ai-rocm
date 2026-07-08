@@ -29,5 +29,25 @@ COPY --from=artifacts /artifacts/share/gguf-vram-estimator.py /usr/local/bin/ggu
 RUN chmod +x /usr/local/bin/gguf-vram-estimator.py && \
       printf '%s\n' /usr/local/lib /usr/local/lib64 > /etc/ld.so.conf.d/local.conf && ldconfig
 
-# Interactive toolbox shell
-CMD ["/bin/bash"]
+# Shared-resolver runtime assets: per-port build-spec + seed templates + helper scripts
+# (baked RO under /opt/resources; the resolver/entrypoint live in the runtime base).
+COPY build-spec  /opt/resources/build-spec
+COPY templates/  /opt/resources/templates/
+COPY scripts/gen_llama_env.sh /opt/resources/scripts/gen_llama_env.sh
+
+# BUILD-TIME generate the llama.env template from the pinned llama-server's arg
+# table (enumerates every env-having flag; VERIFIES the active LLAMA_ARG_* names
+# exist — an upstream rename fails the build here, by design).
+RUN chmod +x /opt/resources/scripts/gen_llama_env.sh \
+    && /opt/resources/scripts/gen_llama_env.sh /opt/resources/templates/llama.env
+
+# Runtime shell banner (interactive/toolbox lane)
+COPY profile.d/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
+RUN chmod 0644 /etc/profile.d/99-toolbox-banner.sh
+
+# Helper scripts on PATH (per /opt/resources design)
+ENV PATH=/opt/resources/scripts:$PATH
+
+# Server by default (distrobox/toolbx override the entrypoint → same image is both);
+# `podman run IMAGE <cmd>` still wins over SERVICE inside the entrypoint.
+ENTRYPOINT ["/opt/resources/resolve/droste-entrypoint.sh"]

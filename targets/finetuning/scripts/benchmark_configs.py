@@ -126,10 +126,12 @@ def run_multinode(train_script, train_args, head_ip, worker_ip, worker_script, t
     export NCCL_IB_RETRY_CNT=7
     export NCCL_IB_DISABLE=0
     """
-    worker_dir = os.path.dirname(worker_script)
+    # Run from the user workspace (not the read-only helper dir holding worker_script)
+    # so any relative output-*/ dirs land on the persistent workspace mount.
+    worker_run_dir = "/opt/workspace"
     worker_cmd = f"""
     {worker_env}
-    cd {worker_dir}
+    cd {worker_run_dir}
     torchrun --nproc_per_node=1 --nnodes=2 --node_rank=1 --master_addr={head_ip} --master_port=12345 {worker_script} {train_args}
     """
 
@@ -222,7 +224,7 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     train_script = os.path.join(script_dir, "train.py")
-    worker_train_script = "/opt/workspace/train.py"
+    worker_train_script = "/opt/resources/scripts/train.py"
 
     # ── Phase 1: Build test plan ───────────────────────────────────
     plan = []

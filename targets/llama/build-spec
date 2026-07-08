@@ -1,0 +1,68 @@
+# this container's mounts + service, both lanes
+#
+# build-spec — llama port. Sourced bash consumed by the shared resolver
+# (/opt/resources/resolve/droste-resolve.sh) via the shared entrypoint.
+# Contract + row semantics: base/resolve/build-spec.example.
+
+# ── SERVICE ──────────────────────────────────────────────────────────────────
+# Placeholder argv; llama_pre_launch REBUILDS it after ENV_FILE is sourced so
+# LLAMA_EXTRA_ARGS (from /opt/data/llama.env) can join the command line —
+# SERVICE would otherwise be expanded at spec-source time, before the env file.
+SERVICE=( llama-server )
+
+# ── ENV_FILE ─────────────────────────────────────────────────────────────────
+# Seeded from the BUILD-GENERATED template (templates.yaml if_missing); carries
+# LLAMA_ARG_* lines (llama-server reads them natively) + LLAMA_EXTRA_ARGS.
+ENV_FILE="/opt/data/llama.env"
+
+# ── OVERLAYS ─────────────────────────────────────────────────────────────────
+# venv overlay is universal (per design). llama-server itself is a compiled
+# binary — the overlay serves the user's own pip installs (whole venv, so
+# console scripts in bin/ persist too).
+OVERLAYS=(
+    "/opt/data/venv:/opt/venv"
+)
+
+# ── SURFACES ─────────────────────────────────────────────────────────────────
+SURFACES=()
+
+# ── CACHES ───────────────────────────────────────────────────────────────────
+# None. llama.cpp uses its own kernels (no Triton/MIOpen), and the slot store is
+# CONSUMED in place: LLAMA_ARG_SLOT_SAVE_PATH points INTO /opt/data directly
+# (no bind needed; dir pre-created in llama_pre_launch).
+CACHES=()
+
+# ── CRITICAL ─────────────────────────────────────────────────────────────────
+# Shared HF cache: llama-server's -hf downloads land here (llama.cpp consolidated
+# onto the standard HF hub cache); unbound = silent multi-GB re-download.
+CRITICAL=(
+    "hf-cache:$HOME/.cache/huggingface"
+)
+
+# ── OPTIONAL ─────────────────────────────────────────────────────────────────
+# Read-only bind point for a local GGUF collection (LLAMA_ARG_MODEL can point
+# here). Tell-once marker body: templates/mount_shared_models_here.
+OPTIONAL=(
+    "models:/opt/models:/opt/models/mount_shared_models_here"
+)
+
+# ── PRE_LAUNCH ───────────────────────────────────────────────────────────────
+PRE_LAUNCH="llama_pre_launch"
+llama_pre_launch() {
+    # ENV_FILE is sourced un-exported by the resolver; llama-server reads
+    # LLAMA_ARG_* from its ENVIRONMENT, so export every LLAMA_* var (covers the
+    # env file and anything the user set) so they survive the exec.
+    local v
+    for v in $(compgen -v LLAMA_ || true); do
+        export "${v?}"
+    done
+
+    # Pre-create the slot save dir (active default /opt/data/cache/slots;
+    # follows the var if the user re-pointed it).
+    mkdir -p "${LLAMA_ARG_SLOT_SAVE_PATH:-/opt/data/cache/slots}"
+
+    # Rebuild SERVICE now that LLAMA_EXTRA_ARGS is known. Deliberate word-split,
+    # unset-safe; quoting inside the value is not honoured (documented in llama.env).
+    # shellcheck disable=SC2206
+    SERVICE=( llama-server ${LLAMA_EXTRA_ARGS:-} )
+}

@@ -1,0 +1,34 @@
+# extra_model_paths.yaml — extra model directories for ComfyUI.
+#
+# ComfyUI is launched with `--extra-model-paths-config /opt/data/extra_model_paths.yaml`.
+# This file was seeded from the image ONCE (only because it was missing) — it is yours:
+# edits persist on /opt/data and are never overwritten.
+#
+# Format: each top-level stanza names a model store; keys are ComfyUI model categories,
+# values are directories (relative to the stanza's base_path if one is set). Reference:
+# https://github.com/comfyanonymous/ComfyUI/blob/master/extra_model_paths.yaml.example
+
+# Baked model configs shipped with the image: the 11 SD/SD2 architecture yamls used by
+# the "Load Checkpoint (With Config)" node (read-only). Keep this stanza.
+comfyui_baked:
+  configs: /opt/resources/model_configs
+
+# ── Your own model directories (uncomment + edit to add a store) ─────────────
+#
+# my_models:
+#   base_path: /absolute/path/to/my/models
+#   checkpoints: checkpoints
+#   diffusion_models: diffusion_models
+#   text_encoders: text_encoders
+#   vae: vae
+#   loras: loras
+#   clip_vision: clip_vision
+#   latent_upscale_models: latent_upscale_models
+#   embeddings: embeddings
+#   controlnet: controlnet
+#   upscale_models: upscale_models
+#
+# NOTE you usually do NOT need a stanza: models in the shared HF cache
+# (~/.cache/huggingface) and anything bound at /opt/models are linked into
+# ComfyUI/models automatically by the startup model scanner, and files dropped
+# directly into your models bind (/opt/data/model-tree) load as-is.

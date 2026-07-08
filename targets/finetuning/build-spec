@@ -1,0 +1,66 @@
+# this container's mounts + service, both lanes
+#
+# build-spec — finetuning runtime declaration, sourced by the shared resolver
+# (/opt/resources/resolve/droste-resolve.sh). Baked at /opt/resources/build-spec.
+# See base/resolve/build-spec.example for the full contract.
+
+# ── SERVICE ──────────────────────────────────────────────────────────────────
+# JupyterLab, rooted at the user workspace so relative output-*/ dirs from
+# train.py land on the persistent workspace mount. --notebook-dir is a live
+# jupyter-server alias for ServerApp.root_dir. Default token auth stays ON
+# (random token printed in the container log; set JUPYTER_TOKEN to fix one).
+SERVICE=( jupyter lab --ip 0.0.0.0 --port 8888 --notebook-dir=/opt/workspace
+          --no-browser --allow-root )
+
+# ── ENV_FILE ─────────────────────────────────────────────────────────────────
+# None: finetuning has no env-file style config (jupyter takes flags).
+ENV_FILE=""
+
+# ── OVERLAYS — <upper>:<lower> ───────────────────────────────────────────────
+# venv overlay (universal): user pip installs land on /opt/data, the baked
+# torch/unsloth/flash-attn stack stays pristine underneath. This (plus the
+# workspace user bind) is what retires the old `chmod -R a+rwX /opt` hack.
+OVERLAYS=(
+    "/opt/data/venv:/opt/venv"
+)
+
+# ── SURFACES — <src>:<dest> ──────────────────────────────────────────────────
+# None: the workspace is the USER'S bind (CRITICAL below), not container state
+# surfaced from /opt/data.
+SURFACES=()
+
+# ── CACHES — <src>:<dest> ────────────────────────────────────────────────────
+# Compute/kernel caches at the tools' DEFAULT paths, zero env vars. Triton is
+# the hot one here (flash-attn Triton backend + unsloth kernels; default
+# ~/.triton/cache — 01-rocm-env-for-triton.sh sets toolchain paths only, no
+# cache dir). MIOpen keeps both its cache and its .config db side.
+CACHES=(
+    "/opt/data/cache/miopen:$HOME/.cache/miopen"
+    "/opt/data/cache/miopen-config:$HOME/.config/miopen"
+    "/opt/data/cache/triton:$HOME/.triton/cache"
+    "/opt/data/cache/torch:$HOME/.cache/torch"
+)
+
+# ── CRITICAL — <label>:<path> ────────────────────────────────────────────────
+# workspace holds edited notebooks AND trained adapters (relative output-*/) =
+# irreplaceable work; HF cache unbound = silent 20GB+ model/dataset re-download.
+# Both hard-error unless bound (ALLOW_EPHEMERAL escapes).
+CRITICAL=(
+    "workspace:/opt/workspace"
+    "hf-cache:$HOME/.cache/huggingface"
+)
+
+# ── OPTIONAL ─────────────────────────────────────────────────────────────────
+# None: finetuning pulls models/datasets from the HF hub — no /opt/models role.
+OPTIONAL=()
+
+# ── PRE_LAUNCH ───────────────────────────────────────────────────────────────
+# The server lane never sources /etc/profile.d (no login shell), but the Triton
+# HIP toolchain env (TRITON_HIP_LLD_PATH/_CLANG_PATH + SDK LD_LIBRARY_PATH) it
+# provides is needed for flash-attn/unsloth kernel compiles under Jupyter too.
+# Source the exact script the interactive lane uses so both lanes match.
+PRE_LAUNCH="finetuning_pre_launch"
+finetuning_pre_launch() {
+    # shellcheck source=/dev/null
+    source /etc/profile.d/01-rocm-env-for-triton.sh
+}

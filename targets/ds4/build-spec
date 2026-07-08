@@ -1,0 +1,143 @@
+# this container's mounts + service, both lanes
+#
+# build-spec — ds4 port. Sourced bash consumed by the shared resolver
+# (/opt/resources/resolve/droste-resolve.sh) via the shared entrypoint.
+# Contract + row semantics: base/resolve/build-spec.example.
+
+# ── SERVICE ──────────────────────────────────────────────────────────────────
+# Placeholder argv; ds4_pre_launch REBUILDS it after ENV_FILE is sourced,
+# translating the DS4_DROSTE_* vars (ds4 has no native per-flag env) into flags.
+SERVICE=( ds4-server )
+
+# ── ENV_FILE ─────────────────────────────────────────────────────────────────
+# Seeded from templates/ds4.env (templates.yaml if_missing); carries active
+# DS4_DROSTE_* values + the commented full flag list + native DS4_* passthroughs.
+ENV_FILE="/opt/data/ds4.env"
+
+# ── OVERLAYS ─────────────────────────────────────────────────────────────────
+# venv overlay is universal (per design). ds4-server is a compiled HIP binary;
+# the overlay serves cockpit/hf-CLI/user pip installs (whole venv, so console
+# scripts in bin/ persist too).
+OVERLAYS=(
+    "/opt/data/venv:/opt/venv"
+)
+
+# ── SURFACES ─────────────────────────────────────────────────────────────────
+# Whole ~/.ds4 from /opt/data/ds4 (saved sessions kvcache/ + browser/ profile +
+# anything future). Top-level /opt/data/ds4, not cache/ — sessions are user WORK.
+SURFACES=(
+    "/opt/data/ds4:$HOME/.ds4"
+)
+
+# ── CACHES ───────────────────────────────────────────────────────────────────
+# None. The KV disk cache is CONSUMED in place: DS4_DROSTE_KV_DISK_DIR points
+# INTO /opt/data directly (dir pre-created in ds4_pre_launch). No Triton/MIOpen
+# (hipBLASLt-only compiled engine).
+CACHES=()
+
+# ── CRITICAL ─────────────────────────────────────────────────────────────────
+# Shared HF cache: download_model.sh fetches the 80-430 GB quants here — the
+# unbound-means-silent-re-download rule bites hardest on this port.
+CRITICAL=(
+    "hf-cache:$HOME/.cache/huggingface"
+)
+
+# ── OPTIONAL ─────────────────────────────────────────────────────────────────
+# Read-only bind point for a local GGUF collection (DS4_DROSTE_MODEL can point
+# here). Tell-once marker body: templates/mount_shared_models_here.
+OPTIONAL=(
+    "models:/opt/models:/opt/models/mount_shared_models_here"
+)
+
+# ── PRE_LAUNCH ───────────────────────────────────────────────────────────────
+# DS4_DROSTE_<SUFFIX> → flag maps (mirror the derivation rule documented in
+# templates/ds4.env; source-verified against pinned kyuz0/ds4 @00e64ea).
+DS4_VALUE_FLAGS=(
+    "MODEL:--model"
+    "MTP:--mtp"
+    "MTP_DRAFT:--mtp-draft"
+    "MTP_MARGIN:--mtp-margin"
+    "CTX:--ctx"
+    "TOKENS:--tokens"
+    "CHDIR:--chdir"
+    "HOST:--host"
+    "PORT:--port"
+    "TRACE:--trace"
+    "KV_DISK_DIR:--kv-disk-dir"
+    "KV_DISK_SPACE_MB:--kv-disk-space-mb"
+    "KV_CACHE_MIN_TOKENS:--kv-cache-min-tokens"
+    "KV_CACHE_COLD_MAX_TOKENS:--kv-cache-cold-max-tokens"
+    "KV_CACHE_CONTINUED_INTERVAL_TOKENS:--kv-cache-continued-interval-tokens"
+    "KV_CACHE_BOUNDARY_TRIM_TOKENS:--kv-cache-boundary-trim-tokens"
+    "KV_CACHE_BOUNDARY_ALIGN_TOKENS:--kv-cache-boundary-align-tokens"
+    "TOOL_MEMORY_MAX_IDS:--tool-memory-max-ids"
+    "SSD_STREAMING_CACHE_EXPERTS:--ssd-streaming-cache-experts"
+    "SSD_STREAMING_PRELOAD_EXPERTS:--ssd-streaming-preload-experts"
+    "SIMULATE_USED_MEMORY:--simulate-used-memory"
+    "PREFILL_CHUNK:--prefill-chunk"
+    "POWER:--power"
+    "DIR_STEERING_FILE:--dir-steering-file"
+    "DIR_STEERING_FFN:--dir-steering-ffn"
+    "DIR_STEERING_ATTN:--dir-steering-attn"
+    "BACKEND:--backend"
+)
+DS4_BOOL_FLAGS=(
+    "CORS:--cors"
+    "KV_CACHE_REJECT_DIFFERENT_QUANT:--kv-cache-reject-different-quant"
+    "DISABLE_EXACT_DSML_TOOL_REPLAY:--disable-exact-dsml-tool-replay"
+    "QUALITY:--quality"
+    "SSD_STREAMING:--ssd-streaming"
+    "SSD_STREAMING_COLD:--ssd-streaming-cold"
+    "WARM_WEIGHTS:--warm-weights"
+)
+
+PRE_LAUNCH="ds4_pre_launch"
+ds4_pre_launch() {
+    # ENV_FILE is sourced un-exported by the resolver; export every DS4_* var so
+    # the NATIVE ones (DS4_THREADS etc.) reach the binary across the exec.
+    # (Exported DS4_DROSTE_* are harmless — the binary ignores them.)
+    local v
+    for v in $(compgen -v DS4_ || true); do
+        export "${v?}"
+    done
+
+    # Pre-create the KV disk cache dir (active default /opt/data/cache/kv-disk;
+    # follows the var if the user re-pointed or blanked it).
+    if [ -n "${DS4_DROSTE_KV_DISK_DIR:-}" ]; then
+        mkdir -p "$DS4_DROSTE_KV_DISK_DIR"
+    fi
+
+    # Cockpit state: ~/.ds4-cockpit.conf is a FILE (not a dir) → persist it at
+    # /opt/data/cockpit/ via a symlink (writes through the link land there).
+    # SERVER lane only: under distrobox $HOME is the REAL host home — cockpit
+    # state rides it natively there, and the link would dangle on the host.
+    if [ "${DROSTE_LANE:-server}" = server ]; then
+        mkdir -p /opt/data/cockpit
+        ln -sf /opt/data/cockpit/ds4-cockpit.conf "$HOME/.ds4-cockpit.conf"
+    fi
+
+    # Translate DS4_DROSTE_* → argv. Native DS4_* untouched (binary reads them).
+    local argv=( ds4-server ) entry var flag val
+    for entry in "${DS4_VALUE_FLAGS[@]}"; do
+        var="DS4_DROSTE_${entry%%:*}"
+        flag=${entry#*:}
+        val=${!var:-}
+        if [ -n "$val" ]; then
+            argv+=( "$flag" "$val" )
+        fi
+    done
+    for entry in "${DS4_BOOL_FLAGS[@]}"; do
+        var="DS4_DROSTE_${entry%%:*}"
+        flag=${entry#*:}
+        case "${!var:-}" in
+            ""|0|false|no|off) ;;
+            *) argv+=( "$flag" ) ;;
+        esac
+    done
+    # Raw catch-all, appended last. Deliberate word-split, unset-safe; quoting
+    # inside the value is not honoured (documented in ds4.env).
+    # shellcheck disable=SC2206
+    argv+=( ${DS4_DROSTE_EXTRA_ARGS:-} )
+
+    SERVICE=( "${argv[@]}" )
+}

@@ -1,0 +1,86 @@
+# this container's mounts + service, both lanes
+#
+# build-spec — comfyui runtime declaration, sourced by the shared resolver
+# (droste-entrypoint.sh / distrobox init_hooks -> droste-resolve.sh). Contract +
+# ordering: base/resolve/build-spec.example. All paths EXPLICIT and ABSOLUTE;
+# $HOME expands at source time (sourced bash).
+
+# ── SERVICE ──────────────────────────────────────────────────────────────────
+# ComfyUI web UI on 8188 with the upstream Strix Halo perf flags. The extra
+# model-paths config lives on /opt/data (seeded if_missing by templates.yaml)
+# and registers the baked /opt/resources/model_configs. main.py is absolute:
+# ComfyUI derives every path from base_path = main.py's directory, not CWD
+# (PRE_LAUNCH still cd's there for any relative writes).
+SERVICE=(
+    python /opt/ComfyUI/main.py
+    --listen 0.0.0.0 --port 8188
+    --disable-mmap --gpu-only --disable-smart-memory --cache-none --bf16-vae
+    --extra-model-paths-config /opt/data/extra_model_paths.yaml
+)
+
+# ── ENV_FILE ─────────────────────────────────────────────────────────────────
+ENV_FILE=""
+
+# ── OVERLAYS — <upper>:<lower> ───────────────────────────────────────────────
+# Baked lowers are load-bearing (venv, the 3 baked custom nodes); user writes
+# (pip installs incl. bin/ entry points, node installs) land on /opt/data.
+OVERLAYS=(
+    "/opt/data/venv:/opt/venv"
+    "/opt/data/custom_nodes:/opt/ComfyUI/custom_nodes"
+)
+
+# ── SURFACES — <src>:<dest> ──────────────────────────────────────────────────
+# model-tree = the scanner's symlink tree (+ user drop-ins), surfaced over the
+# marker-only baked models/. user/ = ComfyUI state (db/settings/workflows),
+# seeded if_empty by templates.yaml after the mount.
+SURFACES=(
+    "/opt/data/model-tree:/opt/ComfyUI/models"
+    "/opt/data/user:/opt/ComfyUI/user"
+)
+
+# ── CACHES — <src>:<dest> ────────────────────────────────────────────────────
+# Compute/kernel caches persisted on /opt/data with zero env vars. MIOpen uses
+# BOTH ~/.cache/miopen (binary caches) and ~/.config/miopen (user db/config).
+CACHES=(
+    "/opt/data/cache/miopen:$HOME/.cache/miopen"
+    "/opt/data/cache/miopen-config:$HOME/.config/miopen"
+    "/opt/data/cache/triton:$HOME/.triton/cache"
+    "/opt/data/cache/torch:$HOME/.cache/torch"
+)
+
+# ── CRITICAL — <label>:<path> ────────────────────────────────────────────────
+# Hard-error if unbound (ALLOW_EPHEMERAL downgrades to a warning). input/output
+# hold real user work; the HF cache is the single shared model store (unbound =>
+# silent multi-GB re-downloads).
+CRITICAL=(
+    "input:/opt/ComfyUI/input"
+    "output:/opt/ComfyUI/output"
+    "hf-cache:$HOME/.cache/huggingface"
+)
+
+# ── OPTIONAL — <label>:<path>:<marker> ───────────────────────────────────────
+# Optional local-model collection (scanner source #2). Tell-once: INFO + marker
+# (body from templates/mount_shared_models_here) on first unpopulated start.
+OPTIONAL=(
+    "models:/opt/models:/opt/models/mount_shared_models_here"
+)
+
+# ── PRE_LAUNCH ───────────────────────────────────────────────────────────────
+# 1) The server lane never sources /etc/profile.d (no login shell), but the torch
+#    perf env it provides (TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL,
+#    TORCH_BLAS_PREFER_HIPBLASLT) is needed under the served ComfyUI too. Source
+#    the exact script the interactive lane uses so both lanes match.
+# 2) Refresh the ComfyUI model symlink tree from the shared HF cache (+ optional
+#    /opt/models). Defaults already match: tree /opt/data/model-tree, registry
+#    /opt/data/model-registry.yaml, cache ~/.cache/huggingface/hub, /opt/models
+#    skipped-if-absent. A scanner failure only leaves the tree stale — log and
+#    continue, never block the server (the resolver runs under set -e; the ||
+#    branch absorbs the failure).
+PRE_LAUNCH="comfyui_pre_launch"
+comfyui_pre_launch() {
+    # shellcheck source=/dev/null
+    source /etc/profile.d/01-rocm-envs.sh
+    python3 /opt/resources/scripts/model_scanner.py sync \
+        || resolve::warn "model_scanner sync failed (exit $?) — model tree may be stale"
+    cd /opt/ComfyUI
+}

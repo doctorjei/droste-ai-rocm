@@ -1,0 +1,18 @@
+Nothing is bound at /opt/models yet — only models already present in the shared
+HuggingFace cache (~/.cache/huggingface) are available to ComfyUI.
+
+To make a local model collection available, bind it onto /opt/models
+(read-only is fine), e.g.:
+
+  podman run ... -v /absolute/path/to/models:/opt/models:ro ...
+
+  # distrobox.ini
+  volume=/absolute/path/to/models:/opt/models:ro
+
+The startup model scanner classifies everything it finds under /opt/models and
+links it into ComfyUI/models alongside the HF-cache models (non-weight files,
+including this marker, are ignored).
+
+This file's existence means "you have been informed" — the notice is shown only
+once; delete the file to see it again. With /opt/models bound and populated, it
+is irrelevant.

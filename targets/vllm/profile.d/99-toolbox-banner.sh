@@ -88,14 +88,14 @@ printf 'AMD STRIX HALO — vLLM Toolbox (gfx1151, ROCm via TheRock)\n'
 echo
 printf 'Machine: %s\n' "$MACHINE"
 printf 'GPU    : %s\n\n' "$GPU"
-printf 'Repo   : https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes\n'
-printf 'Image  : docker.io/kyuz0/vllm-therock-gfx1151:latest\n\n'
-printf 'Included:\n'
-printf '  - %-16s → %s\n' "start-vllm (TUI)" "Interactive launcher: Model select, Multi-GPU & Cache handling"
-printf '  - %-16s → %s\n' "start-vllm-cluster" "Cluster launcher: Setup Ray Head/Worker & Launch vLLM RCCL"
-printf '  - %-16s → %s\n' "vllm-cluster-bench" "Cluster Benchmark: TP=2, Auto-detected Env, JSON Results"
-printf '  - %-16s → %s\n' "vLLM server" "vllm serve meta-llama/Meta-Llama-3.1-8B-Instruct"
-printf '  - %-16s → %s\n' "API test"    "curl localhost:8000/v1/chat/completions"
+printf 'Repo   : https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes\n\n'
+printf 'This image runs an OpenAI-compatible vLLM server by DEFAULT (its entrypoint) on\n'
+printf 'port 8000. Config file: /opt/data/vllm_config.yaml  (vllm serve --config).\n\n'
+printf 'Usage:\n'
+printf '  - %-18s → %s\n' "Pick a model" "edit model: in /opt/data/vllm_config.yaml (REQUIRED to start)"
+printf '  - %-18s → %s\n' "vLLM server"  "starts automatically; commented MODEL_TABLE stanzas in the config"
+printf '  - %-18s → %s\n' "Ad-hoc serve" "vllm serve <model> --host 0.0.0.0 --port 8000"
+printf '  - %-18s → %s\n' "API test"     "curl localhost:8000/v1/chat/completions"
 echo
 printf 'SSH tip: ssh -L 8000:localhost:8000 user@host\n\n'
 
