@@ -8,3 +8,6 @@ share-rw/
 *.tar.xz
 *.tar.gz
 *.log
+
+# python bytecode
+__pycache__/

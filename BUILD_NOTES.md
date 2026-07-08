@@ -79,8 +79,128 @@ and referenced from the per-image sections below.
 - Distrobox/Toolbox shares the host home directory. `PYTHONNOUSERSITE=1` prevents
   the host's `~/.local/lib/python*` from shadowing container-installed packages
   (e.g. the hf CLI importing a host-side broken `huggingface_hub`).
-- `/opt` is made world-writable (`chmod -R a+rwX /opt`) so a distrobox-injected
-  host user can write into the workspace/venv.
+- The old `/opt` world-write hack (`chmod -R a+rwX /opt`) is RETIRED: writability
+  now comes from the venv overlay upper + the user's own binds (see "Runtime
+  contract" below), so nothing in the baked tree needs loosening.
+
+---
+
+## Runtime contract — shared resolver + per-port build-spec
+
+The "bucket B" rework turned all five ports from interactive `CMD bash` toolboxes
+into servers-by-default with ONE shared runtime mechanism. The moving parts:
+
+### Resolver + entrypoint (baked in the runtime base, inherited by all 5 ports)
+- `base/resolve/droste-resolve.sh` — a sourced primitive library (overlay, surface,
+  cache-bind, critical, optional-marker, template seeding), baked at
+  `/opt/resources/resolve/`. Lane-aware: `DROSTE_LANE=server` (default) mounts;
+  `DROSTE_LANE=distrobox` skips every internal mount ($HOME is the persistent host
+  home there) and runs only the non-mount steps.
+- `droste-entrypoint.sh` — the server-lane ENTRYPOINT for every port. Sources the
+  library + the port's `/opt/resources/build-spec`, runs `resolve::apply_spec` in
+  the fixed design order (ensure `/opt/data` → SURFACES/OVERLAYS/CACHES → CRITICAL
+  → OPTIONAL → templates → ENV_FILE → PRE_LAUNCH), then execs SERVICE — unless the
+  user passed a command, which wins (`podman run IMAGE bash` still works).
+- `droste-init-hook.sh` — the distrobox-lane counterpart, invoked from
+  `targets/<port>/distrobox.ini` `init_hooks` (distrobox replaces pid1, so the
+  ENTRYPOINT never runs there). Same spec, `DROSTE_LANE=distrobox`, no exec.
+  init_hooks run as root (HOME=/root), so it re-derives the distrobox USER's home
+  (first uid >= 1000 in /etc/passwd; `DROSTE_USER_HOME` overrides) before applying
+  the spec — that is what lets `$HOME`-relative CRITICALs see the host-home bind.
+- **`is_bound` is an ancestor-walk**, not an exact mountinfo match: the longest
+  component-aware mount-point prefix of the target decides (rootfs `/` → unbound;
+  anything deeper → bound). Needed because distrobox binds the whole `$HOME` —
+  an exact match would false-error every critical living under it.
+- **`ENV_FILE` is sourced under `set -a`** so plain `VAR=` lines are exported and
+  survive the exec into the service (llama-server reads `LLAMA_ARG_*` from its
+  environment). llama/ds4 keep belt-and-braces export loops in PRE_LAUNCH so their
+  specs stay self-sufficient under other callers.
+- **The SERVICE-rebuild pattern:** build-spec is sourced bash, so `SERVICE=( … )`
+  expands BEFORE ENV_FILE is sourced. Ports whose argv depends on env-file values
+  (llama `$LLAMA_EXTRA_ARGS`, ds4's flag translation) declare a placeholder argv
+  and rebuild `SERVICE` inside PRE_LAUNCH, which runs after ENV_FILE. Documented
+  in `base/resolve/build-spec.example`.
+
+### build-spec (the per-port declaration)
+One sourced-bash file per port (`targets/<port>/build-spec`, baked at
+`/opt/resources/build-spec`; the name is a placeholder pending a rename). Rows:
+`SERVICE / ENV_FILE / OVERLAYS / SURFACES / CACHES / CRITICAL / OPTIONAL /
+PRE_LAUNCH` — all paths explicit + absolute (`$HOME` allowed and preferred for
+home-relative paths: it is the only form correct in BOTH lanes). SURFACES and
+CACHES are structurally identical binds kept as separate rows by design (future
+cache-specific behaviour). There is deliberately no DEFAULTS row — ALL content
+seeding is owned by templates.yaml. Contract doc: `base/resolve/build-spec.example`.
+
+### Templates (first-run seeding)
+`targets/<port>/templates/` bakes to `/opt/resources/templates/`; the manifest
+`templates.yaml` (restricted YAML subset, parsed by the base's stdlib-only
+`apply_templates.py` — no pyyaml in the lean images) maps `src: dest` under two
+rules: `if_empty` (copy iff dest is a COMPLETELY empty dir — a user who deleted
+the starter content expressed intent, nothing is resurrected) and `if_missing`
+(copy iff dest does not exist — user edits are never overwritten). Seeding runs
+AFTER mounts so seeds land on the bound destinations. The `/opt/models` marker
+body (`mount_shared_models_here`) lives in templates/ too, picked up by name by
+the OPTIONAL primitive, not by the manifest.
+
+### Repo layout convention (per port)
+`targets/<port>/profile.d/` → `/etc/profile.d/` (interactive-lane shells);
+`targets/<port>/scripts/` → `/opt/resources/scripts/` (baked RO helpers on
+PATH/PYTHONPATH, never seeded); `templates/` → `/opt/resources/templates/`;
+`build-spec` → `/opt/resources/build-spec`; `distrobox.ini` = repo-side example,
+not baked. comfyui's `scripts/tests/` is repo-only (never COPY'd).
+
+### Per-port notes (bucket-B rework rationale)
+- **comfyui** — the wan/qwen "studio" pip stacks were DROPPED with the studios
+  (studios-only deps; ComfyUI implements Wan/Qwen natively — watch the first
+  runtime test for anything that misses them). The 11 baked SD/SD2 config yamls
+  moved out of `models/` to `/opt/resources/model_configs/` (registered back via
+  the seeded `extra_model_paths.yaml`); `models/configs/` stays, empty, for user
+  drop-ins on their own bind. `get_*.sh` downloaders are cache-native now (plain
+  `hf download` into the shared HF cache, no staging/`mv`), and the old
+  `clean-cache` verb was REMOVED — it would `rm -rf` the SHARED store. The
+  benchmark helpers keep their private port-8000 assumption (they drive their own
+  private instance). PRE_LAUNCH runs the model scanner (`model_scanner.py sync`)
+  to refresh `/opt/data/model-tree`; a scanner failure logs and continues (stale
+  tree, never a blocked server).
+- **finetuning** — `chmod -R a+rwX /opt` RETIRED: the venv overlay + the user's
+  workspace bind provide all needed writability. The multi-node worker's CWD vs
+  script-path split is deliberate: helpers live at `/opt/resources/scripts/`
+  (RO, on PATH/PYTHONPATH) while workers run with CWD=/opt/workspace, so relative
+  `output-*/` adapters persist on the mount on every node. The baked
+  `/opt/workspace` ships EMPTY (it is the user's bind mountpoint); the starter
+  notebooks seed from templates only into a completely empty workspace —
+  seed-if-empty semantics honor user deletions.
+- **vllm** — the upstream TUI's MODEL_TABLE is vendored at toolbox sha
+  `6446b9595273f289e11586c3c7d3e1e6f2945888` (`targets/vllm/upstream/models.py`)
+  and `vllm_config.yaml` is GENERATED AT IMAGE BUILD from it
+  (`scripts/gen_vllm_config.py`) — hermetic, and upstream drift is visible as a
+  vendored-file diff, not a silent build change. `VLLM_NO_USAGE_STATS=1` is baked
+  instead of persisting `~/.config/vllm` (do-not-track > carrying state). The
+  `cache/vllm` bind is deliberately OMITTED: `VLLM_DISABLE_COMPILE_CACHE=1`
+  should keep `~/.cache/vllm` empty — VERIFY at first runtime test, add the bind
+  if artifacts land there. `/opt/fp8` is trimmed to the runtime import surface
+  (top-level `*.py` + LICENSE/NOTICE + `licenses/` kept for compliance; bench/
+  docs/serve scripts dropped).
+- **llama** — `llama.env` is BUILD-generated from the pinned llama-server's own
+  arg table (`scripts/gen_llama_env.sh`: `--help` parse with a binary-string-scan
+  fallback), so the commented flag list can't drift from the pinned binary; the
+  build FAILS LOUDLY if `LLAMA_ARG_{HOST,PORT,SLOT_SAVE_PATH,MODEL}` vanish
+  upstream. `LLAMA_CACHE` is deliberately UNSET — it is first in llama.cpp's
+  cache-path resolution and setting it would re-separate the shared HF cache.
+  The slot store dir (`LLAMA_ARG_SLOT_SAVE_PATH=/opt/data/cache/slots`) is
+  pre-created in PRE_LAUNCH.
+- **ds4** — ds4 has no native per-flag env vars, so PRE_LAUNCH translates
+  `DS4_DROSTE_*` → argv (arity source-verified against pinned kyuz0/ds4
+  `@00e64ea`); NATIVE `DS4_*` vars (DS4_THREADS, …) pass through untouched — the
+  binary reads them itself. Backend shorthands (`--rocm`/`--cpu`/…) and the
+  distributed/multi-node flags are left to `DS4_DROSTE_EXTRA_ARGS`. The whole
+  `~/.ds4` (kvcache sessions + browser profile) is surfaced from `/opt/data/ds4`
+  (sessions are user WORK, top-level, not cache/); the cockpit conf is a FILE, so
+  it persists via symlink `~/.ds4-cockpit.conf → /opt/data/cockpit/…`.
+  `download_model.sh` was reworked cache-native (`hf download` into the shared HF
+  cache, prints the snapshot path for `DS4_DROSTE_MODEL`); the upstream copy is
+  REMOVED from `/usr/local/bin` — it downloaded via `--local-dir`, bypassing the
+  cache on the project's biggest files (80–430 GB quants).
 
 ---
 
@@ -119,7 +239,11 @@ exactly once and compiled artifacts ABI-match the runtime libs shipped here.
   wrote an EMPTY file here — that was a bug). It activates the venv and exports
   `ROCM_PATH` from the stable `/opt/rocm` symlink, then the HIP/PATH/LD env for
   interactive shells.
-- No `CMD`.
+- Bakes the shared runtime contract: `/opt/resources/resolve/` (resolver +
+  entrypoint + init hook + templates applier, on PATH) and `VOLUME /opt/data`
+  (auto-anonymous-volume when unbound; the resolver warns). See "Runtime
+  contract" above.
+- No `CMD` and no base `ENTRYPOINT` (ports opt in to `droste-entrypoint.sh`).
 
 ### base/Container.build
 TheRock gfx1151 ROCm SDK (`rocm-sdk-devel`) + host toolchain for native gfx1151
@@ -374,19 +498,23 @@ Toolbox submodule provenance (droste-ai-rocm):
 ## Targets (runtimes)
 
 ### targets/Container.comfyui
-Interactive ComfyUI + AMD studios on the unified ROCm base. Ported from the
-Fedora source and the real upstream Dockerfile (submodule commit
-`c2ef528b05e474491845fe27715315cec287d80c`).
+ComfyUI server on the unified ROCm base. Ported from the Fedora source and the
+real upstream Dockerfile (submodule commit
+`c2ef528b05e474491845fe27715315cec287d80c`), then reworked to the shared runtime
+contract (bucket B).
 
-- SINGLE interactive image — NOT split build/runtime — because it keeps a
-  compiler toolchain (gcc/g++/make/binutils/python3-dev) for Triton JIT AT
-  RUNTIME.
-- FROM the runtime base (canopy + de-divert + venv with the gfx1151 runtime
-  kernels). comfyui is a torch app, so it adds the torch stack (torch/
-  torchvision/torchaudio) pinned from the SAME index into the base venv. torch's
-  own bundled ROCm coexists with the base runtime kernels — do NOT add a system
-  ROCm SDK, and do NOT re-add `libnss-myhostname` (the base already provides it
-  for distrobox).
+- SINGLE image — NOT split build/runtime — because it keeps a compiler toolchain
+  (gcc/g++/make/binutils/python3-dev) for Triton JIT AT RUNTIME.
+- Server by default: `ENTRYPOINT` = the shared `droste-entrypoint.sh`, which
+  applies `build-spec` (mounts, critical checks, template seeding, model-scanner
+  PRE_LAUNCH) and execs ComfyUI on :8188; a user command still wins, and
+  distrobox/toolbx replace pid1 and run the resolver from init_hooks instead.
+  See "Runtime contract" above.
+- FROM the TORCH base (canopy + de-divert + venv with the gfx1151 runtime
+  kernels + the pinned torch). It adds torchvision/torchaudio pinned from the
+  SAME index into the base venv. torch's own bundled ROCm coexists with the base
+  runtime kernels — do NOT add a system ROCm SDK, and do NOT re-add
+  `libnss-myhostname` (the base already provides it for distrobox).
 - Pin nuance: `TORCHVISION`/`TORCHAUDIO` are left blank in the pin (not yet
   locked) — when empty, install them unpinned (`--pre`) so pip's resolver picks
   the wheel matching the pinned torch on the same `+rocm` date. `transformers` is
@@ -398,24 +526,21 @@ Fedora source and the real upstream Dockerfile (submodule commit
   `ffmpeg`, `libdrm-devel`->`libdrm2` (runtime, not `-dev`), `gcc-c++`->`g++`,
   `python3.13-devel`->`python3-dev`; `python3.13(-venv)` dropped (interpreter +
   venv already in the base).
-- torch stack into the BASE venv: torchvision/torchaudio pinned only when their
-  ARG is set, else unpinned (`--pre` lets pip see nightly/pre-release wheels).
-  (Fedora installed torchaudio "for resolver; remove later" and never removed it
-  — we keep it installed and drop the misleading comment; wan-video-studio pulls
-  audio deps.)
-- ComfyUI + custom nodes + AMD studios: every clone floats HEAD upstream
-  (`--depth=1`). Each has an ARG `*_REF` so a specific sha/tag can be pinned;
-  blank = latest HEAD. These MUST be sha-pinned on-host for reproducible builds
-  — the provenance sha in the header pins only THIS toolbox repo. Refs
-  (all default-branch HEAD, pinned 2026-07-05): `COMFYUI_REF`
-  (comfyanonymous/ComfyUI master), `ESSENTIALS_REF` (cubiq/ComfyUI_essentials),
-  `AMDGPUMONITOR_REF` (kyuz0/ComfyUI-AMDGPUMonitor), `GGUF_REF`
-  (city96/ComfyUI-GGUF), `QWEN_STUDIO_REF` (kyuz0/qwen-image-studio),
-  `WAN_STUDIO_REF` (kyuz0/wan-video-studio).
-- Wan Video Studio uses an explicit dep list per upstream, not its
-  `requirements.txt`.
-- Consumed asset trees (helper scripts) are copied into the build context from
-  upstream/comfyui.
+- ComfyUI + 3 custom nodes (essentials, AMDGPUMonitor, GGUF): sha-pinned clones
+  (`--depth=1` + fetch of the pinned ref), ARG `*_REF` overrideable (pinned
+  2026-07-05). The wan/qwen AMD "studios" (`QWEN_STUDIO_REF`/`WAN_STUDIO_REF`
+  clones + their pip stacks) were DROPPED with the bucket-B rework — rationale
+  in "Per-port notes (bucket-B rework rationale)" above.
+- The 11 baked SD/SD2 config yamls are moved OUT of `models/` to
+  `/opt/resources/model_configs/` (the runtime model-tree bind replaces
+  `models/`); they register back via the seeded `extra_model_paths.yaml`.
+- Runtime-contract assets: helper scripts (get_*.sh downloaders,
+  benchmark/perf helpers, model_manager, model_scanner) baked RO at
+  `/opt/resources/scripts/` (PATH + PYTHONPATH); API-format workflows at
+  `/opt/resources/api_workflows/`; `build-spec` + `templates/` (demo inputs, UI
+  workflow set, extra_model_paths.yaml, /opt/models marker body) baked under
+  `/opt/resources/`. The baked `user/` ships EMPTY (surfaced from
+  `/opt/data/user`, seeded if_empty).
 - Interactive login-shell wiring (see cross-cutting): adds torch/AOTriton env,
   the login banner, a PATH-last guard, and core-dump suppression; the Fedora
   `venv.sh` is intentionally NOT ported (base already writes rocm.sh).
@@ -447,14 +572,21 @@ kernels already live in the base).
   `/usr/local/bin/ds4-cockpit` — both container-owned (NOT the distrobox-shared
   host `~/.local`, which `PYTHONNOUSERSITE` also guards against). Mirrors droste's
   kento `pipx install --global`.
-- Interactive toolbox entrypoint (`CMD ["/bin/bash"]`) matches the Fedora runtime
-  stage.
+- Server by default: `ENTRYPOINT` = the shared `droste-entrypoint.sh` (build-spec:
+  whole-`~/.ds4` surface, HF-cache CRITICAL, `ds4.env` seeding, the
+  `DS4_DROSTE_*` → argv translation in PRE_LAUNCH, then execs `ds4-server`);
+  distrobox/toolbx override the entrypoint for the interactive lane. The
+  upstream `download_model.sh` is REMOVED from `/usr/local/bin` (superseded by
+  the cache-native rework at `/opt/resources/scripts/`); `PYTHONNOUSERSITE=1` +
+  helper scripts on PATH. See "Runtime contract" above.
 
 ### targets/Container.finetuning
 The shippable LLM-finetuning toolbox — torch + HF/unsloth stack on the gfx1151
 runtime kernels, with the compiled bitsandbytes + custom RCCL COPY'd from the
-finetuning-artifacts carrier. Interactive Jupyter toolbox, NOT a minimal service
-image. Translated from the upstream single-stage Dockerfile
+finetuning-artifacts carrier. JupyterLab server by default (shared
+`droste-entrypoint.sh`, :8888; distrobox/toolbx override it for the interactive
+lane), NOT a minimal service image. Translated from the upstream single-stage
+Dockerfile
 (`github.com/kyuz0/amd-strix-halo-llm-finetuning @
 093a23c0d49418aef08e5053aa19faf65b35236a`).
 
@@ -517,8 +649,13 @@ kernels the base carries — NO ROCm re-adds. The base already writes a real
   libggml -> `/usr/local/lib64`, vram helper -> `/usr/local/bin` (executable).
   `/usr/local/lib{,64}` are already on the base's ld path via `rocm.conf` — add
   `local.conf` + `ldconfig` to be sure.
-- Interactive toolbox: default to a shell (distrobox injects the host user at run
-  time).
+- Server by default: `ENTRYPOINT` = the shared `droste-entrypoint.sh` (build-spec:
+  HF-cache CRITICAL, `llama.env` seeding + `set -a` source, SERVICE rebuilt in
+  PRE_LAUNCH with `$LLAMA_EXTRA_ARGS`, then execs `llama-server`); distrobox/
+  toolbx override the entrypoint for the interactive lane. `llama.env` is
+  BUILD-generated by `gen_llama_env.sh` from the pinned binary's own arg table
+  (fails the build if the active `LLAMA_ARG_*` names vanish upstream). See
+  "Runtime contract" above.
 
 ### targets/Container.vllm
 The shippable vLLM toolbox for Strix Halo / gfx1151. FROM the runtime base + the

@@ -79,6 +79,59 @@ The `-build` carriers are `FROM scratch` images holding only `/artifacts`.
 `scaffolding/_fedora-src/` holds the original Fedora Containerfiles as a translation
 reference (not built).
 
+## Running
+
+Every port image is a **server by default**: a shared entrypoint (baked in the
+runtime base) reads the port's `/opt/resources/build-spec`, surfaces persistent
+state from the `/opt/data` volume at the paths the tools expect (overlay/bind
+mounts — every tool runs on its DEFAULTS, zero destination env vars), checks the
+critical binds, seeds first-run content, then execs the service. A user command
+still wins (`podman run IMAGE bash` gets a shell). The critical-bind checks run
+first even then, so a quick shell with no binds needs `-e ALLOW_EPHEMERAL=1`.
+Full contract + rationale: [BUILD_NOTES](BUILD_NOTES.md).
+
+| Image | Service | Port | Config file (seeded if missing, on `/opt/data`) |
+|---|---|---|---|
+| comfyui | ComfyUI web UI | 8188 | `extra_model_paths.yaml` |
+| finetuning | JupyterLab | 8888 | — (token auth; see container log) |
+| vllm | `vllm serve --config` | 8000 | `vllm_config.yaml` — set `model:` |
+| llama | `llama-server` | 8080 | `llama.env` — set `LLAMA_ARG_MODEL` |
+| ds4 | `ds4-server` | 8000 | `ds4.env` — set `DS4_DROSTE_MODEL` |
+
+Mount contract (all ports):
+
+- **`/opt/data`** — the one container-specific volume (venv overlay upper, compute
+  caches, the seeded config file, comfyui's model tree). Unbound → anonymous
+  volume + a warning.
+- **Critical binds** — hard-error at start unless bound; `ALLOW_EPHEMERAL=1`
+  downgrades that to a warning. Always the **HF cache** (`~/.cache/huggingface` —
+  the SINGLE model store, shared across all five ports; bind the same host dir
+  everywhere and any model one tool downloads is available to the rest); plus
+  comfyui `input`/`output` and finetuning `workspace` (irreplaceable user work).
+- **`/opt/models`** — optional read-only local model collection (comfyui scanner
+  source #2; the llama/ds4/vllm config model path may point here). Unbound →
+  one-time INFO + marker file, never an error.
+
+```bash
+podman run -d -p 8188:8188 --device /dev/kfd --device /dev/dri \
+  -v ~/droste/comfyui/data:/opt/data \
+  -v ~/droste/comfyui/input:/opt/ComfyUI/input \
+  -v ~/droste/comfyui/output:/opt/ComfyUI/output \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  ghcr.io/doctorjei/droste-comfyui-halo:latest
+```
+
+comfyui additionally runs a pre-launch **model scanner**: it classifies everything
+in the HF cache (+ `/opt/models`) and maintains a ComfyUI-friendly symlink tree
+(`/opt/data/model-tree`, surfaced at `/opt/ComfyUI/models`) — models any port
+pulls into the shared cache appear in ComfyUI's pickers automatically.
+
+**distrobox lane:** the same images double as `$HOME`-native interactive
+toolboxes — `distrobox assemble create --file targets/<port>/distrobox.ini`. The
+ini declares the volume binds plus an init hook that runs the same resolver in
+distrobox mode (no internal mounts; the auto-bound host home persists the HF
+cache and dotfile state natively).
+
 ## Building
 
 ROCm/HIP is **ahead-of-time cross-compiled** — images build on any x86 host (no GPU).
