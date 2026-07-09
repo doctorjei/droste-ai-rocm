@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""droste-hf-adopt: adopt already-downloaded model files into the HF hub cache.
+
+WHY: droste boxes share a single HuggingFace hub cache; anything in it is
+cached content for every container (and for hf/huggingface_hub generally).
+Model files that arrived some other way -- browser download, wget, rsync
+from another machine -- sit OUTSIDE that cache, so each consumer either
+re-downloads multi-GB weights or needs an ad-hoc bind. This tool moves such
+files INTO the hub cache, but only when they are PROVABLY hub content:
+the file's hash must match what the HF API says the repo contains at the
+current (or requested) revision. Everything else is refused with a reason;
+its home is the /opt/models bind, not the cache.
+
+HOW: for --repo <org>/<name> we fetch the repo manifest from the HF API
+(?blobs=true -- metadata only, never file content). LFS siblings carry
+their content sha256 (lfs.oid); small non-LFS siblings carry their git
+blob sha1 (blobId). Each local candidate is hashed once (streamed, both
+digests in one pass) and matched. A match is adopted exactly the way
+`hf download` would have stored it:
+
+    <cache>/models--<org>--<name>/
+        blobs/<digest>                      content-addressed blob
+        snapshots/<commit>/<repo-path>  ->  relative symlink into blobs/
+        refs/<branch>                       commit sha
+
+Blobs are staged as blobs/.tmp-* and renamed into place, so there is never
+partial state; existing blobs are never overwritten; user files are never
+deleted except under --move, and only after successful placement.
+
+DEFAULT IS DRY-RUN: nothing is touched until you pass --apply.
+"""
+
+import argparse
+import errno
+import hashlib
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CHUNK = 1 << 20  # 1 MiB read chunks for streamed hashing
+API_BASE = "https://huggingface.co/api/models"
+FIXTURE_ENV = "DROSTE_ADOPT_API_FIXTURE"  # test hook; deliberately not in --help
+
+EXAMPLES = """\
+examples:
+  # Adopt a GGUF you fetched with wget into the shared cache (dry-run first):
+  droste-hf-adopt --repo Qwen/Qwen2.5-0.5B-Instruct-GGUF \\
+      ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
+  droste-hf-adopt --apply --repo Qwen/Qwen2.5-0.5B-Instruct-GGUF \\
+      ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+  # Adopt a whole diffusers checkout (nested dirs need --recursive),
+  # reclaiming the disk space afterwards:
+  droste-hf-adopt --apply --move --recursive \\
+      --repo stabilityai/stable-diffusion-xl-base-1.0 ~/sdxl-download/
+
+Only files byte-identical to the repo's content are adopted; everything
+else is refused (its home is the /opt/models bind instead). Small repo
+files you don't have locally are reported as GAP -- a later
+`hf download <repo>` fills those cheaply without re-downloading weights.
+"""
+
+
+def log(args, level, msg):
+    """level 0 = always, 1 = normal, 2 = verbose-only."""
+    verbosity = 1 + args.verbose - args.quiet
+    if level <= verbosity:
+        print(msg)
+
+
+def die(msg, code=2):
+    print(f"droste-hf-adopt: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- cache/auth
+
+def resolve_cache(override):
+    """Standard HF cache resolution: flag > HF_HUB_CACHE > HF_HOME/hub >
+    ~/.cache/huggingface/hub."""
+    if override:
+        return Path(override).expanduser()
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"]).expanduser()
+    if os.environ.get("HF_HOME"):
+        return Path(os.environ["HF_HOME"]).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def find_token(cache):
+    """HF_TOKEN env var, else the token file next to the cache dir
+    (~/.cache/huggingface/token in the default layout)."""
+    tok = os.environ.get("HF_TOKEN", "").strip()
+    if tok:
+        return tok
+    tok_file = cache.parent / "token"
+    try:
+        return tok_file.read_text().strip() or None
+    except OSError:
+        return None
+
+
+# ------------------------------------------------------------------- HF API
+
+def fetch_repo_info(args, repo, revision, token):
+    """GET /api/models/<repo>/revision/<rev>?blobs=true -- metadata only.
+
+    Returns the parsed JSON dict (keys of interest: sha, siblings[]).
+    With DROSTE_ADOPT_API_FIXTURE=<dir> set, reads <dir>/<org>__<name>.json
+    instead of the network (test hook).
+    """
+    fixture_dir = os.environ.get(FIXTURE_ENV)
+    if fixture_dir:
+        org, name = repo.split("/", 1)
+        path = Path(fixture_dir) / f"{org}__{name}.json"
+        log(args, 2, f"# fixture mode: reading {path} (revision ignored)")
+        try:
+            return json.loads(path.read_text())
+        except OSError as e:
+            die(f"fixture read failed: {e}")
+
+    quoted_rev = urllib.parse.quote(revision, safe="")
+    url = f"{API_BASE}/{repo}/revision/{quoted_rev}?blobs=true"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "droste-hf-adopt/0.1",
+        **({"Authorization": f"Bearer {token}"} if token else {}),
+    })
+    log(args, 2, f"# GET {url} (auth: {'token' if token else 'anonymous'})")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            die(f"HTTP {e.code} for {repo}@{revision}: gated or private "
+                "repo -- set HF_TOKEN (or log in with `hf auth login`) "
+                "and accept the license on huggingface.co if required")
+        if e.code == 404:
+            die(f"repo or revision not found: {repo}@{revision}")
+        die(f"HF API returned HTTP {e.code} for {repo}@{revision}")
+    except urllib.error.URLError as e:
+        die(f"cannot reach HF API ({e.reason}); nothing was changed")
+    except TimeoutError:
+        die("HF API request timed out; nothing was changed")
+
+
+def safe_rfilename(rfilename):
+    """Validate a repo-relative path from the API before using it on disk.
+
+    Rejects absolute paths, '..' traversal, empty components, backslashes
+    and other Windows-hostile characters. Returns a relative POSIX path or
+    None if unsafe.
+    """
+    if not rfilename or not isinstance(rfilename, str):
+        return None
+    if rfilename.startswith("/") or "\\" in rfilename or ":" in rfilename:
+        return None
+    parts = rfilename.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    if any(ch in p for p in parts for ch in '<>"|?*\0'):
+        return None
+    return rfilename
+
+
+def is_hex(s, n):
+    return isinstance(s, str) and len(s) == n and \
+        all(c in "0123456789abcdef" for c in s.lower())
+
+
+def index_siblings(args, info, repo):
+    """Build hash->sibling lookup tables from the API manifest.
+
+    Returns (commit, lfs_by_sha256, small_by_sha1, sizes, all_sizes_known,
+    skipped_unsafe).
+    """
+    commit = info.get("sha")
+    if not is_hex(commit, 40):
+        die(f"API response for {repo} has no valid commit sha")
+    lfs_by_sha256 = {}
+    small_by_sha1 = {}
+    sizes = set()
+    all_sizes_known = True
+    skipped_unsafe = 0
+    for sib in info.get("siblings", []):
+        rfn = safe_rfilename(sib.get("rfilename"))
+        if rfn is None:
+            skipped_unsafe += 1
+            log(args, 2, f"# skipping unsafe repo path from API: "
+                         f"{sib.get('rfilename')!r}")
+            continue
+        lfs = sib.get("lfs") or {}
+        # The live API spells the LFS content hash "sha256"; older
+        # payloads/docs say "oid". Accept both.
+        oid = lfs.get("oid") or lfs.get("sha256")
+        size = lfs.get("size", sib.get("size"))
+        if size is None:
+            all_sizes_known = False
+        else:
+            sizes.add(size)
+        if is_hex(oid, 64):
+            lfs_by_sha256[oid.lower()] = (rfn, size)
+        elif not lfs:
+            # blobId of an LFS sibling is the sha1 of its POINTER file,
+            # not the content -- only index blobId for non-LFS siblings
+            # (and never for an LFS sibling whose content hash we could
+            # not read: adopting a 134-byte pointer as a weight file
+            # must be impossible).
+            blob_id = sib.get("blobId")
+            if is_hex(blob_id, 40):
+                small_by_sha1[blob_id.lower()] = (rfn, size)
+    return (commit, lfs_by_sha256, small_by_sha1, sizes, all_sizes_known,
+            skipped_unsafe)
+
+
+# ------------------------------------------------------------------ hashing
+
+def hash_file(path, size):
+    """One streamed pass computing BOTH digests we may need:
+    content sha256 (matches lfs.oid) and git blob sha1
+    ('blob <size>\\0' + content, matches blobId)."""
+    h256 = hashlib.sha256()
+    h1 = hashlib.sha1()
+    h1.update(b"blob %d\x00" % size)
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            h256.update(chunk)
+            h1.update(chunk)
+    return h256.hexdigest(), h1.hexdigest()
+
+
+# ---------------------------------------------------------------- placement
+
+def place_blob(args, src, blob_path, mode):
+    """Get src's content to blob_path atomically. Returns a short verb
+    describing what happened ('hardlinked' / 'copied' / ...).
+
+    Stage into blobs/.tmp-<digest>-<pid>, then rename -- a reader never
+    sees a partial blob and a crash leaves only a .tmp-* to sweep."""
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = blob_path.parent / f".tmp-{blob_path.name}-{os.getpid()}"
+    verb = None
+    try:
+        if mode in ("link", "move"):
+            try:
+                os.link(src, tmp)
+                verb = "hardlinked"
+            except OSError as e:
+                if e.errno not in (errno.EXDEV, errno.EPERM, errno.EMLINK):
+                    raise
+                log(args, 1, f"  note: hardlink not possible "
+                             f"({errno.errorcode.get(e.errno, e.errno)}); "
+                             f"copying instead")
+        if verb is None:
+            shutil.copyfile(src, tmp)
+            verb = "copied"
+        os.rename(tmp, blob_path)  # same dir -> atomic
+    finally:
+        tmp.unlink(missing_ok=True)
+    return verb
+
+
+def ensure_snapshot_link(args, repo_dir, commit, rfn, blob_path, apply_mode):
+    """Create snapshots/<commit>/<rfn> as a RELATIVE symlink to the blob
+    (../../blobs/<digest>, more ..s for nested paths). Never clobbers a
+    path that exists and is not our symlink."""
+    link = repo_dir / "snapshots" / commit / rfn
+    target = os.path.relpath(blob_path, link.parent)
+    if link.is_symlink():
+        if os.readlink(link) == target:
+            return "kept"
+        if not apply_mode:
+            return "would-fix"
+        link.unlink()
+        link.symlink_to(target)
+        return "fixed"
+    if link.exists():
+        log(args, 0, f"  warning: {link} exists and is not a symlink; "
+                     f"leaving it alone")
+        return "blocked"
+    if not apply_mode:
+        return "would-create"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return "created"
+
+
+def ensure_ref(args, repo_dir, revision, commit, apply_mode):
+    """Write/update refs/<revision> -> commit (skipped when the requested
+    revision IS a commit sha). An existing ref with a different sha is
+    updated to the API's current sha -- matches `hf download` -- but the
+    old snapshot dir is left untouched."""
+    if is_hex(revision, 40):
+        return
+    ref = repo_dir / "refs" / revision
+    old = None
+    try:
+        old = ref.read_text().strip()
+    except OSError:
+        pass
+    if old == commit:
+        return
+    if old:
+        log(args, 1, f"  refs/{revision}: {old[:7]} -> {commit[:7]} "
+                     f"(old snapshot kept)")
+    if apply_mode:
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text(commit)
+
+
+# ----------------------------------------------------------- file gathering
+
+def gather_files(args, paths):
+    """Expand CLI paths: files as-is; dirs scanned (non-recursive unless
+    --recursive). Skips .cache/ metadata dirs that `hf download
+    --local-dir` leaves behind."""
+    out = []
+    for p in paths:
+        p = Path(p).expanduser()
+        if p.is_dir():
+            if args.recursive:
+                for root, dirs, files in os.walk(p):
+                    dirs[:] = sorted(d for d in dirs if d != ".cache")
+                    out.extend(Path(root) / f for f in sorted(files))
+            else:
+                out.extend(sorted(c for c in p.iterdir() if c.is_file()))
+        elif p.is_file():
+            out.append(p)
+        else:
+            die(f"no such file or directory: {p}")
+    files = [f for f in out if f.is_file()]
+    if not files:
+        die("no candidate files found (empty dir? need --recursive?)")
+    return files
+
+
+# --------------------------------------------------------------------- main
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="droste-hf-adopt",
+        description="Adopt already-downloaded model files into the "
+                    "HuggingFace hub cache -- no re-download. Only files "
+                    "byte-identical to the repo's published content are "
+                    "adopted; everything else is refused. DRY-RUN by "
+                    "default: pass --apply to actually change the cache.",
+        epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--repo", required=True, metavar="ORG/NAME",
+                   help="HF repo id the files claim to belong to")
+    p.add_argument("paths", nargs="+", metavar="PATH",
+                   help="files to adopt, or a directory to scan")
+    p.add_argument("--apply", action="store_true",
+                   help="actually modify the cache (default: dry-run)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report only, change nothing (this is the default)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--link", dest="mode", action="store_const",
+                      const="link",
+                      help="hardlink into the cache (default; falls back "
+                           "to copy across filesystems)")
+    mode.add_argument("--copy", dest="mode", action="store_const",
+                      const="copy", help="copy into the cache")
+    mode.add_argument("--move", dest="mode", action="store_const",
+                      const="move",
+                      help="move into the cache (source removed only "
+                           "after successful placement)")
+    p.set_defaults(mode="link")
+    p.add_argument("--recursive", action="store_true",
+                   help="recurse into directories")
+    p.add_argument("--cache", metavar="DIR",
+                   help="hub cache dir (default: $HF_HUB_CACHE, "
+                        "$HF_HOME/hub, or ~/.cache/huggingface/hub)")
+    p.add_argument("--revision", default="main", metavar="REV",
+                   help="branch or commit sha to match against "
+                        "(default: main)")
+    p.add_argument("-q", "--quiet", action="count", default=0,
+                   help="only refusals, warnings and the summary")
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="show hashes, API details, per-step decisions")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.dry_run and args.apply:
+        die("--dry-run and --apply are mutually exclusive")
+    apply_mode = args.apply
+
+    repo = args.repo.strip("/")
+    if repo.count("/") != 1 or not all(repo.split("/")):
+        die(f"--repo must look like org/name, got {args.repo!r}")
+
+    cache = resolve_cache(args.cache)
+    token = find_token(cache)
+    files = gather_files(args, args.paths)
+
+    info = fetch_repo_info(args, repo, args.revision, token)
+    (commit, lfs_by_sha256, small_by_sha1, sizes, all_sizes_known,
+     skipped_unsafe) = index_siblings(args, info, repo)
+    if skipped_unsafe:
+        log(args, 0, f"warning: ignored {skipped_unsafe} unsafe path(s) "
+                     f"in the API manifest")
+
+    repo_dir = cache / ("models--" + repo.replace("/", "--"))
+    at = f"{repo}@{commit[:7]}"
+    log(args, 1, f"{'DRY RUN (pass --apply to make changes)' if not apply_mode else 'APPLY'}"
+                 f" | cache: {cache}")
+    log(args, 1, f"repo {at} | {len(lfs_by_sha256)} LFS + "
+                 f"{len(small_by_sha1)} small file(s) | mode: {args.mode}")
+
+    adopted = already = refused = 0
+    satisfied = set()  # rfilenames whose blob is (or will be) in the cache
+    ref_needed = False
+
+    for f in files:
+        size = f.stat().st_size
+        shown = str(f)
+        if all_sizes_known and size not in sizes:
+            # Cheap pre-filter: no repo file has this size, so no hash
+            # can match. Skip hashing multi-GB non-members.
+            log(args, 0, f"REFUSE  {shown}: not byte-identical to any "
+                         f"file in {at} (no size match)")
+            refused += 1
+            continue
+        sha256, git_sha1 = hash_file(f, size)
+        log(args, 2, f"# {f.name}: sha256={sha256[:12]}.. "
+                     f"gitsha1={git_sha1[:12]}.. size={size}")
+        hit = lfs_by_sha256.get(sha256)
+        digest = sha256
+        kind = "lfs sha256"
+        if hit is None:
+            hit = small_by_sha1.get(git_sha1)
+            digest = git_sha1
+            kind = "git blobId"
+        if hit is None:
+            log(args, 0, f"REFUSE  {shown}: not byte-identical to any "
+                         f"file in {at}")
+            refused += 1
+            continue
+
+        rfn, _ = hit
+        blob = repo_dir / "blobs" / digest
+        ref_needed = True
+        satisfied.add(rfn)
+        if blob.exists():
+            if blob.stat().st_size != size:
+                log(args, 0, f"warning: cached blob {digest[:12]}.. has "
+                             f"unexpected size; not touching it and not "
+                             f"removing the source")
+                refused += 1
+                continue
+            ensure_snapshot_link(args, repo_dir, commit, rfn, blob,
+                                 apply_mode)
+            log(args, 1, f"ALREADY {shown}")
+            log(args, 1, f"        == {rfn} (blob already cached)")
+            already += 1
+            if apply_mode and args.mode == "move" \
+                    and f.resolve() != blob.resolve():
+                f.unlink()
+                log(args, 1, "        source removed (--move)")
+        else:
+            if apply_mode:
+                verb = place_blob(args, f, blob, args.mode)
+                ensure_snapshot_link(args, repo_dir, commit, rfn, blob,
+                                     apply_mode)
+                if args.mode == "move":
+                    f.unlink()
+                    verb += ", source removed"
+            else:
+                verb = {"link": "would hardlink", "copy": "would copy",
+                        "move": "would move"}[args.mode]
+                ensure_snapshot_link(args, repo_dir, commit, rfn, blob,
+                                     apply_mode)
+            log(args, 0, f"ADOPT   {shown}")
+            log(args, 0, f"        -> {rfn} ({kind} {digest[:12]}..) "
+                         f"[{verb}]")
+            adopted += 1
+
+    if ref_needed:
+        ensure_ref(args, repo_dir, args.revision, commit, apply_mode)
+
+    # GAP report: repo content still missing from the cache. Small files
+    # are listed (a later `hf download` fills them cheaply); missing LFS
+    # weights are just counted -- listing 20 quant variants is noise.
+    if adopted or already:
+        gaps_small = [rfn for _sha, (rfn, _sz) in small_by_sha1.items()
+                      if rfn not in satisfied
+                      and not (repo_dir / "blobs" / _sha).exists()]
+        gaps_lfs = sum(1 for _sha, (rfn, _sz) in lfs_by_sha256.items()
+                       if rfn not in satisfied
+                       and not (repo_dir / "blobs" / _sha).exists())
+        for rfn in sorted(gaps_small):
+            log(args, 1, f"GAP     {rfn}: not local; "
+                         f"`hf download {repo}` fills this cheaply")
+        if gaps_lfs:
+            log(args, 1, f"GAP     {gaps_lfs} large (LFS) repo file(s) "
+                         f"not in cache (that may be fine)")
+
+    tag = " (dry-run; nothing was changed)" if not apply_mode else ""
+    log(args, 0, f"summary: {adopted} adopted, {already} already cached, "
+                 f"{refused} refused{tag}")
+    if adopted == 0 and already == 0 and refused > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
