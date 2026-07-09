@@ -1,0 +1,1295 @@
+#!/usr/bin/env bash
+# droste-setup — interactive host-side installer for the droste *-halo AI boxes
+# (gfx1151 / Strix Halo images: comfyui, llama, vllm, ds4, finetuning).
+#
+# ONE self-contained script, zero repo-checkout dependencies — safe to run as
+#   curl <url> | bash            (all prompts read from /dev/tty)
+#   curl <url> | bash -s -- comfyui llama     (argv = direct-to-box shortcut)
+#
+# It guides lane choice (server container and/or distrobox), every bind in the
+# mount contract, host ports, and overlay-hostile-filesystem mitigation; then
+# it EMITS per-box recreation records into an emit dir (default ~/droste/):
+#   droste-halo-<box>.compose.yaml   (server lane — always written for that
+#                                     lane, even when no compose provider is
+#                                     installed; fallback creation uses plain
+#                                     `podman create` with identical flags)
+#   droste-halo-<box>.ini            (distrobox lane — native assemble record)
+#   NOTES.md                         (full guide with YOUR real paths baked in)
+# and optionally pulls images / creates boxes / starts servers (build ladder).
+#
+# Re-runs are safe: existing compose/ini files, containers, and distroboxes are
+# detected and listed; per box you choose keep / recreate / modify — an
+# existing setup is NEVER silently clobbered.
+#
+# Test hooks (deliberately undocumented in --help):
+#   DROSTE_SETUP_INPUT=<file>   read all prompt answers from <file> (one per
+#                               line) instead of /dev/tty.
+#   DROSTE_SETUP_FSTYPE=<type>  force the filesystem probe result for every
+#                               data dir (e.g. ecryptfs) — exercises the
+#                               overlay-mitigation path without such a mount.
+set -euo pipefail
+
+# ── Static per-box contract table ────────────────────────────────────────────
+# CANONICAL SOURCE: targets/<box>/build-spec and targets/<box>/distrobox.ini in
+# github.com/doctorjei/droste-ai-rocm. This is a hand-synced snapshot so the
+# installer works with no repo checkout and before any image is pulled; on any
+# drift, the build-specs win. Keep in sync (reviewed against d823b8b).
+
+BOXES=(comfyui llama vllm ds4 finetuning)
+
+declare -A BOX_PITCH=(
+  [comfyui]="ComfyUI web UI — image/video generation"
+  [llama]="llama.cpp server — GGUF LLMs (turboquant fork)"
+  [vllm]="vLLM — OpenAI-compatible LLM server"
+  [ds4]="DeepSeek ds4 server + cockpit — huge MoE quants"
+  [finetuning]="JupyterLab — unsloth/HF finetuning"
+)
+
+# Canonical container-side service port (SERVICE row of each build-spec).
+declare -A BOX_PORT=(
+  [comfyui]=8188 [llama]=8080 [vllm]=8000 [ds4]=8000 [finetuning]=8888
+)
+
+# Extra CRITICAL binds beyond /opt/data + the shared HF cache (CRITICAL rows):
+# space-separated "label:container-dest". These hold irreplaceable user work.
+declare -A BOX_EXTRA_BINDS=(
+  [comfyui]="input:/opt/ComfyUI/input output:/opt/ComfyUI/output"
+  [llama]=""
+  [vllm]=""
+  [ds4]=""
+  [finetuning]="workspace:/opt/workspace"
+)
+
+# OPTIONAL /opt/models bind point (OPTIONAL row; finetuning has none).
+declare -A BOX_HAS_MODELS=(
+  [comfyui]=1 [llama]=1 [vllm]=1 [ds4]=1 [finetuning]=0
+)
+
+# Distrobox-lane extra volume lines: the server lane's SURFACES mirrored into
+# the ini (the resolver mounts nothing in distrobox mode). comfyui only —
+# model-tree + user/ MUST track the /opt/data host dir (@DATA@ substituted).
+declare -A BOX_INI_SURFACES=(
+  [comfyui]="@DATA@/model-tree:/opt/ComfyUI/models @DATA@/user:/opt/ComfyUI/user"
+  [llama]="" [vllm]="" [ds4]="" [finetuning]=""
+)
+
+# Config file seeded (if missing) onto /opt/data at first start.
+declare -A BOX_CONFIG=(
+  [comfyui]="extra_model_paths.yaml"
+  [llama]="llama.env"
+  [vllm]="vllm_config.yaml"
+  [ds4]="ds4.env"
+  [finetuning]=""
+)
+
+# One-line explanations for the prompted bind families (what lives there).
+declare -A BIND_DESC=(
+  [data]="venv overlay upper, caches, seeded config"
+  [input]="source files you feed ComfyUI"
+  [output]="generated images/videos - your work"
+  [workspace]="notebooks + trained adapters - your work"
+)
+
+# The ONE pre-first-use action (dashboard Notes column; @DATA@ substituted).
+declare -A BOX_NOTE=(
+  [comfyui]=""
+  [llama]="Set model: @DATA@/llama.env"
+  [vllm]="Set model: @DATA@/vllm_config.yaml"
+  [ds4]="Set model: @DATA@/ds4.env"
+  [finetuning]="Token: podman logs droste-halo-finetuning"
+)
+
+IMAGE_PREFIX="ghcr.io/doctorjei/droste-"   # + <box> + "-halo:" + tag
+IMAGE_SUFFIX="-halo:latest"
+NAME_PREFIX="droste-halo-"                 # container AND distrobox names
+INIT_HOOK="/opt/resources/resolve/droste-init-hook.sh"
+
+# ── Copy-mode size + fuse speed constants ────────────────────────────────────
+# Rough size of the baked content copy-mode would duplicate onto /opt/data
+# (mostly the venv; torch-stack boxes are multi-GB, llama/ds4 are compiled
+# binaries with a small venv). TODO(Jei-tune): replace with measured numbers
+# from `podman image inspect` / du on a real host; same for the fuse ballpark.
+declare -A BOX_COPY_GB=(
+  [comfyui]=14 [llama]=1 [vllm]=15 [ds4]=1 [finetuning]=16
+)
+FUSE_SPEED_NOTE="~30% on app files; models unaffected"  # TODO(Jei-tune)
+
+# Filesystems kernel overlayfs rejects as an upper (the ecryptfs lesson).
+overlay_hostile_fs() {
+  case "$1" in
+    ecryptfs|nfs*|virtiofs|fuse*|vfat|exfat|msdos|cifs|smb*|9p|overlay)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── Usage ────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<'EOF'
+Usage: droste-setup [OPTIONS] [BOX ...]
+
+Interactive setup for the droste *-halo AI boxes (Strix Halo / gfx1151).
+Guides lanes (server container / distrobox), binds, ports, and filesystem
+gotchas; writes per-box recreation records (compose.yaml + distrobox ini)
+plus a NOTES.md, and can pull images, create boxes, and start servers.
+
+BOX      comfyui llama vllm ds4 finetuning   (default: interactive menu)
+
+Options:
+  --plain    ASCII output (no emoji / ANSI) — auto-detected on dumb terminals
+  -h, --help show this help
+
+Safe to re-run: existing setups are detected and never clobbered.
+EOF
+}
+
+# ── Output / display helpers ─────────────────────────────────────────────────
+PLAIN=0
+ARG_BOXES=()
+for arg in "$@"; do
+  case "$arg" in
+    --plain) PLAIN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) printf 'droste-setup: unknown option: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
+    *) ARG_BOXES+=("$arg") ;;
+  esac
+done
+case "${TERM:-dumb}" in dumb|unknown) PLAIN=1 ;; esac
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]*8*|*[Uu][Tt][Ff]*) : ;;
+  *) PLAIN=1 ;;
+esac
+
+if [[ $PLAIN -eq 1 ]]; then
+  BOLD="" ULINE="" RESET="" DIVCH="-"
+  G_ACTIVE="[+] ACTIVE" G_STOPPED="[-] STOPPED" G_NONE="[ ] none"
+  W_ACTIVE=10 W_STOPPED=11 W_NONE=8
+  G_YES="Y" G_NO="n" W_GLYPH=1
+else
+  BOLD=$'\e[1m' ULINE=$'\e[4m' RESET=$'\e[0m' DIVCH="─"
+  G_ACTIVE=$'\U1F7E2 ACTIVE' G_STOPPED=$'\U1F6D1 STOPPED' G_NONE=$'⚫ none'
+  W_ACTIVE=9 W_STOPPED=10 W_NONE=7        # emoji glyphs are double-width
+  G_YES=$'✅' G_NO=$'\U1F6AB' W_GLYPH=2
+fi
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" | fold -s -w 79; }
+die()  { printf 'droste-setup: %s\n' "$*" >&2; exit 1; }
+wrap() { printf '%s\n' "$*" | fold -s -w 79; }
+
+section() {   # ── Name ──────... divider, 79 cols
+  local name=$1 line fill i n
+  n=$(( 79 - ${#name} - 6 ))
+  fill=""
+  # shellcheck disable=SC2324  # string append of the divider char, not math
+  for (( i = 0; i < n; i = i + 1 )); do fill+=$DIVCH; done
+  printf '\n%s%s %s %s%s%s\n' "$BOLD" "$DIVCH$DIVCH" "$name" "$fill" "$DIVCH" "$RESET"
+}
+
+hdr() { printf '%s%s%s%s\n' "$BOLD" "$ULINE" "$1" "$RESET"; }
+
+# Pad a cell whose DISPLAY width may differ from its byte length (emoji).
+pad_cell() {   # text display-width column-width
+  local text=$1 dw=$2 cw=$3 n
+  n=$(( cw - dw )); [[ $n -lt 1 ]] && n=1
+  printf '%s%*s' "$text" "$n" ""
+}
+
+home_disp() {  # compress $HOME → ~ for display
+  local p=$1
+  if [[ $p == "$HOME" ]]; then printf '~'
+  elif [[ $p == "$HOME"/* ]]; then printf '~%s' "${p#"$HOME"}"
+  else printf '%s' "$p"; fi
+}
+
+expand_path() {  # ~ expansion + absolutize + normalize (realpath -m style)
+  local p=$1
+  # shellcheck disable=SC2088  # matching a LITERAL leading ~ is the point
+  case "$p" in
+    "~") p=$HOME ;;
+    "~/"*) p=$HOME/${p#\~/} ;;
+    /*) : ;;
+    *) p=$PWD/$p ;;
+  esac
+  # Collapse ., .., //  without requiring the path to exist.
+  p=$(realpath -m -- "$p" 2>/dev/null) || :
+  printf '%s' "$p"
+}
+
+# ── Prompt plumbing (curl|bash-safe: /dev/tty, or the scripted-input hook) ───
+ASK_FD=""
+SCRIPTED=0
+init_input() {
+  if [[ -n "${DROSTE_SETUP_INPUT:-}" ]]; then
+    [[ -r "$DROSTE_SETUP_INPUT" ]] || die "cannot read DROSTE_SETUP_INPUT=$DROSTE_SETUP_INPUT"
+    exec {ASK_FD}<"$DROSTE_SETUP_INPUT"
+    SCRIPTED=1
+  else
+    if ! exec {ASK_FD}</dev/tty; then
+      die "no controlling terminal for prompts (this installer is interactive)"
+    fi
+  fi
+}
+
+ANS=""
+ask_raw() {  # $1 = prompt text (printed without newline)
+  printf '%s' "$1"
+  if ! IFS= read -r ANS <&"$ASK_FD"; then
+    printf '\n'
+    die "prompt input exhausted"
+  fi
+  if [[ $SCRIPTED -eq 1 ]]; then printf '%s\n' "$ANS"; fi
+}
+
+ANS_YN=0
+ask_yn() {  # question default(Y|N)  → ANS_YN=1/0
+  local q=$1 def=$2 hint
+  [[ $def == Y ]] && hint="[Y/n]" || hint="[y/N]"
+  while :; do
+    ask_raw "$q $hint: "
+    case "$ANS" in
+      "") [[ $def == Y ]] && ANS_YN=1 || ANS_YN=0; return 0 ;;
+      y|Y) ANS_YN=1; return 0 ;;
+      n|N) ANS_YN=0; return 0 ;;
+    esac
+  done
+}
+
+ANS_CH=""
+ask_choice() {  # prompt letters(first=default, shown capital) → ANS_CH (lower)
+  local q=$1 letters=$2 def=${2:0:1} c
+  while :; do
+    ask_raw "$q: "
+    [[ -z $ANS ]] && ANS=$def
+    c=${ANS,,}
+    if [[ ${#c} -eq 1 && ${letters,,} == *"$c"* ]]; then
+      ANS_CH=$c
+      return 0
+    fi
+  done
+}
+
+ANS_PATH=""
+ask_path_raw() {  # label default → ANS_PATH (absolute; NOT created)
+  local label=$1 def=$2 typed
+  ask_raw "What path should be used for $label? [$(home_disp "$def")] "
+  typed=$ANS
+  [[ -z $ANS ]] && ANS=$def
+  ANS_PATH=$(expand_path "$ANS")
+  # Make the interpretation visible whenever the typed answer was not
+  # already the resolved absolute form (relative tokens, ~, ./x, x/../y).
+  if [[ -n $typed && $typed != "$ANS_PATH" ]]; then
+    say "  -> $ANS_PATH"
+  fi
+  return 0
+}
+
+ask_path() {  # label default → ANS_PATH (absolute, created if absent)
+  ask_path_raw "$1" "$2"
+  mkdir -p "$ANS_PATH" 2>/dev/null || warn "could not create $ANS_PATH"
+}
+
+ANS_PORT=""
+ask_port() {  # box default → ANS_PORT
+  local box=$1 def=$2 other
+  while :; do
+    ask_raw "What host port should be used for $box? [$def] "
+    [[ -z $ANS ]] && ANS=$def
+    if [[ ! $ANS =~ ^[0-9]+$ ]] || (( ANS < 1 || ANS > 65535 )); then
+      say "  Please give a port number (1-65535)."
+      continue
+    fi
+    other=""
+    local b
+    for b in "${BOXES[@]}"; do
+      [[ $b == "$box" ]] && continue
+      [[ "${CFG_PORT[$b]:-}" == "$ANS" ]] && other=$b
+    done
+    if [[ -n $other ]]; then
+      say "  Port $ANS is already assigned to $other — pick another."
+      continue
+    fi
+    ANS_PORT=$ANS
+    return 0
+  done
+}
+
+# ── State ────────────────────────────────────────────────────────────────────
+declare -A ACTION            # box → new|keep|recreate|modify
+declare -A CFG_LANE          # box → server|distrobox|both
+declare -A CFG_AS            # box → 1|""
+declare -A CFG_PORT          # box → host port ("" for distrobox-only)
+declare -A CFG_MODE          # box → ""|fuse|copy|ignore  (overlay mitigation)
+declare -A CFG_FS            # box → probed fstype of the data dir
+declare -A PATHS             # "box:label" → absolute host path
+declare -A EX_COMPOSE EX_INI EX_CTR EX_DBX     # detection (1/"" ; EX_CTR=state)
+declare -A EXD_PATH          # "box:label" → parsed host path from old files
+declare -A EXD_PORT EXD_AS EXD_MODE EXD_LANE   # parsed defaults
+declare -A SESSION_STATE     # box → ACTIVE|STOPPED (what this run did)
+SELECTED=()                  # chosen boxes, canonical order
+CONFIGURE=()                 # SELECTED minus keeps
+HF_CACHE=""
+MODELS_DIR=""                # "" = not configured
+EMIT_DIR=""
+RUNG="w"                     # w|p|c|a
+
+RUNTIME="" ROOTLESS=0 COMPOSE_CMD="" HAVE_DISTROBOX=0
+GROUP_MODE="" GROUP_GIDS=""
+
+# ── Preflight (warn, never block) ────────────────────────────────────────────
+preflight() {
+  section "Preflight"
+  if command -v podman >/dev/null 2>&1; then
+    RUNTIME=podman
+    [[ ${EUID:-$(id -u)} -ne 0 ]] && ROOTLESS=1
+    say "  [ok] podman found ($([[ $ROOTLESS -eq 1 ]] && echo rootless || echo rootful))"
+  elif command -v docker >/dev/null 2>&1; then
+    RUNTIME=docker
+    say "  [ok] docker found (podman not present)"
+  else
+    warn "neither podman nor docker found — definitions will still be written"
+  fi
+  if [[ -e /dev/kfd && -e /dev/dri ]]; then
+    say "  [ok] GPU devices present: /dev/kfd /dev/dri"
+  else
+    warn "GPU devices missing (/dev/kfd, /dev/dri) — fine on a non-GPU host"
+  fi
+  local g missing=""
+  for g in render video; do
+    id -nG 2>/dev/null | tr ' ' '\n' | grep -qx "$g" || missing="$missing,$g"
+  done
+  missing=${missing#,}
+  if [[ -n $missing ]]; then
+    warn "not in group(s) $missing (fix: sudo usermod -aG $missing \$USER; re-login)"
+  else
+    say "  [ok] user is in the render + video groups"
+  fi
+  if [[ -e /dev/fuse ]]; then
+    say "  [ok] /dev/fuse present (fuse-overlayfs fallback available)"
+  else
+    warn "/dev/fuse missing — fuse-overlayfs fallback unavailable"
+  fi
+  if [[ -n $RUNTIME ]] && "$RUNTIME" compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="$RUNTIME compose"
+    say "  [ok] compose provider: $COMPOSE_CMD"
+  elif command -v podman-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="podman-compose"
+    say "  [ok] compose provider: podman-compose"
+  else
+    warn "no compose provider — compose files written anyway; plain $RUNTIME used"
+  fi
+  command -v distrobox >/dev/null 2>&1 && HAVE_DISTROBOX=1
+  [[ $HAVE_DISTROBOX -eq 0 ]] && warn "distrobox not found (needed for the distrobox lane)"
+  # group_add strategy: rootless podman must use keep-groups (numeric GIDs get
+  # remapped away by the userns); rootful/docker take real GIDs.
+  # VERIFY-AT-USE: podman-compose is expected to pass group_add keep-groups
+  # through unmodified (plain `podman create` fallback definitely honors it).
+  if [[ $RUNTIME == podman && $ROOTLESS -eq 1 ]]; then
+    GROUP_MODE="keep-groups"
+  else
+    GROUP_MODE="gids"
+    local gid
+    for g in render video; do
+      gid=$(getent group "$g" 2>/dev/null | cut -d: -f3) || gid=""
+      [[ -n $gid ]] && GROUP_GIDS="$GROUP_GIDS $gid"
+    done
+    GROUP_GIDS=${GROUP_GIDS# }
+    [[ -z $GROUP_GIDS ]] && warn "render/video groups not found; edit group_add later"
+  fi
+  return 0
+}
+
+# ── Existing-setup detection + parsing (re-run safety) ───────────────────────
+compose_file() { printf '%s/%s%s.compose.yaml' "$EMIT_DIR" "$NAME_PREFIX" "$1"; }
+ini_file()     { printf '%s/%s%s.ini' "$EMIT_DIR" "$NAME_PREFIX" "$1"; }
+
+dest_to_label() {  # box dest → label ("" if unknown)
+  local box=$1 dest=$2 pair
+  case "$dest" in
+    /opt/data) printf 'data'; return 0 ;;
+    /opt/models) printf 'models'; return 0 ;;
+    */.cache/huggingface) printf 'hf'; return 0 ;;
+  esac
+  for pair in ${BOX_EXTRA_BINDS[$box]}; do
+    if [[ ${pair#*:} == "$dest" ]]; then printf '%s' "${pair%%:*}"; return 0; fi
+  done
+  printf ''
+}
+
+parse_existing_compose() {  # box
+  local box=$1 f line src dest label
+  f=$(compose_file "$box")
+  [[ -f $f ]] || return 0
+  while IFS= read -r line; do
+    if [[ $line =~ ^[[:space:]]*-[[:space:]]+(/[^:]+):(/[^:\"]+)(:ro)?$ ]]; then
+      src=${BASH_REMATCH[1]} dest=${BASH_REMATCH[2]}
+      label=$(dest_to_label "$box" "$dest")
+      [[ -n $label ]] && EXD_PATH["$box:$label"]=$src
+    elif [[ $line =~ ^[[:space:]]*-[[:space:]]+\"?([0-9]+): ]]; then
+      EXD_PORT[$box]=${BASH_REMATCH[1]}
+    elif [[ $line =~ DROSTE_OVERLAY_MODE=([a-z]+) ]]; then
+      EXD_MODE[$box]=${BASH_REMATCH[1]}
+    elif [[ $line =~ ^[[:space:]]*restart: ]]; then
+      EXD_AS[$box]=1
+    fi
+  done < "$f"
+  return 0
+}
+
+parse_existing_ini() {  # box
+  local box=$1 f line vols entry src dest label
+  f=$(ini_file "$box")
+  [[ -f $f ]] || return 0
+  while IFS= read -r line; do
+    if [[ $line =~ ^volume=\"(.*)\"$ ]]; then
+      vols=${BASH_REMATCH[1]}
+      for entry in $vols; do
+        src=${entry%%:*}
+        dest=${entry#*:}; dest=${dest%%:*}
+        src=$(expand_path "$src")
+        label=$(dest_to_label "$box" "$dest")
+        [[ -n $label && -z "${EXD_PATH["$box:$label"]:-}" ]] \
+          && EXD_PATH["$box:$label"]=$src
+      done
+    fi
+  done < "$f"
+  return 0
+}
+
+detect_existing() {
+  local box any=0 items state
+  for box in "${BOXES[@]}"; do
+    [[ -f $(compose_file "$box") ]] && EX_COMPOSE[$box]=1
+    [[ -f $(ini_file "$box") ]] && EX_INI[$box]=1
+    if [[ -n $RUNTIME ]]; then
+      state=$("$RUNTIME" ps -a --filter "name=^${NAME_PREFIX}${box}\$" \
+              --format '{{.State}}' 2>/dev/null | head -n1) || state=""
+      [[ -n $state ]] && EX_CTR[$box]=$state
+    fi
+    if [[ $HAVE_DISTROBOX -eq 1 ]]; then
+      distrobox list --no-color 2>/dev/null | \
+        awk -F'|' '{gsub(/ /,"",$2); print $2}' | \
+        grep -qx "${NAME_PREFIX}${box}" && EX_DBX[$box]=1 || true
+    fi
+    parse_existing_compose "$box"
+    parse_existing_ini "$box"
+    if [[ -n "${EX_COMPOSE[$box]:-}${EX_INI[$box]:-}" ]]; then
+      if [[ -n "${EX_COMPOSE[$box]:-}" && -n "${EX_INI[$box]:-}" ]]; then
+        EXD_LANE[$box]=both
+      elif [[ -n "${EX_COMPOSE[$box]:-}" ]]; then
+        EXD_LANE[$box]=server
+      else
+        EXD_LANE[$box]=distrobox
+      fi
+    fi
+  done
+  for box in "${BOXES[@]}"; do
+    [[ -n "${EX_COMPOSE[$box]:-}${EX_INI[$box]:-}${EX_CTR[$box]:-}${EX_DBX[$box]:-}" ]] \
+      && any=1
+  done
+  if [[ $any -eq 1 ]]; then
+    section "Existing setup detected"
+    for box in "${BOXES[@]}"; do
+      items=""
+      [[ -n "${EX_COMPOSE[$box]:-}" ]] && items="$items compose-file"
+      [[ -n "${EX_INI[$box]:-}" ]] && items="$items ini-file"
+      [[ -n "${EX_CTR[$box]:-}" ]] && items="$items container(${EX_CTR[$box]})"
+      [[ -n "${EX_DBX[$box]:-}" ]] && items="$items distrobox"
+      [[ -n $items ]] && say "  $box:$items"
+    done
+    say "Existing boxes are never clobbered — you will choose keep/recreate/modify."
+  fi
+  return 0
+}
+
+box_exists() {  # box → 0 if any trace exists
+  local box=$1
+  [[ -n "${EX_COMPOSE[$box]:-}${EX_INI[$box]:-}${EX_CTR[$box]:-}${EX_DBX[$box]:-}" ]]
+}
+
+# ── Box selection ────────────────────────────────────────────────────────────
+select_boxes() {
+  local box tok idx pick
+  declare -A want=()
+  if [[ ${#ARG_BOXES[@]} -gt 0 ]]; then
+    for tok in "${ARG_BOXES[@]}"; do
+      [[ -n "${BOX_PORT[$tok]:-}" ]] || die "unknown box: $tok"
+      want[$tok]=1
+    done
+  else
+    section "Select boxes"
+    idx=1
+    for box in "${BOXES[@]}"; do
+      printf '  %d) %-11s %s (port %s)\n' \
+        "$idx" "$box" "${BOX_PITCH[$box]}" "${BOX_PORT[$box]}"
+      idx=$((idx+1))
+    done
+    say "  6) all of the above"
+    while :; do
+      ask_raw "Which box(es)? (names or numbers, space-separated) [all]: "
+      [[ -z $ANS ]] && ANS=all
+      want=()
+      local ok=1
+      for tok in $ANS; do
+        case "$tok" in
+          all|6) for box in "${BOXES[@]}"; do want[$box]=1; done ;;
+          [1-5]) pick=${BOXES[$((tok-1))]}; want[$pick]=1 ;;
+          *) if [[ -n "${BOX_PORT[$tok]:-}" ]]; then want[$tok]=1
+             else say "  Unknown box: $tok"; ok=0; fi ;;
+        esac
+      done
+      [[ $ok -eq 1 && ${#want[@]} -gt 0 ]] && break
+    done
+  fi
+  SELECTED=()
+  for box in "${BOXES[@]}"; do
+    [[ -n "${want[$box]:-}" ]] && SELECTED+=("$box")
+  done
+  return 0
+}
+
+# For each selected box that already exists: keep / recreate / modify.
+resolve_actions() {
+  local box
+  CONFIGURE=()
+  for box in "${SELECTED[@]}"; do
+    if box_exists "$box"; then
+      say ""
+      say "${NAME_PREFIX}${box} already exists."
+      say "  [K]eep as-is (touch nothing)"
+      say "  [r]ecreate (fresh defaults; old container replaced at create step)"
+      say "  [m]odify (re-ask questions, defaulting to the current values)"
+      ask_choice "[K/r/m]" "Krm"
+      case "$ANS_CH" in
+        k) ACTION[$box]=keep ;;
+        r) ACTION[$box]=recreate; CONFIGURE+=("$box") ;;
+        m) ACTION[$box]=modify;   CONFIGURE+=("$box") ;;
+      esac
+    else
+      ACTION[$box]=new
+      CONFIGURE+=("$box")
+    fi
+  done
+  return 0
+}
+
+# ── Shared questions ─────────────────────────────────────────────────────────
+shared_questions() {
+  section "Shared storage"
+  wrap "The Hugging Face cache is the SINGLE model store shared by every box: a model any box downloads is instantly available to all the others."
+  local def=$HOME/.cache/huggingface box
+  for box in "${BOXES[@]}"; do    # seed default from an existing setup
+    if [[ -n "${EXD_PATH["$box:hf"]:-}" ]]; then
+      def=${EXD_PATH["$box:hf"]}
+      break
+    fi
+  done
+  ask_path "the shared HF cache" "$def"
+  HF_CACHE=$ANS_PATH
+  ask_yn "Bind a read-only local model collection at /opt/models (optional)?" N
+  if [[ $ANS_YN -eq 1 ]]; then
+    def=$HOME/models
+    for box in "${BOXES[@]}"; do
+      if [[ -n "${EXD_PATH["$box:models"]:-}" ]]; then
+        def=${EXD_PATH["$box:models"]}
+        break
+      fi
+    done
+    ask_path "the local model collection" "$def"
+    MODELS_DIR=$ANS_PATH
+  fi
+  return 0
+}
+
+# ── Filesystem probe + overlay mitigation (the ecryptfs lesson) ──────────────
+FSTYPE=""
+probe_fstype() {  # dir → FSTYPE
+  local d=$1
+  if [[ -n "${DROSTE_SETUP_FSTYPE:-}" ]]; then
+    FSTYPE=$DROSTE_SETUP_FSTYPE
+    return 0
+  fi
+  while [[ ! -e $d && $d != / ]]; do d=$(dirname "$d"); done
+  FSTYPE=$(findmnt -n -o FSTYPE --target "$d" 2>/dev/null) \
+    || FSTYPE=$(stat -f -c %T "$d" 2>/dev/null) || FSTYPE=unknown
+  [[ -z $FSTYPE ]] && FSTYPE=unknown
+  return 0
+}
+
+MIT_ALL=""        # ""=unset, else fuse|copy|ignore applied to all later paths
+MIT_ASKED=0
+
+fs_mitigation_menu() {  # box dir fstype → ANS_CH in {f,c,i,n}
+  local box=$1 dir=$2 fstype=$3
+  say ""
+  wrap "Droste uses the Linux kernel's overlayfs to maximize speed and efficiency. However, the filesystem for $(home_disp "$dir") is incompatible with overlayfs ($fstype). Would you like to use another location, select a fallback, or ignore? (If you ignore, the container will fail to load.)"
+  say "  Use [F]use overlay (userspace; slower: $FUSE_SPEED_NOTE)"
+  say "  Make [c]opies of files (no overlay; more storage: ~${BOX_COPY_GB[$box]} GB for $box)"
+  say "  Select [n]ew path (most efficient)"
+  say "  [i]gnore (\"ostrich solution\"; box will fail on start)"
+  ask_choice "[F/c/n/i]" "Fcni"
+  return 0
+}
+
+# ── Pattern propagation for the path family ──────────────────────────────────
+PATTERN_ROOT=""      # user-approved root for auto-filled paths
+PATTERN_ASKED=0
+DEFAULT_ROOT=""      # emit dir (default ~/droste)
+
+path_default() {  # box label → default path (existing > pattern > root)
+  local box=$1 label=$2
+  if [[ ${ACTION[$box]} == modify && -n "${EXD_PATH["$box:$label"]:-}" ]]; then
+    printf '%s' "${EXD_PATH["$box:$label"]}"
+  elif [[ -n $PATTERN_ROOT ]]; then
+    printf '%s/%s/%s' "$PATTERN_ROOT" "$box" "$label"
+  else
+    printf '%s/%s/%s' "$DEFAULT_ROOT" "$box" "$label"
+  fi
+}
+
+maybe_offer_pattern() {  # box label answered-path
+  local box=$1 label=$2 got=$3 root example
+  [[ $PATTERN_ASKED -eq 1 ]] && return 0
+  [[ ${ACTION[$box]} == modify ]] && return 0
+  PATTERN_ASKED=1
+  [[ $got == "$DEFAULT_ROOT/$box/$label" ]] && return 0
+  if [[ $got == */"$box"/"$label" ]]; then
+    root=${got%/"$box"/"$label"}
+  elif [[ $got == */"$label" ]]; then
+    root=${got%/"$label"}
+    root=$(dirname "$root")
+  else
+    root=$(dirname "$got")
+  fi
+  [[ -z $root || $root == / ]] && return 0
+  example="$root/comfyui/input"
+  say "Apply this pattern to all shared resource bindings"
+  ask_yn "  (e.g. $(home_disp "$example"))?" Y
+  [[ $ANS_YN -eq 1 ]] && PATTERN_ROOT=$root
+  return 0
+}
+
+# Ask (or pattern-fill) one bind path for a box; sets PATHS[box:label].
+ask_bind_path() {  # box label dest prose
+  local box=$1 label=$2 dest=$3 prose=$4 def
+  def=$(path_default "$box" "$label")
+  if [[ -n $PATTERN_ROOT && ${ACTION[$box]} != modify && $PATTERN_ASKED -eq 1 ]]; then
+    PATHS["$box:$label"]=$def
+    mkdir -p "$def" 2>/dev/null || warn "could not create $def"
+    say "  $box $label: $(home_disp "$def") (pattern)"
+  else
+    say "  ($label -> $dest: ${BIND_DESC[$label]:-bind})"
+    ask_path "$prose" "$def"
+    PATHS["$box:$label"]=$ANS_PATH
+    maybe_offer_pattern "$box" "$label" "$ANS_PATH"
+  fi
+  return 0
+}
+
+# Data dir + fs probe + mitigation loop; sets PATHS[box:data] CFG_MODE CFG_FS.
+choose_data_dir() {  # box
+  local box=$1 def dir
+  while :; do
+    ask_bind_path "$box" data /opt/data "the data dir"
+    dir=${PATHS["$box:data"]}
+    probe_fstype "$dir"
+    CFG_FS[$box]=$FSTYPE
+    if ! overlay_hostile_fs "$FSTYPE"; then
+      CFG_MODE[$box]=""
+      break
+    fi
+    if [[ ${CFG_LANE[$box]} == distrobox ]]; then
+      # No in-container mounts in the distrobox lane — informational only.
+      say "  Note: $FSTYPE is overlay-hostile, but the distrobox lane mounts"
+      say "  nothing in-container, so this path is fine for distrobox use."
+      CFG_MODE[$box]=""
+      break
+    fi
+    if [[ -n $MIT_ALL ]]; then
+      CFG_MODE[$box]=$MIT_ALL
+      say "  $FSTYPE detected — applying your earlier choice ($MIT_ALL)."
+      break
+    fi
+    # Modify with the same path: keep the recorded mitigation (re-prompts
+    # default to current values); a changed path gets the full menu.
+    if [[ ${ACTION[$box]} == modify && -n "${EXD_MODE[$box]:-}" \
+          && $dir == "${EXD_PATH["$box:data"]:-}" ]]; then
+      CFG_MODE[$box]=${EXD_MODE[$box]}
+      say "  $FSTYPE detected — keeping the existing choice" \
+          "(DROSTE_OVERLAY_MODE=${EXD_MODE[$box]})."
+      break
+    fi
+    fs_mitigation_menu "$box" "$dir" "$FSTYPE"
+    case "$ANS_CH" in
+      f) CFG_MODE[$box]=fuse ;;
+      c) CFG_MODE[$box]=copy ;;
+      i) CFG_MODE[$box]=ignore ;;
+      n) PATTERN_ROOT=""; continue ;;   # re-ask this path explicitly
+    esac
+    if [[ $MIT_ASKED -eq 0 ]]; then
+      MIT_ASKED=1
+      ask_yn "Apply this decision to all paths?" Y
+      [[ $ANS_YN -eq 1 ]] && MIT_ALL=${CFG_MODE[$box]}
+    fi
+    break
+  done
+  return 0
+}
+
+# ── Per-box configuration ────────────────────────────────────────────────────
+LANE_ALL=""      # propagated lane
+AS_ALL=""        # propagated autostart (only meaningful with a server lane)
+LANE_ASKED=0
+
+configure_box() {  # box remaining-after-this (count)
+  local box=$1 remaining=$2 pair label dest lane_def
+  section "$box"
+  say "${BOX_PITCH[$box]}"
+
+  # Lane (Db/Sv/both) + AutoStart — propagatable after the first box.
+  if [[ -n $LANE_ALL && ${ACTION[$box]} != modify ]]; then
+    CFG_LANE[$box]=$LANE_ALL
+    CFG_AS[$box]=$AS_ALL
+    say "Lane: $LANE_ALL (applied to all boxes)"
+  else
+    lane_def="S"
+    if [[ ${ACTION[$box]} == modify ]]; then
+      case "${EXD_LANE[$box]:-server}" in
+        both) lane_def="b" ;;
+        distrobox) lane_def="d" ;;
+        *) lane_def="S" ;;
+      esac
+    fi
+    say "Lanes: a [S]erver container (podman/docker, runs the service),"
+    say "       a [d]istrobox (interactive \$HOME-native toolbox), or [b]oth."
+    case "$lane_def" in
+      S) ask_choice "Which lane(s) for $box? [S/d/b]" "Sdb" ;;
+      d) ask_choice "Which lane(s) for $box? [s/D/b]" "Dsb" ;;
+      b) ask_choice "Which lane(s) for $box? [s/d/B]" "Bsd" ;;
+    esac
+    case "$ANS_CH" in
+      s) CFG_LANE[$box]=server ;;
+      d) CFG_LANE[$box]=distrobox ;;
+      b) CFG_LANE[$box]=both ;;
+    esac
+    CFG_AS[$box]=""
+    if [[ ${CFG_LANE[$box]} != distrobox ]]; then
+      if [[ ${ACTION[$box]} == modify && -n "${EXD_AS[$box]:-}" ]]; then
+        ask_yn "Auto-start the $box server at boot?" Y
+      else
+        ask_yn "Auto-start the $box server at boot?" N
+      fi
+      [[ $ANS_YN -eq 1 ]] && CFG_AS[$box]=1
+    fi
+    if [[ $LANE_ASKED -eq 0 && $remaining -gt 0 ]]; then
+      LANE_ASKED=1
+      ask_yn "Apply this choice to all boxes?" Y
+      if [[ $ANS_YN -eq 1 ]]; then
+        LANE_ALL=${CFG_LANE[$box]}
+        AS_ALL=${CFG_AS[$box]}
+      fi
+    fi
+  fi
+
+  # Data dir (+ fs probe / overlay mitigation), then the other CRITICAL binds.
+  choose_data_dir "$box"
+  for pair in ${BOX_EXTRA_BINDS[$box]}; do
+    label=${pair%%:*} dest=${pair#*:}
+    case "$label" in
+      workspace) ask_bind_path "$box" "$label" "$dest" "the workspace" ;;
+      *) ask_bind_path "$box" "$label" "$dest" "the $label dir" ;;
+    esac
+  done
+
+  # Host port (server lane only).
+  if [[ ${CFG_LANE[$box]} != distrobox ]]; then
+    local pdef=${BOX_PORT[$box]}
+    [[ ${ACTION[$box]} == modify && -n "${EXD_PORT[$box]:-}" ]] \
+      && pdef=${EXD_PORT[$box]}
+    ask_port "$box" "$pdef"
+    CFG_PORT[$box]=$ANS_PORT
+  else
+    CFG_PORT[$box]=""
+  fi
+  return 0
+}
+
+# ── Build ladder ─────────────────────────────────────────────────────────────
+ask_ladder() {
+  section "Build step"
+  say "  [W] Write definition(s) only (compose & ini)"
+  say "  [p] Pull image(s) & write definition(s)"
+  say "  [c] Pull, write, & create box(es)"
+  say "  [a] All of the above, and start server(s)"
+  ask_choice "[W/p/c/a]" "Wpca"
+  RUNG=$ANS_CH
+  return 0
+}
+
+# ── Emitters ─────────────────────────────────────────────────────────────────
+emit_compose() {  # box → writes droste-halo-<box>.compose.yaml
+  local box=$1 f pair label dest
+  f=$(compose_file "$box")
+  {
+    printf '# %s%s.compose.yaml — generated by droste-setup on %s\n' \
+      "$NAME_PREFIX" "$box" "$(date +%F)"
+    printf '# Recreate this box any time with:\n'
+    printf '#   %s compose -f %s up -d\n' "${RUNTIME:-podman}" "$f"
+    printf '# Contract source: targets/%s/build-spec (droste-ai-rocm repo).\n' "$box"
+    printf 'services:\n'
+    printf '  %s:\n' "$box"
+    printf '    image: %s%s%s\n' "$IMAGE_PREFIX" "$box" "$IMAGE_SUFFIX"
+    printf '    container_name: %s%s\n' "$NAME_PREFIX" "$box"
+    printf '    ports:\n'
+    printf '      - "%s:%s"\n' "${CFG_PORT[$box]}" "${BOX_PORT[$box]}"
+    printf '    devices:\n'
+    printf '      - /dev/kfd\n'
+    printf '      - /dev/dri\n'
+    if [[ "${CFG_MODE[$box]:-}" == fuse ]]; then
+      printf '      - /dev/fuse   # fuse-overlayfs (overlay-hostile data fs)\n'
+    fi
+    printf '    cap_add:\n'
+    printf '      - SYS_ADMIN   # entrypoint mounts inside the container\n'
+    printf '    group_add:\n'
+    if [[ $GROUP_MODE == keep-groups ]]; then
+      printf '      - keep-groups   # rootless podman: carry render/video groups\n'
+    else
+      local gid
+      if [[ -n $GROUP_GIDS ]]; then
+        for gid in $GROUP_GIDS; do
+          printf '      - "%s"\n' "$gid"
+        done
+      else
+        printf '      # - "<render-gid>"   # getent group render/video failed\n'
+      fi
+    fi
+    printf '    volumes:\n'
+    printf '      - %s:/opt/data\n' "${PATHS["$box:data"]}"
+    for pair in ${BOX_EXTRA_BINDS[$box]}; do
+      label=${pair%%:*} dest=${pair#*:}
+      printf '      - %s:%s\n' "${PATHS["$box:$label"]}" "$dest"
+    done
+    printf '      - %s:/root/.cache/huggingface\n' "$HF_CACHE"
+    if [[ -n $MODELS_DIR && ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
+      printf '      - %s:/opt/models:ro\n' "$MODELS_DIR"
+    fi
+    case "${CFG_MODE[$box]:-}" in
+      fuse|copy)
+        printf '    environment:\n'
+        printf '      - DROSTE_OVERLAY_MODE=%s\n' "${CFG_MODE[$box]}"
+        ;;
+    esac
+    if [[ -n "${CFG_AS[$box]:-}" ]]; then
+      printf '    restart: unless-stopped\n'
+    fi
+    printf '    # security_opt: ["seccomp=unconfined"]  # uncomment if GPU fails\n'
+  } > "$f"
+  say "  wrote $(home_disp "$f")"
+  return 0
+}
+
+emit_ini() {  # box → writes droste-halo-<box>.ini (distrobox assemble record)
+  local box=$1 f pair label dest vols surf data
+  f=$(ini_file "$box")
+  data=${PATHS["$box:data"]}
+  {
+    printf '# %s%s.ini — generated by droste-setup on %s\n' \
+      "$NAME_PREFIX" "$box" "$(date +%F)"
+    printf '# Create/recreate with:  distrobox assemble create --file %s\n' "$f"
+    printf '# Modeled on targets/%s/distrobox.ini (droste-ai-rocm repo).\n' "$box"
+    printf '\n'
+    printf '[%s%s]\n' "$NAME_PREFIX" "$box"
+    printf 'image=%s%s%s\n' "$IMAGE_PREFIX" "$box" "$IMAGE_SUFFIX"
+    printf 'init_hooks="%s"\n' "$INIT_HOOK"
+    vols="$data:/opt/data"
+    for pair in ${BOX_EXTRA_BINDS[$box]}; do
+      label=${pair%%:*} dest=${pair#*:}
+      vols="$vols ${PATHS["$box:$label"]}:$dest"
+    done
+    printf 'volume="%s"\n' "$vols"
+    if [[ -n "${BOX_INI_SURFACES[$box]}" ]]; then
+      surf=${BOX_INI_SURFACES[$box]//@DATA@/$data}
+      printf '# Server-lane SURFACES mirrored here (the resolver mounts nothing\n'
+      printf '# in distrobox mode); MUST track the /opt/data host dir above.\n'
+      printf 'volume="%s"\n' "$surf"
+    fi
+    if [[ -n $MODELS_DIR && ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
+      printf '# Optional read-only local model collection:\n'
+      printf 'volume="%s:/opt/models:ro"\n' "$MODELS_DIR"
+    fi
+    if [[ $HF_CACHE != "$HOME/.cache/huggingface" ]]; then
+      printf '# Non-default HF cache mapped to the in-box expected location:\n'
+      printf 'volume="%s:%s/.cache/huggingface"\n' "$HF_CACHE" "$HOME"
+    fi
+  } > "$f"
+  say "  wrote $(home_disp "$f")"
+  return 0
+}
+
+# ── Execution (the ladder rungs) ─────────────────────────────────────────────
+plain_create_args() {  # box → prints podman/docker create args (one per line)
+  local box=$1 pair label dest gid
+  printf -- '--name\n%s%s\n' "$NAME_PREFIX" "$box"
+  printf -- '-p\n%s:%s\n' "${CFG_PORT[$box]}" "${BOX_PORT[$box]}"
+  printf -- '--device\n/dev/kfd\n--device\n/dev/dri\n'
+  [[ "${CFG_MODE[$box]:-}" == fuse ]] && printf -- '--device\n/dev/fuse\n'
+  printf -- '--cap-add\nsys_admin\n'
+  if [[ $GROUP_MODE == keep-groups ]]; then
+    printf -- '--group-add\nkeep-groups\n'
+  else
+    for gid in $GROUP_GIDS; do printf -- '--group-add\n%s\n' "$gid"; done
+  fi
+  printf -- '-v\n%s:/opt/data\n' "${PATHS["$box:data"]}"
+  for pair in ${BOX_EXTRA_BINDS[$box]}; do
+    label=${pair%%:*} dest=${pair#*:}
+    printf -- '-v\n%s:%s\n' "${PATHS["$box:$label"]}" "$dest"
+  done
+  printf -- '-v\n%s:/root/.cache/huggingface\n' "$HF_CACHE"
+  if [[ -n $MODELS_DIR && ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
+    printf -- '-v\n%s:/opt/models:ro\n' "$MODELS_DIR"
+  fi
+  case "${CFG_MODE[$box]:-}" in
+    fuse|copy) printf -- '-e\nDROSTE_OVERLAY_MODE=%s\n' "${CFG_MODE[$box]}" ;;
+  esac
+  [[ -n "${CFG_AS[$box]:-}" ]] && printf -- '--restart\nunless-stopped\n'
+  printf '%s%s%s\n' "$IMAGE_PREFIX" "$box" "$IMAGE_SUFFIX"
+  return 0
+}
+
+create_server() {  # box
+  local box=$1 f args=()
+  f=$(compose_file "$box")
+  if [[ ${ACTION[$box]} == recreate && -n "${EX_CTR[$box]:-}" ]]; then
+    "$RUNTIME" rm -f "${NAME_PREFIX}${box}" >/dev/null 2>&1 \
+      || warn "could not remove old container ${NAME_PREFIX}${box}"
+  fi
+  if [[ -n $COMPOSE_CMD ]]; then
+    if [[ $RUNG == a ]]; then
+      $COMPOSE_CMD -f "$f" up -d \
+        && SESSION_STATE[$box]=ACTIVE \
+        || warn "compose up failed for $box (see output above)"
+    else
+      if $COMPOSE_CMD -f "$f" up --no-start >/dev/null 2>&1 \
+         || $COMPOSE_CMD -f "$f" create; then
+        SESSION_STATE[$box]=STOPPED
+      else
+        warn "compose create failed for $box"
+      fi
+    fi
+  else
+    mapfile -t args < <(plain_create_args "$box")
+    if "$RUNTIME" create "${args[@]}"; then
+      SESSION_STATE[$box]=STOPPED
+      if [[ $RUNG == a ]]; then
+        "$RUNTIME" start "${NAME_PREFIX}${box}" \
+          && SESSION_STATE[$box]=ACTIVE \
+          || warn "could not start ${NAME_PREFIX}${box}"
+      fi
+    else
+      warn "$RUNTIME create failed for $box"
+    fi
+  fi
+  return 0
+}
+
+create_distrobox() {  # box
+  local box=$1
+  if [[ $HAVE_DISTROBOX -eq 0 ]]; then
+    warn "distrobox not installed — skipped creating ${NAME_PREFIX}${box}"
+    return 0
+  fi
+  if [[ ${ACTION[$box]} == recreate && -n "${EX_DBX[$box]:-}" ]]; then
+    distrobox rm -f "${NAME_PREFIX}${box}" >/dev/null 2>&1 \
+      || warn "could not remove old distrobox ${NAME_PREFIX}${box}"
+  fi
+  distrobox assemble create --file "$(ini_file "$box")" \
+    || warn "distrobox assemble failed for $box"
+  return 0
+}
+
+execute() {
+  local box lane
+  section "Executing"
+  for box in "${CONFIGURE[@]}"; do
+    lane=${CFG_LANE[$box]}
+    [[ $lane != distrobox ]] && emit_compose "$box"
+    [[ $lane != server ]] && emit_ini "$box"
+  done
+  if [[ $RUNG != w ]]; then
+    for box in "${CONFIGURE[@]}"; do
+      say "  pulling ${IMAGE_PREFIX}${box}${IMAGE_SUFFIX} ..."
+      "${RUNTIME:-podman}" pull "${IMAGE_PREFIX}${box}${IMAGE_SUFFIX}" \
+        || warn "pull failed for $box"
+    done
+  fi
+  if [[ $RUNG == c || $RUNG == a ]]; then
+    for box in "${CONFIGURE[@]}"; do
+      lane=${CFG_LANE[$box]}
+      [[ $lane != distrobox ]] && create_server "$box"
+      [[ $lane != server ]] && create_distrobox "$box"
+    done
+  fi
+  return 0
+}
+
+# ── NOTES.md ─────────────────────────────────────────────────────────────────
+write_notes() {
+  local f=$EMIT_DIR/NOTES.md box lane port asx data note
+  {
+    printf '# droste-halo setup notes\n\n'
+    printf 'Generated by droste-setup on %s. Re-run droste-setup any time —\n' \
+      "$(date +%F)"
+    printf 'existing boxes are detected and never clobbered.\n\n'
+    printf '## Your installation\n\n'
+    printf '| Box | Lanes | Auto-start | Host port | Data dir |\n'
+    printf '|---|---|---|---|---|\n'
+    for box in "${SELECTED[@]}"; do
+      lane=$(box_lanes_disp "$box")
+      port=$(box_port_disp "$box")
+      asx=no; [[ -n "$(box_as "$box")" ]] && asx=yes
+      data="${PATHS["$box:data"]:-${EXD_PATH["$box:data"]:-?}}"
+      printf '| %s | %s | %s | %s | %s |\n' "$box" "$lane" "$asx" "$port" "$data"
+    done
+    printf '\nShared HF cache: `%s` — bound into every box; the SINGLE model\n' \
+      "$HF_CACHE"
+    printf 'store (a model one box downloads is available to all the others).\n'
+    if [[ -n $MODELS_DIR ]]; then
+      printf 'Local model collection: `%s` (read-only at /opt/models).\n' \
+        "$MODELS_DIR"
+    else
+      printf 'Local model collection: not configured (/opt/models unbound).\n'
+    fi
+    printf '\n## Day-to-day commands\n\n'
+    printf '    podman start <name>        # start a server box\n'
+    printf '    podman stop <name>         # stop it\n'
+    printf '    podman logs -f <name>      # follow its log\n'
+    printf '    distrobox enter <name>     # enter an interactive box\n\n'
+    printf 'Names: '
+    for box in "${SELECTED[@]}"; do printf '%s%s ' "$NAME_PREFIX" "$box"; done
+    printf '\n\n## Per-box quickstart\n'
+    for box in "${SELECTED[@]}"; do
+      data="${PATHS["$box:data"]:-${EXD_PATH["$box:data"]:-<data-dir>}}"
+      port=$(box_port_disp "$box")
+      printf '\n### %s — %s\n\n' "$box" "${BOX_PITCH[$box]}"
+      case "$box" in
+        comfyui)
+          printf -- '- Web UI: http://localhost:%s (server lane).\n' "$port"
+          printf -- '- Models are scanned from the shared HF cache (+ /opt/models)\n'
+          printf '  at every start; new downloads appear in the pickers.\n'
+          printf -- '- Your work dirs: input `%s`, output `%s`.\n' \
+            "${PATHS["$box:input"]:-${EXD_PATH["$box:input"]:-?}}" \
+            "${PATHS["$box:output"]:-${EXD_PATH["$box:output"]:-?}}"
+          ;;
+        llama)
+          printf -- '- BEFORE first use: edit `%s/llama.env` and set\n' "$data"
+          printf '  `LLAMA_ARG_MODEL` (a GGUF path, or use `-hf org/repo` via\n'
+          printf '  `LLAMA_EXTRA_ARGS`). The file is seeded at first start.\n'
+          printf -- '- API: http://localhost:%s (llama-server).\n' "$port"
+          ;;
+        vllm)
+          printf -- '- BEFORE first use: edit `%s/vllm_config.yaml` and set\n' "$data"
+          printf '  `model:` (HF repo id or /opt/models path). Seeded at first start.\n'
+          printf -- '- OpenAI-compatible API: http://localhost:%s/v1.\n' "$port"
+          ;;
+        ds4)
+          printf -- '- BEFORE first use: edit `%s/ds4.env` and set\n' "$data"
+          printf '  `DS4_DROSTE_MODEL` (GGUF path). Seeded at first start.\n'
+          printf -- '- API: http://localhost:%s (ds4-server).\n' "$port"
+          ;;
+        finetuning)
+          printf -- '- JupyterLab: http://localhost:%s — get the login token with\n' \
+            "$port"
+          printf '    podman logs %sfinetuning\n' "$NAME_PREFIX"
+          printf -- '- Notebooks + trained adapters live in your workspace:\n'
+          printf '  `%s`.\n' \
+            "${PATHS["$box:workspace"]:-${EXD_PATH["$box:workspace"]:-?}}"
+          ;;
+      esac
+    done
+    printf '\n## Recreate one-liners\n\n'
+    for box in "${SELECTED[@]}"; do
+      if [[ -f $(compose_file "$box") ]]; then
+        printf '    %s compose -f %s up -d\n' \
+          "${RUNTIME:-podman}" "$(compose_file "$box")"
+      fi
+      if [[ -f $(ini_file "$box") ]]; then
+        printf '    distrobox assemble create --file %s\n' "$(ini_file "$box")"
+      fi
+    done
+    printf '\n## Auto-start\n\n'
+    printf 'Boxes with auto-start use `restart: unless-stopped`. For rootless\n'
+    printf 'podman that policy is applied at boot by a user service — enable it\n'
+    printf 'once:\n\n'
+    printf '    systemctl --user enable --now podman-restart.service\n'
+    printf '    loginctl enable-linger %s   # start user services at boot\n\n' \
+      "${USER:-$(id -un)}"
+    printf '## Shared model store\n\n'
+    printf 'Every box binds `%s`. Download once, use everywhere:\n\n' "$HF_CACHE"
+    printf '    hf download <org>/<repo>       # or: huggingface-cli download\n\n'
+    printf 'ComfyUI re-scans the cache at each start (symlink model tree).\n'
+    printf '\n## Installer choices (record)\n\n'
+    printf -- '- Date: %s; emit dir: `%s`; runtime: %s%s.\n' \
+      "$(date +%F)" "$EMIT_DIR" "${RUNTIME:-none}" \
+      "$([[ $ROOTLESS -eq 1 ]] && echo ' (rootless)')"
+    printf -- '- group_add mode: %s.\n' \
+      "$([[ $GROUP_MODE == keep-groups ]] && echo 'keep-groups (rootless podman)' \
+         || echo "numeric GIDs (${GROUP_GIDS:-none found})")"
+    for box in "${CONFIGURE[@]}"; do
+      note=""
+      case "${CFG_MODE[$box]:-}" in
+        fuse) note="fs=${CFG_FS[$box]} → DROSTE_OVERLAY_MODE=fuse + /dev/fuse" ;;
+        copy) note="fs=${CFG_FS[$box]} → DROSTE_OVERLAY_MODE=copy" ;;
+        ignore) note="fs=${CFG_FS[$box]} → IGNORED (box will fail on start!)" ;;
+        *) note="fs=${CFG_FS[$box]:-?} (kernel overlayfs OK)" ;;
+      esac
+      printf -- '- %s: lane=%s, data=`%s`, %s.%s\n' \
+        "$box" "${CFG_LANE[$box]}" "${PATHS["$box:data"]}" "$note" \
+        "$([[ -n ${BOX_CONFIG[$box]} ]] \
+           && printf ' Seeded config: %s.' "${BOX_CONFIG[$box]}")"
+    done
+    printf '\nEscape hatch: `-e ALLOW_EPHEMERAL=1` downgrades missing-critical-\n'
+    printf 'bind errors to warnings (NOT recommended — data will not persist).\n'
+    printf '\n## Health check\n\n'
+    printf 'On the GPU host, the repo'\''s `scaffolding/check-rocm.sh` validates\n'
+    printf 'GPU access + per-box smoke across all images (see its --help).\n'
+  } > "$f"
+  say "  wrote $(home_disp "$f")"
+  return 0
+}
+
+# ── Status dashboard ─────────────────────────────────────────────────────────
+box_lanes_disp() {  # box → server|distrobox|both from config or detection
+  local box=$1
+  if [[ -n "${CFG_LANE[$box]:-}" ]]; then
+    printf '%s' "${CFG_LANE[$box]}"
+  else
+    printf '%s' "${EXD_LANE[$box]:-none}"
+  fi
+}
+box_port_disp() {
+  local box=$1
+  printf '%s' "${CFG_PORT[$box]:-${EXD_PORT[$box]:--}}"
+}
+box_as() {
+  local box=$1
+  if [[ -n "${CFG_LANE[$box]:-}" ]]; then
+    printf '%s' "${CFG_AS[$box]:-}"
+  else
+    printf '%s' "${EXD_AS[$box]:-}"
+  fi
+}
+
+box_state() {  # box → ACTIVE|STOPPED|none
+  local box=$1 state=""
+  if [[ -n $RUNTIME ]]; then
+    state=$("$RUNTIME" ps -a --filter "name=^${NAME_PREFIX}${box}\$" \
+            --format '{{.State}}' 2>/dev/null | head -n1) || state=""
+  fi
+  if [[ -z $state ]]; then
+    if [[ -n "${SESSION_STATE[$box]:-}" ]]; then
+      printf '%s' "${SESSION_STATE[$box]}"
+    elif [[ -n "${EX_CTR[$box]:-}" ]]; then
+      [[ ${EX_CTR[$box]} == running ]] && printf 'ACTIVE' || printf 'STOPPED'
+    elif [[ -n "${EX_DBX[$box]:-}" ]]; then
+      printf 'STOPPED'
+    else
+      printf 'none'
+    fi
+  else
+    [[ $state == running ]] && printf 'ACTIVE' || printf 'STOPPED'
+  fi
+}
+
+dashboard() {
+  local box lane st stg stw g note data row port
+  say ""
+  hdr "Box Status"
+  say "Legend: St state - Db distrobox - Sv server - AS auto-start ($G_YES yes / $G_NO no)"
+  printf '%s%s%s\n' "$ULINE" \
+    "$(pad_cell "Box" 3 11)$(pad_cell "St" 2 12)$(pad_cell "Db" 2 3)$(pad_cell "Sv" 2 3)$(pad_cell "AS" 2 3)$(pad_cell "Port" 4 5)Important Notes" \
+    "$RESET"
+  for box in "${SELECTED[@]}"; do
+    lane=$(box_lanes_disp "$box")
+    st=$(box_state "$box")
+    case "$st" in
+      ACTIVE)  stg=$G_ACTIVE;  stw=$W_ACTIVE ;;
+      STOPPED) stg=$G_STOPPED; stw=$W_STOPPED ;;
+      *)       stg=$G_NONE;    stw=$W_NONE ;;
+    esac
+    row=$(pad_cell "$box" ${#box} 11)
+    row+=$(pad_cell "$stg" "$stw" 12)
+    [[ $lane == distrobox || $lane == both ]] && g=$G_YES || g=$G_NO
+    row+=$(pad_cell "$g" "$W_GLYPH" 3)
+    [[ $lane == server || $lane == both ]] && g=$G_YES || g=$G_NO
+    row+=$(pad_cell "$g" "$W_GLYPH" 3)
+    [[ -n "$(box_as "$box")" ]] && g=$G_YES || g=$G_NO
+    row+=$(pad_cell "$g" "$W_GLYPH" 3)
+    port=$(box_port_disp "$box")
+    row+=$(pad_cell "$port" ${#port} 5)
+    data="${PATHS["$box:data"]:-${EXD_PATH["$box:data"]:-}}"
+    note=${BOX_NOTE[$box]//@DATA@/$(home_disp "${data:-~/droste/$box/data}")}
+    [[ ${#note} -gt 42 ]] && note="${note:0:39}..."
+    printf '%s%s\n' "$row" "$note"
+  done
+  say ""
+  hdr "Shortcuts"
+  say "  Enter a box:        distrobox enter ${NAME_PREFIX}<box>"
+  say "  Start/stop server:  podman start|stop ${NAME_PREFIX}<box>"
+  say "  Recreate (from $(home_disp "$EMIT_DIR")):"
+  say "    server:    podman compose -f ${NAME_PREFIX}<box>.compose.yaml up -d"
+  say "    distrobox: distrobox assemble create --file ${NAME_PREFIX}<box>.ini"
+  say "* ComfyUI models are scanned at start; add more: hf download (shared cache)"
+  say "Definitions + full guide: $(home_disp "$EMIT_DIR") (compose.yaml, ini, NOTES.md)"
+  return 0
+}
+
+# ── Main flow ────────────────────────────────────────────────────────────────
+main() {
+  init_input
+  say "droste-setup — guided install for the droste *-halo AI boxes"
+  preflight
+
+  section "Where to keep the definitions"
+  wrap "Per-box recreation records (compose.yaml + distrobox ini) and NOTES.md are written to an emit dir; default data dirs live under it too."
+  # A typo here fans out into every emitted file — confirm before creating.
+  while :; do
+    ask_path_raw "the definitions (emit dir)" "$HOME/droste"
+    if [[ -d $ANS_PATH ]]; then
+      break
+    fi
+    ask_yn "Create $ANS_PATH?" Y
+    if [[ $ANS_YN -eq 1 ]]; then
+      if mkdir -p "$ANS_PATH" 2>/dev/null; then
+        break
+      fi
+      warn "could not create $ANS_PATH — pick another location"
+    fi
+  done
+  EMIT_DIR=$ANS_PATH
+  DEFAULT_ROOT=$EMIT_DIR
+
+  detect_existing
+  select_boxes
+  resolve_actions
+
+  if [[ ${#CONFIGURE[@]} -gt 0 ]]; then
+    shared_questions
+    local i n box
+    n=${#CONFIGURE[@]}
+    for (( i = 0; i < n; i = i + 1 )); do
+      box=${CONFIGURE[$i]}
+      configure_box "$box" $(( n - i - 1 ))
+    done
+    ask_ladder
+    execute
+    write_notes
+  else
+    say ""
+    say "Nothing to change (all selected boxes kept as-is)."
+  fi
+
+  dashboard
+  return 0
+}
+
+main
