@@ -18,6 +18,15 @@ blob sha1 (blobId). Each local candidate is hashed once (streamed, both
 digests in one pass) and matched. A match is adopted exactly the way
 `hf download` would have stored it:
 
+Without --repo each file goes through an IDENTIFY phase first: search
+terms derived from the filename (plus, for GGUF, any provenance embedded
+in the header) are fed to the HF model-search API, and each candidate
+repo's manifest is checked for a sibling whose published hash equals the
+local file's. Identification is therefore exactly as strict as --repo --
+a repo is only ever accepted on hash proof, never on name similarity.
+Files in one directory may identify to different repos; adoption then
+runs per identified repo. Unidentifiable files are refused.
+
     <cache>/models--<org>--<name>/
         blobs/<digest>                      content-addressed blob
         snapshots/<commit>/<repo-path>  ->  relative symlink into blobs/
@@ -35,6 +44,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import urllib.error
@@ -45,6 +55,8 @@ from pathlib import Path
 CHUNK = 1 << 20  # 1 MiB read chunks for streamed hashing
 API_BASE = "https://huggingface.co/api/models"
 FIXTURE_ENV = "DROSTE_ADOPT_API_FIXTURE"  # test hook; deliberately not in --help
+SEARCH_LIMIT = 20  # candidate repos returned per search query
+MAX_SEARCHES = 3  # search attempts per file before giving up (stay polite)
 
 EXAMPLES = """\
 examples:
@@ -53,6 +65,11 @@ examples:
       ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
   droste-hf-adopt --apply --repo Qwen/Qwen2.5-0.5B-Instruct-GGUF \\
       ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+  # Don't know (or trust) the repo? Omit --repo: each file is IDENTIFIED
+  # via the HF search API and adopted only if a repo's published hashes
+  # prove it contains this exact content:
+  droste-hf-adopt ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
   # Adopt a whole diffusers checkout (nested dirs need --recursive),
   # reclaiming the disk space afterwards:
@@ -107,10 +124,12 @@ def find_token(cache):
 
 # ------------------------------------------------------------------- HF API
 
-def fetch_repo_info(args, repo, revision, token):
+def fetch_repo_info(args, repo, revision, token, fatal=True):
     """GET /api/models/<repo>/revision/<rev>?blobs=true -- metadata only.
 
     Returns the parsed JSON dict (keys of interest: sha, siblings[]).
+    With fatal=False (identify-phase candidates) any failure returns None
+    instead of exiting -- the sweep just moves to the next candidate.
     With DROSTE_ADOPT_API_FIXTURE=<dir> set, reads <dir>/<org>__<name>.json
     instead of the network (test hook).
     """
@@ -122,7 +141,10 @@ def fetch_repo_info(args, repo, revision, token):
         try:
             return json.loads(path.read_text())
         except OSError as e:
-            die(f"fixture read failed: {e}")
+            if fatal:
+                die(f"fixture read failed: {e}")
+            log(args, 2, f"# fixture manifest missing for {repo}; skipping")
+            return None
 
     quoted_rev = urllib.parse.quote(revision, safe="")
     url = f"{API_BASE}/{repo}/revision/{quoted_rev}?blobs=true"
@@ -135,6 +157,10 @@ def fetch_repo_info(args, repo, revision, token):
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
+        if not fatal:
+            log(args, 2, f"# HTTP {e.code} for {repo}@{revision}; "
+                         f"skipping candidate")
+            return None
         if e.code in (401, 403):
             die(f"HTTP {e.code} for {repo}@{revision}: gated or private "
                 "repo -- set HF_TOKEN (or log in with `hf auth login`) "
@@ -143,8 +169,15 @@ def fetch_repo_info(args, repo, revision, token):
             die(f"repo or revision not found: {repo}@{revision}")
         die(f"HF API returned HTTP {e.code} for {repo}@{revision}")
     except urllib.error.URLError as e:
+        if not fatal:
+            log(args, 2, f"# cannot reach HF API for {repo} ({e.reason}); "
+                         f"skipping candidate")
+            return None
         die(f"cannot reach HF API ({e.reason}); nothing was changed")
     except TimeoutError:
+        if not fatal:
+            log(args, 2, f"# HF API timed out for {repo}; skipping candidate")
+            return None
         die("HF API request timed out; nothing was changed")
 
 
@@ -231,6 +264,240 @@ def hash_file(path, size):
             h256.update(chunk)
             h1.update(chunk)
     return h256.hexdigest(), h1.hexdigest()
+
+
+def memo_hash(path, size, memo):
+    """hash_file, cached per run: the identify phase may consult many
+    candidate repos and adoption runs after it -- each file is hashed
+    exactly ONCE."""
+    key = str(path)
+    if key not in memo:
+        memo[key] = hash_file(path, size)
+    return memo[key]
+
+
+# ----------------------------------------------------------- identification
+
+# Quant/dtype/format tokens: useful for filename matching, but repo names
+# usually carry only the model name -- broadened searches strip these.
+QUANT_RE = re.compile(
+    r"(?i)^(i?q\d[a-z0-9_]*|fp\d+|bf16|f16|f32|f64|int[48]|[48]bit|e\dm\d|"
+    r"gguf|ggml|safetensors|gptq|awq|exl2|imatrix)$")
+GGUF_HINT_KEYS = ("general.source.huggingface.repository",
+                  "general.source.url", "general.name", "general.basename")
+
+
+def valid_repo_id(s):
+    """org/name shape check, shared by --repo and identify candidates."""
+    s = (s or "").strip("/")
+    return s if s.count("/") == 1 and all(s.split("/")) else None
+
+
+def derive_term_sets(name):
+    """Filename -> ladder of HF search queries, most specific first:
+    the full stem, then quant/dtype tokens stripped, then the trailing
+    token dropped as well."""
+    stem = name[:name.rfind(".")] if "." in name else name
+    tokens = [t for t in re.split(r"[-_. ]+", stem) if t]
+    plain, quant_tail = [], False
+    for t in tokens:
+        if QUANT_RE.match(t):
+            quant_tail = True
+            continue
+        if quant_tail and re.fullmatch(r"(?i)([a-z]{1,3}|\d)", t):
+            continue  # the _K / _M / _XXS pieces of q4_K_M-style suffixes
+        quant_tail = False
+        plain.append(t)
+    sets = [stem]
+    if plain and plain != tokens:
+        sets.append(" ".join(plain))
+    if len(plain) > 1:
+        sets.append(" ".join(plain[:-1]))
+    out = []
+    for s in sets:
+        if s not in out:
+            out.append(s)
+    return out[:MAX_SEARCHES]
+
+
+def gguf_repo_hint(path):
+    """Best-effort GGUF provenance: bounded header parse looking for
+    general.source.huggingface.repository / general.name style keys.
+    Returns (repo_id_or_None, name_or_None). Purely a hint feeding the
+    hash-verified pipeline; any parse trouble degrades silently."""
+    found = {}
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+            if magic != b"GGUF":
+                return None, None
+            buf = magic + fh.read((1 << 20) - 4)  # bounded prefix
+        version = int.from_bytes(buf[4:8], "little")
+        if version < 2:  # v1 used 32-bit counts; not worth supporting
+            return None, None
+        n_kv = int.from_bytes(buf[16:24], "little")
+        pos = 24
+        scalar = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+                  10: 8, 11: 8, 12: 8}  # gguf value type -> byte width
+
+        def take(n):
+            nonlocal pos
+            if n < 0 or pos + n > len(buf):
+                raise ValueError("out of bounds")
+            out = buf[pos:pos + n]
+            pos += n
+            return out
+
+        def take_str():
+            return take(int.from_bytes(take(8), "little")) \
+                .decode("utf-8", "replace")
+
+        for _ in range(min(n_kv, 512)):
+            key = take_str()
+            vtype = int.from_bytes(take(4), "little")
+            if vtype == 8:  # string
+                val = take_str()
+                if key in GGUF_HINT_KEYS:
+                    found[key] = val.strip()
+            elif vtype == 9:  # array: elem type + count + elems
+                etype = int.from_bytes(take(4), "little")
+                count = int.from_bytes(take(8), "little")
+                if etype == 8:
+                    for _ in range(count):
+                        take_str()
+                else:
+                    take(scalar[etype] * count)
+            else:
+                take(scalar[vtype])
+    except Exception:
+        pass  # hint only -- keep whatever was parsed before the trouble
+    src = found.get("general.source.huggingface.repository") \
+        or found.get("general.source.url") or ""
+    if src.startswith("http"):
+        src = "/".join(urllib.parse.urlparse(src).path.strip("/").split("/")[:2])
+    return (valid_repo_id(src),
+            found.get("general.name") or found.get("general.basename"))
+
+
+def search_models(args, query, token, searches):
+    """GET /api/models?search=... -- repo summaries ({id, downloads, ...}),
+    most-downloaded first. Raises URLError/TimeoutError; the caller
+    refuses that file rather than crashing the run.
+
+    Fixture (DROSTE_ADOPT_API_FIXTURE=<dir>): reads <dir>/search.json --
+    either a list (returned for every query) or a dict of query -> list
+    (with optional "*" default); {"error": msg} simulates a network
+    failure.
+    """
+    if query in searches:
+        return searches[query]
+    fixture_dir = os.environ.get(FIXTURE_ENV)
+    if fixture_dir:
+        path = Path(fixture_dir) / "search.json"
+        log(args, 2, f"# fixture mode: reading {path} for search {query!r}")
+        try:
+            data = json.loads(path.read_text())
+        except OSError as e:
+            die(f"fixture read failed: {e}")
+        if isinstance(data, dict):
+            if "error" in data:
+                raise urllib.error.URLError(data["error"])
+            data = data.get(query, data.get("*", []))
+        searches[query] = data
+        return data
+    url = (f"{API_BASE}?search={urllib.parse.quote(query)}"
+           f"&limit={SEARCH_LIMIT}&sort=downloads&direction=-1")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "droste-hf-adopt/0.1",
+        **({"Authorization": f"Bearer {token}"} if token else {}),
+    })
+    log(args, 2, f"# GET {url}")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    searches[query] = data
+    return data
+
+
+def get_manifest(args, repo, revision, token, manifests):
+    """Fetch+index a candidate repo's manifest, cached per run (identify
+    sweeps and multi-file invocations must not re-fetch). Returns
+    (info, index_tuple) or None; failures are negative-cached."""
+    if repo in manifests:
+        return manifests[repo]
+    entry = None
+    info = fetch_repo_info(args, repo, revision, token, fatal=False)
+    if info is not None and is_hex(info.get("sha"), 40):
+        entry = (info, index_siblings(args, info, repo))
+    elif info is not None:
+        log(args, 2, f"# {repo}: manifest has no valid commit sha; skipping")
+    manifests[repo] = entry
+    return entry
+
+
+def identify_file(args, f, size, token, manifests, searches, hash_memo):
+    """IDENTIFY phase for one file (no --repo): find HF repos whose
+    published hashes prove they contain this exact content. Returns
+    (repo, note, alternatives) on success, (None, refusal_reason, [])
+    otherwise."""
+
+    def hash_matches(idx):
+        _commit, lfs_by_sha256, small_by_sha1, sizes, all_known, _ = idx
+        if all_known and size not in sizes:
+            return False  # cheap pre-filter: no sibling can match
+        # sizes incomplete -> fall through to the (memoized) hash compare
+        sha256, git_sha1 = memo_hash(f, size, hash_memo)
+        return sha256 in lfs_by_sha256 or git_sha1 in small_by_sha1
+
+    # GGUF provenance hint: an embedded source repo, once hash-proven,
+    # is definitive -- no search needed. A stale/wrong hint just falls
+    # through to the search path.
+    hint_repo, hint_name = gguf_repo_hint(f)
+    if hint_repo:
+        log(args, 2, f"# {f.name}: gguf hint -> {hint_repo}")
+        entry = get_manifest(args, hint_repo, args.revision, token, manifests)
+        if entry and hash_matches(entry[1]):
+            return hint_repo, "via gguf hint; 1 candidate tried", []
+
+    term_sets = derive_term_sets(f.name)
+    if hint_name and hint_name not in term_sets:
+        term_sets.insert(0, hint_name)  # e.g. gguf general.name
+    results = []
+    for query in term_sets[:MAX_SEARCHES]:
+        log(args, 2, f"# {f.name}: search {query!r}")
+        try:
+            results = search_models(args, query, token, searches)
+        except (urllib.error.URLError, TimeoutError) as e:
+            log(args, 0, f"warning: HF search failed "
+                         f"({getattr(e, 'reason', e)})")
+            return None, "HF search unavailable; pass --repo explicitly", []
+        if results:
+            break
+
+    downloads, candidates = {}, []
+    for r in results:
+        rid = valid_repo_id(r.get("id")) if isinstance(r, dict) else None
+        if rid and rid not in downloads:
+            downloads[rid] = r.get("downloads") or 0
+            candidates.append(rid)
+    log(args, 2, f"# {f.name}: candidates: "
+                 f"{', '.join(candidates) or '(none)'}")
+
+    tried = 0
+    matches = []
+    for repo in candidates:
+        entry = get_manifest(args, repo, args.revision, token, manifests)
+        if entry is None:
+            continue  # manifest fetch failed -> next candidate
+        tried += 1
+        if hash_matches(entry[1]):
+            matches.append(repo)
+    if not matches:
+        return None, (f"could not identify a HF repo containing this exact "
+                      f"content (tried {tried} repo(s)); pass --repo "
+                      f"explicitly or place it in /opt/models"), []
+    matches.sort(key=lambda r: -downloads[r])  # stable: keeps search order
+    return (matches[0], f"via search; {tried} candidate(s) tried",
+            matches[1:])
 
 
 # ---------------------------------------------------------------- placement
@@ -346,12 +613,16 @@ def build_parser():
         description="Adopt already-downloaded model files into the "
                     "HuggingFace hub cache -- no re-download. Only files "
                     "byte-identical to the repo's published content are "
-                    "adopted; everything else is refused. DRY-RUN by "
+                    "adopted; everything else is refused. Without --repo "
+                    "each file is first IDENTIFIED via the HF search API "
+                    "(still hash-proven, never name-guessed). DRY-RUN by "
                     "default: pass --apply to actually change the cache.",
         epilog=EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--repo", required=True, metavar="ORG/NAME",
-                   help="HF repo id the files claim to belong to")
+    p.add_argument("--repo", metavar="ORG/NAME",
+                   help="HF repo id the files claim to belong to "
+                        "(omit to identify the repo per file via HF "
+                        "search + hash proof)")
     p.add_argument("paths", nargs="+", metavar="PATH",
                    help="files to adopt, or a directory to scan")
     p.add_argument("--apply", action="store_true",
@@ -381,35 +652,21 @@ def build_parser():
     p.add_argument("-q", "--quiet", action="count", default=0,
                    help="only refusals, warnings and the summary")
     p.add_argument("-v", "--verbose", action="count", default=0,
-                   help="show hashes, API details, per-step decisions")
+                   help="show hashes, API/search details, per-step "
+                        "decisions")
     return p
 
 
-def main():
-    args = build_parser().parse_args()
-    if args.dry_run and args.apply:
-        die("--dry-run and --apply are mutually exclusive")
+def adopt_group(args, cache, repo, idx, files, hash_memo):
+    """Match/place/ref/GAP flow for one (repo, revision) group -- the
+    whole adoption pass that used to be main()'s body. Returns
+    (adopted, already, refused)."""
     apply_mode = args.apply
-
-    repo = args.repo.strip("/")
-    if repo.count("/") != 1 or not all(repo.split("/")):
-        die(f"--repo must look like org/name, got {args.repo!r}")
-
-    cache = resolve_cache(args.cache)
-    token = find_token(cache)
-    files = gather_files(args, args.paths)
-
-    info = fetch_repo_info(args, repo, args.revision, token)
     (commit, lfs_by_sha256, small_by_sha1, sizes, all_sizes_known,
-     skipped_unsafe) = index_siblings(args, info, repo)
-    if skipped_unsafe:
-        log(args, 0, f"warning: ignored {skipped_unsafe} unsafe path(s) "
-                     f"in the API manifest")
+     _skipped_unsafe) = idx
 
     repo_dir = cache / ("models--" + repo.replace("/", "--"))
     at = f"{repo}@{commit[:7]}"
-    log(args, 1, f"{'DRY RUN (pass --apply to make changes)' if not apply_mode else 'APPLY'}"
-                 f" | cache: {cache}")
     log(args, 1, f"repo {at} | {len(lfs_by_sha256)} LFS + "
                  f"{len(small_by_sha1)} small file(s) | mode: {args.mode}")
 
@@ -427,7 +684,7 @@ def main():
                          f"file in {at} (no size match)")
             refused += 1
             continue
-        sha256, git_sha1 = hash_file(f, size)
+        sha256, git_sha1 = memo_hash(f, size, hash_memo)
         log(args, 2, f"# {f.name}: sha256={sha256[:12]}.. "
                      f"gitsha1={git_sha1[:12]}.. size={size}")
         hit = lfs_by_sha256.get(sha256)
@@ -500,6 +757,68 @@ def main():
         if gaps_lfs:
             log(args, 1, f"GAP     {gaps_lfs} large (LFS) repo file(s) "
                          f"not in cache (that may be fine)")
+    return adopted, already, refused
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.dry_run and args.apply:
+        die("--dry-run and --apply are mutually exclusive")
+    apply_mode = args.apply
+
+    cache = resolve_cache(args.cache)
+    token = find_token(cache)
+    files = gather_files(args, args.paths)
+    hash_memo = {}  # each file is hashed once, across identify + adopt
+    header = (f"{'DRY RUN (pass --apply to make changes)' if not apply_mode else 'APPLY'}"
+              f" | cache: {cache}")
+
+    refused = 0
+    groups = []  # (repo, index_tuple, [files])
+    if args.repo:
+        repo = valid_repo_id(args.repo)
+        if repo is None:
+            die(f"--repo must look like org/name, got {args.repo!r}")
+        info = fetch_repo_info(args, repo, args.revision, token)
+        idx = index_siblings(args, info, repo)
+        if idx[5]:
+            log(args, 0, f"warning: ignored {idx[5]} unsafe path(s) "
+                         f"in the API manifest")
+        log(args, 1, header)
+        groups.append((repo, idx, files))
+    else:
+        # IDENTIFY phase: per file (one directory may hold files from
+        # several repos), then adopt per identified repo group.
+        log(args, 1, header)
+        manifests, searches = {}, {}  # per-run caches, never re-fetched
+        by_repo = {}
+        for f in files:
+            repo, note, alts = identify_file(args, f, f.stat().st_size,
+                                             token, manifests, searches,
+                                             hash_memo)
+            if repo is None:
+                log(args, 0, f"REFUSE  {f}: {note}")
+                refused += 1
+                continue
+            commit = manifests[repo][1][0]
+            log(args, 1, f"IDENTIFIED {f} -> {repo} @ {commit[:7]} ({note})")
+            if alts:
+                log(args, 1, f"        also matches: {', '.join(alts)} "
+                             f"(picked by downloads)")
+            by_repo.setdefault(repo, []).append(f)
+        for repo, group_files in by_repo.items():
+            idx = manifests[repo][1]
+            if idx[5]:
+                log(args, 0, f"warning: ignored {idx[5]} unsafe path(s) "
+                             f"in the API manifest for {repo}")
+            groups.append((repo, idx, group_files))
+
+    adopted = already = 0
+    for repo, idx, group_files in groups:
+        a, c, r = adopt_group(args, cache, repo, idx, group_files, hash_memo)
+        adopted += a
+        already += c
+        refused += r
 
     tag = " (dry-run; nothing was changed)" if not apply_mode else ""
     log(args, 0, f"summary: {adopted} adopted, {already} already cached, "
