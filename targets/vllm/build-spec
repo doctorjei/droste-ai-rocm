@@ -36,15 +36,16 @@ SURFACES=()
 # ── CACHES (optional) — <src>:<dest> ─────────────────────────────────────────
 # Persist the torch-stack compute/kernel caches with zero env vars ($HOME-relative so
 # both lanes resolve correctly). Triton default cache is ~/.triton/cache (01-rocm-env-
-# for-triton.sh sets no TRITON_CACHE_DIR, so the default holds). MIOpen writes a user
-# db under ~/.config/miopen in addition to the ~/.cache/miopen kernel cache.
-# vLLM's own ~/.cache/vllm is NOT bound here: VLLM_DISABLE_COMPILE_CACHE=1 suppresses the
-# torch.compile graph store. VERIFY-AT-TEST: if ~/.cache/vllm receives artifacts under our
-# flag set, add "/opt/data/cache/vllm:$HOME/.cache/vllm" here.
+# for-triton.sh sets no TRITON_CACHE_DIR, so the default holds). MIOpen's miopen-db
+# row is its machine-written tuning DB (~/.config/miopen is MIOpen's default userdb
+# path) in addition to the ~/.cache/miopen kernel cache. The vllm row is vLLM's own
+# compile/artifact cache (~/.cache/vllm) — it consciously joins the shared
+# /opt/caches store under the v0.2.0 cache policy (owner decision 2026-07-09).
 CACHES=(
     "/opt/data/cache/miopen:$HOME/.cache/miopen"
-    "/opt/data/cache/miopen-config:$HOME/.config/miopen"
+    "/opt/data/cache/miopen-db:$HOME/.config/miopen"
     "/opt/data/cache/triton:$HOME/.triton/cache"
+    "/opt/data/cache/vllm:$HOME/.cache/vllm"
 )
 
 # ── CRITICAL (optional) — <label>:<path> ─────────────────────────────────────

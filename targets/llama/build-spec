@@ -57,9 +57,10 @@ llama_pre_launch() {
         export "${v?}"
     done
 
-    # Pre-create the slot save dir (fixed default path; harmless if the user
+    # Pre-create the slot save dir (fixed default path — session STATE, kept out
+    # of the cache/ pathname and deliberately per-box; harmless if the user
     # re-points --slot-save-path via LLAMA_EXTRA_ARGS).
-    mkdir -p /opt/data/cache/slots
+    mkdir -p /opt/data/slots
 
     # Rebuild SERVICE now that LLAMA_EXTRA_ARGS is known. The pinned fork's
     # --slot-save-path carries no env annotation, so it rides the command line —
@@ -67,5 +68,5 @@ llama_pre_launch() {
     # (parsed later) wins. Deliberate word-split, unset-safe; quoting inside the
     # value is not honoured (documented in llama.env).
     # shellcheck disable=SC2206
-    SERVICE=( llama-server --slot-save-path /opt/data/cache/slots ${LLAMA_EXTRA_ARGS:-} )
+    SERVICE=( llama-server --slot-save-path /opt/data/slots ${LLAMA_EXTRA_ARGS:-} )
 }

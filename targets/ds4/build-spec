@@ -101,8 +101,9 @@ ds4_pre_launch() {
         export "${v?}"
     done
 
-    # Pre-create the KV disk cache dir (active default /opt/data/cache/kv-disk;
-    # follows the var if the user re-pointed or blanked it).
+    # Pre-create the KV disk dir (active default /opt/data/kv-disk — session
+    # STATE, kept out of the cache/ pathname and deliberately per-box; follows
+    # the var if the user re-pointed or blanked it).
     if [ -n "${DS4_DROSTE_KV_DISK_DIR:-}" ]; then
         mkdir -p "$DS4_DROSTE_KV_DISK_DIR"
     fi

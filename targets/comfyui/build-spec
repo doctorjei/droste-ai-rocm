@@ -40,10 +40,11 @@ SURFACES=(
 
 # ── CACHES — <src>:<dest> ────────────────────────────────────────────────────
 # Compute/kernel caches persisted on /opt/data with zero env vars. MIOpen uses
-# BOTH ~/.cache/miopen (binary caches) and ~/.config/miopen (user db/config).
+# BOTH ~/.cache/miopen (binary caches) and ~/.config/miopen (its machine-written
+# tuning DB — MIOpen's default userdb path, config-ish location notwithstanding).
 CACHES=(
     "/opt/data/cache/miopen:$HOME/.cache/miopen"
-    "/opt/data/cache/miopen-config:$HOME/.config/miopen"
+    "/opt/data/cache/miopen-db:$HOME/.config/miopen"
     "/opt/data/cache/triton:$HOME/.triton/cache"
     "/opt/data/cache/torch:$HOME/.cache/torch"
 )

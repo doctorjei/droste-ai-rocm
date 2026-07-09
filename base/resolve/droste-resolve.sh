@@ -6,13 +6,24 @@
 # this library IS the primitives. See build-spec.example for the contract.
 #
 # Two lanes (DROSTE_LANE):
-#   server    (default) — image ENTRYPOINT runs; overlays/surfaces/caches are mounted to
-#                         redirect app writes onto the /opt/data volume.
+#   server    (default) — image ENTRYPOINT runs as root; overlays/surfaces/caches are
+#                         mounted to redirect app writes onto the /opt/data volume.
 #   distrobox           — distrobox init_hooks source this lib, set DROSTE_LANE=distrobox,
-#                         and call the primitives; $HOME is the persistent home, so the
-#                         internal mounts (overlay/surface/cache) are NO-OPs — only the
-#                         non-mount steps (critical checks, optional marker, template
-#                         seeding, env source, pre-launch) run.
+#                         and call the SAME primitives. Since lane unification the mounts
+#                         run in-box too: container-lifecycle events must never destroy
+#                         user state (venv/custom-node installs land on /opt/data, not in
+#                         the container layer). Needs CAP_SYS_ADMIN in the box — ini:
+#                         additional_flags="--cap-add sys_admin --device /dev/fuse".
+#                         Deliberate lane DEVIATIONS, each commented at its site:
+#                           - /root/-prefixed SURFACE/CACHE dests remap to the box user's
+#                             home (_lane_dest — server runs as root, the box user doesn't);
+#                           - dirs the resolver creates are chowned to the box user
+#                             (_mkuserdir / copy-mode chown — the hook runs as root);
+#                           - every mount skips if its target is already a mountpoint
+#                             (_is_mountpoint — init_hooks re-run on every start);
+#                           - the HF cache is NEVER resolver-mounted in either lane (it is
+#                             a CRITICAL user bind; in-box the auto-bound real home
+#                             satisfies it natively).
 #
 # Sourced by a caller that has already set `set -euo pipefail`; kept in effect here so a
 # failing primitive aborts container startup loudly.
@@ -21,6 +32,7 @@ set -euo pipefail
 # ── Config (override via env before sourcing) ───────────────────────────────
 : "${DROSTE_LANE:=server}"
 : "${DROSTE_DATA_DIR:=/opt/data}"
+: "${DROSTE_CACHES_DIR:=/opt/caches}"   # optional SHARED compute-cache volume (see cache_bind)
 : "${RESOLVE_TEMPLATES_DIR:=/opt/resources/templates}"
 : "${RESOLVE_APPLY_TEMPLATES:=/opt/resources/resolve/apply_templates.py}"
 : "${DROSTE_OVERLAY_MODE:=auto}"   # auto (kernel→fuse→copy) | kernel | fuse | copy (non-auto = forced, no fallback)
@@ -81,8 +93,8 @@ resolve::_mount_err_is_feature() {
 # _err_need_cap — the CAP_SYS_ADMIN diagnostic shared by every mount path.
 resolve::_err_need_cap() {
     resolve::err "$1: mount failed with a permission error — the resolver needs CAP_SYS_ADMIN to mount inside the container."
-    resolve::err "  add '--cap-add sys_admin' to the run command. (Rootless podman: the capability is namespaced to the container's user namespace — it grants no host privilege.)"
-    resolve::err "  The distrobox lane is unaffected; it mounts nothing."
+    resolve::err "  server lane: add '--cap-add sys_admin' to the run command; distrobox lane: additional_flags=\"--cap-add sys_admin --device /dev/fuse\" in distrobox.ini."
+    resolve::err "  (Rootless podman: the capability is namespaced to the container's user namespace — it grants no host privilege.)"
 }
 
 # _bind — plain bind mount with the EPERM diagnostic (surfaces, caches, copy mode).
@@ -156,7 +168,66 @@ resolve::_anon_volume() {
     [[ $root =~ $re || $src =~ $re ]]
 }
 
-# ── Primitive: overlay (server lane only) ───────────────────────────────────
+# _is_mountpoint — is <target> ITSELF a mountpoint (exact mountinfo field-5 match)?
+# DISTINCT SEMANTICS from is_bound: is_bound's ancestor-walk answers "is this path
+# covered by any bind" (right for criticals — the whole distrobox $HOME bind counts);
+# here we answer "did something already mount exactly HERE", the re-entry guard for
+# init_hooks, which re-run on every container start within the same boot — mounting
+# again would stack a second layer over our own earlier mount.
+resolve::_is_mountpoint() {
+    local target=$1
+    [ "$target" != "/" ] && target=${target%/}
+    awk -v t="$target" '$5 == t { found = 1; exit } END { exit !found }' \
+        "$(resolve::_mountinfo)"
+}
+
+# _lane_dest — remap a spec dest for the current lane. WHY: build-spec dest paths are
+# written for the SERVER lane, which runs as root ($HOME=/root) — caches target
+# /root/.cache/*, ds4's surface targets /root/.ds4. In the distrobox lane the box user
+# is non-root and the app runs in THEIR home, so a literal /root/ prefix would park
+# state where the box user never looks. Remap the /root prefix to the box user's home
+# (DROSTE_USER_HOME, exported by droste-init-hook.sh; fall back to /root = unchanged).
+# NOTE: the hook also re-exports HOME before sourcing the spec, so $HOME-relative spec
+# paths normally arrive already user-homed — this catches literal /root strings and
+# the failed-user-derivation case.
+resolve::_lane_dest() {
+    local dest=$1
+    if [ "$DROSTE_LANE" = distrobox ]; then
+        case "$dest" in
+            /root/*) dest="${DROSTE_USER_HOME:-/root}${dest#/root}" ;;
+        esac
+    fi
+    printf '%s' "$dest"
+}
+
+# _mkuserdir — mkdir -p with the distrobox OWNERSHIP deviation. WHY: init_hooks run as
+# root but the box user is non-root; dirs the resolver creates (overlay upper/work,
+# surface/cache src, dests inside the auto-bound REAL home) must be writable by — and
+# on host-visible paths, owned by — the box user, or overlay copy-ups and cache writes
+# fail EACCES (and root-owned litter lands in the host home). Chowns the leaf plus any
+# path components created THIS run, NON-recursively: pre-existing content (root-baked
+# lowers, files a server-lane run left in an upper) is deliberately never touched —
+# reads work, and new writes land in user-owned dirs. Server lane: plain mkdir -p.
+resolve::_mkuserdir() {
+    local dir=$1
+    if [ "$DROSTE_LANE" != distrobox ] || [ -z "${DROSTE_USER:-}" ]; then
+        mkdir -p "$dir"
+        return 0
+    fi
+    local created=() d
+    d=$(dirname "$dir")
+    while [ ! -e "$d" ] && [ "$d" != / ]; do
+        created+=("$d")
+        d=$(dirname "$d")
+    done
+    mkdir -p "$dir"
+    local m
+    for m in "$dir" ${created[@]+"${created[@]}"}; do
+        resolve::_domount chown "$DROSTE_USER:" "$m"
+    done
+}
+
+# ── Primitive: overlay (BOTH lanes since lane unification) ──────────────────
 # entry form: <upper>:<lower>  (upper = /opt/data side, lower = baked app dir)
 # Mounts a writable layer OVER the baked lower. Strategy = DROSTE_OVERLAY_MODE:
 #   kernel — mount -t overlay: lowerdir=<lower>, upperdir=<upper>,
@@ -171,9 +242,17 @@ resolve::_anon_volume() {
 #            the run is broken regardless → fail fast with the cap diagnostic instead.
 resolve::overlay() {
     local upper=$1 lower=$2
-    [ "$DROSTE_LANE" = server ] || return 0
     if [ ! -d "$lower" ]; then
         resolve::warn "overlay lower '$lower' does not exist; skipping"
+        return 0
+    fi
+    # IDEMPOTENCY: init_hooks re-run on every container start (same boot); if the
+    # lower already IS a mountpoint (our earlier overlay/copy-bind, or a user's own
+    # bind over it), mounting again would stack a second layer. Exact-mountpoint
+    # check — NOT is_bound's ancestor-walk, which would false-positive on any
+    # ancestor bind (e.g. the whole distrobox $HOME).
+    if resolve::_is_mountpoint "$lower"; then
+        resolve::info "overlay $lower: already mounted — skipping (re-entrant init hook)"
         return 0
     fi
     local mode=$DROSTE_OVERLAY_MODE
@@ -184,7 +263,11 @@ resolve::overlay() {
     local name work
     name=$(basename "$upper")
     work="$(dirname "$upper")/.work/$name"
-    mkdir -p "$upper" "$work"
+    # OWNERSHIP wrinkle (distrobox): _mkuserdir chowns upper/work to the box user so
+    # copy-ups/writes performed as that user succeed. The root-baked LOWER stays
+    # root-owned on purpose — reads work, writes land in the user-owned upper.
+    resolve::_mkuserdir "$upper"
+    resolve::_mkuserdir "$work"
 
     if [ -n "${DROSTE_RESOLVE_DRYRUN:-}" ]; then
         local desc=$mode
@@ -260,6 +343,14 @@ resolve::_overlay_copy() {
         resolve::_domount mkdir -p "$tmpdir"
         resolve::_domount cp -a "$lower/." "$tmpdir/"
         resolve::_domount mv "$tmpdir" "$copydir"
+        # OWNERSHIP (distrobox): recursive chown is safe ONLY here — every file in a
+        # freshly-created copydir was cloned from the root-baked lower THIS run, and
+        # copy mode has no upper to absorb writes, so the box user needs write access
+        # throughout. Pre-existing copydirs are left untouched (may hold user content
+        # with deliberate ownership/modes).
+        if [ "$DROSTE_LANE" = distrobox ] && [ -n "${DROSTE_USER:-}" ]; then
+            resolve::_domount chown -R "$DROSTE_USER:" "$copydir"
+        fi
     fi
     resolve::warn "copy-mode engaged for $lower:"
     resolve::warn "  - baked image content is FROZEN at first-copy time — image updates will NOT appear here;"
@@ -271,25 +362,90 @@ resolve::_overlay_copy() {
     resolve::_bind "$copydir" "$lower"
 }
 
-# ── Primitive: surface (plain bind, server lane only) ───────────────────────
+# ── Primitive: surface (plain bind, BOTH lanes since lane unification) ──────
 # entry form: <src>:<dest>  (src = /opt/data side, dest = app-side path)
 # Binds a /opt/data subpath onto the path the tool expects; creates src if absent.
+# Distrobox deviations: /root/ dest remap (_lane_dest), box-user chown (_mkuserdir),
+# exact-mountpoint re-entry skip (_is_mountpoint) — rationale at each helper.
 resolve::surface() {
-    local src=$1 dest=$2
-    [ "$DROSTE_LANE" = server ] || return 0
-    mkdir -p "$src"
-    [ -d "$dest" ] || mkdir -p "$dest"
+    local src=$1 dest
+    dest=$(resolve::_lane_dest "$2")
+    # IDEMPOTENCY: init_hooks re-run per container start — skip if something (our
+    # earlier run, or a user bind) is already mounted exactly on the dest.
+    if resolve::_is_mountpoint "$dest"; then
+        resolve::info "surface $dest: already mounted — skipping (re-entrant init hook)"
+        return 0
+    fi
+    resolve::_mkuserdir "$src"
+    # dest may sit inside the auto-bound REAL home in the distrobox lane — create
+    # it via _mkuserdir so a dir we make there isn't left root-owned on the host.
+    [ -d "$dest" ] || resolve::_mkuserdir "$dest"
     resolve::_bind "$src" "$dest"
 }
 
-# ── Primitive: cache_bind (server lane only) ────────────────────────────────
-# Structurally identical to surface today; kept a SEPARATE primitive (per design) so
-# cache-specific behaviour can diverge later without touching surfaces.
+# ── Shared compute-cache volume ($DROSTE_CACHES_DIR, both lanes) ────────────
+# OPTIONAL cross-container cache store: bind ONE host dir (default host path
+# ~/droste/caches — a default only, any path works) onto /opt/caches and every
+# CACHES row whose src lives under $DROSTE_DATA_DIR/cache/ is rewritten to source
+# from the shared dir instead, so all droste boxes share one MIOpen/Triton/torch/vLLM
+# kernel-cache store. Unbound => graceful degrade to today's per-box
+# $DROSTE_DATA_DIR/cache/ sources, announced ONCE per start (below). Deliberately
+# NO `VOLUME /opt/caches` directive in any Containerfile: unbound must NOT spawn
+# an anonymous volume. Dests are never touched — only the src side moves.
+# Detection = is_bound on $DROSTE_CACHES_DIR ITSELF (a user bind exactly there, or
+# an ancestor bind covering it, both mean the dir persists — exact-mountpoint
+# semantics would wrongly reject the ancestor case).
+# MIOpen caveat (commented once, here): the miopen-db row carries MIOpen's
+# machine-written tuning DB, so sharing means one DB for all boxes — two boxes doing HEAVY
+# tuning concurrently will contend on its locks (POSIX locks work fine across
+# bind mounts; contention serializes tuning, it does not corrupt). Fine for the
+# normal one-box-hot-at-a-time pattern; remove the /opt/caches bind from a box's
+# ini/run flags to give it private caches again.
+RESOLVE_SHARED_CACHES=""   # memo: "" = unchecked, y = bound, n = unbound (info shown)
+resolve::_shared_caches() {
+    if [ -z "$RESOLVE_SHARED_CACHES" ]; then
+        if resolve::is_bound "$DROSTE_CACHES_DIR"; then
+            RESOLVE_SHARED_CACHES=y
+        else
+            RESOLVE_SHARED_CACHES=n
+            resolve::info "$DROSTE_CACHES_DIR is not bound — compute caches stay per-box under $DROSTE_DATA_DIR/cache/. Bind one shared host dir (e.g. server: -v ~/droste/caches:$DROSTE_CACHES_DIR; distrobox ini: volume=\"~/droste/caches:$DROSTE_CACHES_DIR\") to share kernel caches across all droste boxes."
+        fi
+    fi
+    [ "$RESOLVE_SHARED_CACHES" = y ]
+}
+
+# ── Primitive: cache_bind (BOTH lanes since lane unification) ───────────────
+# Structurally identical to surface plus the shared-cache src rewrite above; kept a
+# SEPARATE primitive (per design) so cache behaviour can diverge without touching
+# surfaces (it now does — surfaces are state and never rewrite to /opt/caches).
+# DELIBERATE DEVIATION (both lanes): the HF cache is NEVER a cache_bind — it is a
+# CRITICAL user bind (server: -v flag; distrobox: the auto-bound real home already
+# satisfies it), so the resolver mounts nothing for it in either lane.
 resolve::cache_bind() {
-    local src=$1 dest=$2
-    [ "$DROSTE_LANE" = server ] || return 0
-    mkdir -p "$src"
-    [ -d "$dest" ] || mkdir -p "$dest"
+    local src=$1 dest
+    dest=$(resolve::_lane_dest "$2")
+    # Shared-cache src rewrite (policy + MIOpen caveat: block above). Only srcs
+    # under $DROSTE_DATA_DIR/cache/ qualify — session state elsewhere on the data
+    # volume (llama slots, ds4 kv-disk) is not a CACHES row and never rewrites.
+    case "$src" in
+        "$DROSTE_DATA_DIR/cache/"*)
+            if resolve::_shared_caches; then
+                src="$DROSTE_CACHES_DIR/${src#"$DROSTE_DATA_DIR/cache/"}"
+            fi
+            ;;
+    esac
+    # IDEMPOTENCY: same re-entry guard as surface (init_hooks re-run per start).
+    if resolve::_is_mountpoint "$dest"; then
+        resolve::info "cache $dest: already mounted — skipping (re-entrant init hook)"
+        return 0
+    fi
+    # OWNERSHIP on the shared dir: _mkuserdir chowns only the per-cache leaf dirs
+    # it creates ($DROSTE_CACHES_DIR/<name>) — the shared root belongs to the
+    # user's bind and is never touched.
+    resolve::_mkuserdir "$src"
+    # dest may sit inside the auto-bound REAL home in the distrobox lane — create
+    # it via _mkuserdir so a dir we make there isn't left root-owned on the host.
+    [ -d "$dest" ] || resolve::_mkuserdir "$dest"
     resolve::_bind "$src" "$dest"
 }
 
@@ -406,7 +562,9 @@ resolve::apply_spec() {
     # 1) ensure /opt/data (auto-vol + warn)
     resolve::ensure_data "$DROSTE_DATA_DIR"
 
-    # 2) SURFACES + OVERLAYS + CACHES (server lane; no-op in distrobox)
+    # 2) SURFACES + OVERLAYS + CACHES (BOTH lanes since lane unification —
+    #    distrobox mounts in-box via init_hooks; lane deviations live in the
+    #    primitives themselves)
     for entry in ${SURFACES[@]+"${SURFACES[@]}"}; do
         resolve::surface "${entry%%:*}" "${entry#*:}"
     done

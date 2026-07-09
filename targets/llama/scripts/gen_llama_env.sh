@@ -33,7 +33,7 @@ ACTIVE_PORT=8080
 # annotation, so there is no LLAMA_ARG_SLOT_SAVE_PATH to set here — the flag is
 # added by the entrypoint's launch line instead (targets/llama/build-spec,
 # llama_pre_launch). This path only feeds the explanatory comment block below.
-SLOTS_DIR=/opt/data/cache/slots
+SLOTS_DIR=/opt/data/slots
 # Vars that MUST exist in the pinned llama-server's arg table (build fails if not).
 REQUIRED_VARS=(LLAMA_ARG_HOST LLAMA_ARG_PORT LLAMA_ARG_MODEL)
 # Vars excluded from the generic commented list (they get dedicated blocks above
