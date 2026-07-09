@@ -205,6 +205,64 @@ not baked. comfyui's `scripts/tests/` is repo-only (never COPY'd).
   REMOVED from `/usr/local/bin` — it downloaded via `--local-dir`, bypassing the
   cache on the project's biggest files (80–430 GB quants).
 
+### 2026-07-09 — first hardware validation of the contract (Raiju, gfx1151, rootless podman)
+
+The contract's mount mechanics had only been proven under `unshare -Urm` on
+bifrost before this. Running the real images under rootless podman on real
+hardware surfaced three findings and one decided design change.
+
+- **Finding 1 (capability): the server lane REQUIRES `--cap-add sys_admin`.**
+  Rootless podman strips `CAP_SYS_ADMIN` from the container's capability set,
+  so EVERY in-container mount the entrypoint performs — overlays AND plain
+  binds — fails with `mount: <path>: permission denied`. The bifrost proof
+  missed this because namespace root under `unshare -Urm` implicitly holds
+  SYS_ADMIN over its own mount namespace; podman deliberately strips it, so
+  parity requires granting it back. The nuance worth recording: under ROOTLESS
+  podman the grant is namespaced-only — container root maps to the invoking
+  user's uid, so the cap confers nothing the user couldn't already do via
+  `unshare -Urm`. Under ROOTFUL podman/docker it is real host SYS_ADMIN — a
+  bigger ask, though still confined by the container's private mount
+  namespace. The distrobox lane is unaffected (the init hook mounts nothing).
+  On EPERM the resolver fails FAST with a message naming `--cap-add
+  sys_admin` — deliberately no fallback, because without mount capability the
+  plain binds are just as broken as the overlays; there is nothing sane to
+  fall back to.
+- **Finding 2 (filesystem): overlay uppers constrain where `/opt/data` may
+  live.** Kernel overlayfs requires the UPPERDIR filesystem to support
+  O_TMPFILE + RENAME_WHITEOUT. Overlay uppers live inside `/opt/data`, so it
+  must sit on ext4/btrfs/xfs/tmpfs-class storage; on ecryptfs (encrypted
+  homes), NFS, or virtiofs the mount fails (`wrong fs type, bad option, bad
+  superblock`; dmesg: `overlayfs: upper fs missing required features`). Plain
+  binds (input/output, HF cache, workspace, `~/.ds4`) have NO filesystem
+  requirement and can live anywhere, including encrypted homes.
+- **Finding 3 (groups): rootless GPU access needs `--group-add keep-groups`.**
+  Without it the invoking user's render/video group membership does not reach
+  the container: `/dev/kfd` is present but inaccessible and torch dies with
+  `RuntimeError: No HIP GPUs are available` — AFTER a fully-successful
+  resolver/scanner startup, which makes it easy to misread as a ROCm problem.
+  It's a flag problem.
+- **Decided change (Jei, 2026-07-09): two-layer overlay fallback in the
+  resolver** — kernel overlay → fuse-overlayfs → copy-mode, env knob
+  `DROSTE_OVERLAY_MODE` = `auto|kernel|fuse|copy` (default `auto`).
+  - fuse-overlayfs is the PRECEDENTED remedy: podman itself auto-falls-back to
+    fuse-overlayfs for its own storage on exactly these filesystems — observed
+    live on the validating host's ecryptfs storage (graphStatus: `Backing
+    Filesystem: ecryptfs / Native Overlay Diff: false`). We mirror that: the
+    binary is now baked in the runtime base and used automatically when kernel
+    overlay rejects the upper fs; it needs `--device /dev/fuse` on the run.
+    Cost is userspace I/O — slower ONLY on the overlaid paths (venv,
+    custom_nodes); models and caches are plain binds, unaffected.
+  - copy-mode is the LAST resort when fuse is unavailable too: copy the baked
+    content to `/opt/data/copy/<name>` once and bind-mount it, with a LOUD
+    warning — baked content is frozen at first-copy and disk is duplicated;
+    deleting the copy dir forces a re-copy. That frozen-content tradeoff is
+    exactly why s20 REJECTED copy-up as the primary mechanism; accepting it
+    here is NOT a reversal — it sits behind two better options purely so a
+    hostile filesystem degrades service instead of blocking it.
+- **check-rocm.sh hardening:** the sweep now self-carries `--cap-add
+  sys_admin` and a tmpfs `/opt/data` for its probes (tmpfs is always a valid
+  overlay upper), so validation results are host-filesystem-agnostic.
+
 ---
 
 ## Base images

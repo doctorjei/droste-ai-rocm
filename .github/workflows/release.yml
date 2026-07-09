@@ -1,0 +1,111 @@
+name: Release — version-tag GHCR images
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+# Tag push: re-tag the already-built per-SHA images on GHCR with
+# semantic-version aliases. Assumes build-halo has already built and
+# pushed ghcr.io/<owner>/droste-<name>-halo:<sha> for the tagged commit
+# (a green build-halo run for that commit is a prerequisite — tag only
+# commits whose images exist). Uses `docker buildx imagetools create`,
+# which writes new manifest references without downloading or
+# re-uploading image layers. For tag v1.2.3, creates these additional
+# tags on all 12 images: 1.2.3, 1.2, 1.
+#
+# Pre-release tags (version string containing a '-', e.g. v0.2.0-rc1)
+# create ONLY the full :0.2.0-rc1 tag and leave the moving :X.Y / :X
+# aliases pointing at the last stable release.
+#
+# :latest is NOT touched here — build-halo owns :latest on every
+# main-branch build.
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag:
+    name: Re-tag 12 images for ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse semver from tag
+        id: v
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          full="${tag#v}"
+          [[ "$full" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::Malformed release tag: $full"; exit 1; }
+          major="${full%%.*}"
+          rest="${full#${major}.}"
+          minor="${rest%%.*}"
+          if [[ "${full}" == *-* ]]; then
+            prerelease="true"
+          else
+            prerelease="false"
+          fi
+          echo "full=${full}" >> "$GITHUB_OUTPUT"
+          echo "majorminor=${major}.${minor}" >> "$GITHUB_OUTPUT"
+          echo "major=${major}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+      - name: Re-tag all 12 droste-*-halo images
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          SHA="${{ github.sha }}"
+          # Everything build-halo.yml pushes: the 3 bases, comfyui, and the
+          # 4 ports' -build artifact carriers + runtimes.
+          IMAGES=(
+            runtime-base build-base torch-base
+            comfyui
+            ds4-build ds4
+            llama-build llama
+            vllm-build vllm
+            finetuning-build finetuning
+          )
+          # Pre-flight: verify every source :<sha> image exists BEFORE moving
+          # any alias, so a tag on a commit whose images were never built
+          # (matrix still running, skipped by the path filter, or failed)
+          # aborts the job instead of leaving a half-moved, inconsistent set.
+          for name in "${IMAGES[@]}"; do
+            src="ghcr.io/${OWNER}/droste-${name}-halo:${SHA}"
+            if ! docker buildx imagetools inspect "${src}" >/dev/null 2>&1; then
+              echo "::error::Source image missing: ${src} (droste-${name}-halo @ ${SHA}). No aliases moved."
+              exit 1
+            fi
+          done
+
+          if [[ "${{ steps.v.outputs.prerelease }}" == "true" ]]; then
+            VERSION_TAGS=(
+              "${{ steps.v.outputs.full }}"
+            )
+          else
+            VERSION_TAGS=(
+              "${{ steps.v.outputs.full }}"
+              "${{ steps.v.outputs.majorminor }}"
+              "${{ steps.v.outputs.major }}"
+            )
+          fi
+
+          for name in "${IMAGES[@]}"; do
+            src="ghcr.io/${OWNER}/droste-${name}-halo:${SHA}"
+            echo "=== droste-${name}-halo ==="
+            for v in "${VERSION_TAGS[@]}"; do
+              dst="ghcr.io/${OWNER}/droste-${name}-halo:${v}"
+              docker buildx imagetools create --tag "${dst}" "${src}"
+            done
+          done

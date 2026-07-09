@@ -102,7 +102,14 @@ Mount contract (all ports):
 
 - **`/opt/data`** — the one container-specific volume (venv overlay upper, compute
   caches, the seeded config file, comfyui's model tree). Unbound → anonymous
-  volume + a warning.
+  volume + a warning. Because overlay uppers live here, the backing filesystem
+  must be ext4/btrfs/xfs-class (tmpfs also works) — **not** ecryptfs (encrypted
+  homes), NFS, or virtiofs, which kernel overlayfs rejects as an upper. On such
+  hosts the resolver falls back to fuse-overlayfs automatically (add
+  `--device /dev/fuse` to the run to enable it), with a copy-mode last resort;
+  `DROSTE_OVERLAY_MODE=auto|kernel|fuse|copy` overrides (default `auto`).
+  Plain binds (HF cache, input/output, workspace) have no filesystem
+  requirement.
 - **Critical binds** — hard-error at start unless bound; `ALLOW_EPHEMERAL=1`
   downgrades that to a warning. Always the **HF cache** (`~/.cache/huggingface` —
   the SINGLE model store, shared across all five ports; bind the same host dir
@@ -114,12 +121,25 @@ Mount contract (all ports):
 
 ```bash
 podman run -d -p 8188:8188 --device /dev/kfd --device /dev/dri \
+  --cap-add sys_admin --group-add keep-groups \
   -v ~/droste/comfyui/data:/opt/data \
   -v ~/droste/comfyui/input:/opt/ComfyUI/input \
   -v ~/droste/comfyui/output:/opt/ComfyUI/output \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/doctorjei/droste-comfyui-halo:latest
 ```
+
+**Why `--cap-add sys_admin`:** the entrypoint performs its overlay/bind mounts
+*inside* the container, and rootless podman strips `CAP_SYS_ADMIN` — without it
+every mount fails with `permission denied`. Under **rootless** podman the grant
+is namespaced-only: container root maps to your own uid, so the cap allows
+nothing you couldn't already do with `unshare -Urm`. Under **rootful**
+podman/docker it is real host `SYS_ADMIN` — a bigger ask, though still confined
+to the container's private mount namespace. `--group-add keep-groups` carries
+the invoking user's supplementary groups (render/video) into the container for
+rootless GPU access — the invoking user must be in those host groups. The
+distrobox lane needs neither the cap nor the fs requirement above (its init
+hook mounts nothing in-container).
 
 comfyui additionally runs a pre-launch **model scanner**: it classifies everything
 in the HF cache (+ `/opt/models`) and maintains a ComfyUI-friendly symlink tree
@@ -130,7 +150,31 @@ pulls into the shared cache appear in ComfyUI's pickers automatically.
 toolboxes — `distrobox assemble create --file targets/<port>/distrobox.ini`. The
 ini declares the volume binds plus an init hook that runs the same resolver in
 distrobox mode (no internal mounts; the auto-bound host home persists the HF
-cache and dotfile state natively).
+cache and dotfile state natively). Because nothing is mounted in-container,
+this lane needs neither `--cap-add sys_admin` nor the `/opt/data` filesystem
+requirement.
+
+### Troubleshooting
+
+- **`mount: <path>: permission denied` at startup** → the container lacks
+  `CAP_SYS_ADMIN`, so the entrypoint cannot mount anything (overlays *or* plain
+  binds). Fix: add `--cap-add sys_admin` to the run (server lane only).
+- **`wrong fs type, bad option, bad superblock`** (dmesg: `overlayfs: upper fs
+  missing required features`) → `/opt/data` sits on an overlay-hostile
+  filesystem (ecryptfs/NFS/virtiofs) that kernel overlayfs cannot use as an
+  upper. Fix: move `/opt/data` to ext4/btrfs/xfs-class storage, or add
+  `--device /dev/fuse` and the resolver falls back to fuse-overlayfs
+  automatically (copy-mode is the last resort). Note: podman's *own* image
+  storage on such filesystems is a separate concern, solved by `storage.conf`
+  `mount_program = "/usr/bin/fuse-overlayfs"` (relevant for VMs with the
+  graphroot on virtiofs) — that config does not affect the entrypoint's mounts.
+- **`RuntimeError: No HIP GPUs are available`** (or `rocminfo` finds nothing)
+  despite `--device /dev/kfd --device /dev/dri` → the user's supplementary
+  groups were not carried into the container, so `/dev/kfd` is present but
+  inaccessible. Fix: add `--group-add keep-groups` and verify you are in the
+  host `render`/`video` groups (`groups`); if it still fails, try
+  `--security-opt seccomp=unconfined` (`check-rocm.sh`'s known-good flag set
+  carries both).
 
 ## Building
 
@@ -156,6 +200,10 @@ scaffolding/check-rocm.sh              # checks :latest via podman
 scaffolding/check-rocm.sh --tag <sha> --runtime docker --pull
 scaffolding/check-rocm.sh --help       # all options
 ```
+
+The sweep is host-filesystem-agnostic: it self-carries `--cap-add sys_admin` and a
+tmpfs `/opt/data` for its probes (tmpfs is always a valid overlay upper), plus
+`--group-add keep-groups` for rootless GPU access.
 
 It skips the `*-build` carriers (they are `FROM scratch` — nothing to run) and checks the
 runnable tiers in two tiers: **CORE** (deterministic — GPU enumerates as `gfx1151`; `torch.cuda`
