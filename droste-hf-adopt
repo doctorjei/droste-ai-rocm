@@ -57,6 +57,8 @@ API_BASE = "https://huggingface.co/api/models"
 FIXTURE_ENV = "DROSTE_ADOPT_API_FIXTURE"  # test hook; deliberately not in --help
 SEARCH_LIMIT = 20  # candidate repos returned per search query
 MAX_SEARCHES = 3  # search attempts per file before giving up (stay polite)
+HASH_PROGRESS_MIN = 256 << 20  # smaller files hash too fast to show progress
+HASH_PROGRESS_STEP = 128 << 20  # progress update cadence while hashing
 
 EXAMPLES = """\
 examples:
@@ -87,12 +89,39 @@ def log(args, level, msg):
     """level 0 = always, 1 = normal, 2 = verbose-only."""
     verbosity = 1 + args.verbose - args.quiet
     if level <= verbosity:
+        progress_clear()  # never print over a transient status line
         print(msg)
 
 
 def die(msg, code=2):
+    progress_clear()
     print(f"droste-hf-adopt: error: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+_progress = 0  # width of the transient stderr status line; 0 = none showing
+
+
+def progress(args, msg):
+    """Transient in-place status line (long hashes, API waits) -- shown
+    only on an interactive stderr and never under -q, so pipes, logs and
+    cron output are untouched. Overwritten via \\r; progress_clear()
+    wipes it before any real output can collide with it."""
+    global _progress
+    if args.quiet or not sys.stderr.isatty():
+        return
+    pad = max(_progress - len(msg), 0)
+    sys.stderr.write("\r" + msg + " " * pad)
+    sys.stderr.flush()
+    _progress = len(msg)
+
+
+def progress_clear():
+    global _progress
+    if _progress:
+        sys.stderr.write("\r" + " " * _progress + "\r")
+        sys.stderr.flush()
+        _progress = 0
 
 
 # ---------------------------------------------------------------- cache/auth
@@ -252,27 +281,40 @@ def index_siblings(args, info, repo):
 
 # ------------------------------------------------------------------ hashing
 
-def hash_file(path, size):
+def hash_file(path, size, args=None):
     """One streamed pass computing BOTH digests we may need:
     content sha256 (matches lfs.oid) and git blob sha1
-    ('blob <size>\\0' + content, matches blobId)."""
+    ('blob <size>\\0' + content, matches blobId). With args, large files
+    show a transient progress line while hashing (interactive only)."""
     h256 = hashlib.sha256()
     h1 = hashlib.sha1()
     h1.update(b"blob %d\x00" % size)
+    show = args is not None and size >= HASH_PROGRESS_MIN
+    done = next_tick = 0
     with open(path, "rb") as f:
         while chunk := f.read(CHUNK):
             h256.update(chunk)
             h1.update(chunk)
+            if show:
+                done += len(chunk)
+                if done >= next_tick or done == size:
+                    gib = 1 << 30
+                    progress(args, f"  hashing {Path(path).name}: "
+                                   f"{done * 100 // size}% "
+                                   f"({done / gib:.1f}/{size / gib:.1f} GiB)")
+                    next_tick = done + HASH_PROGRESS_STEP
+    if show:
+        progress_clear()
     return h256.hexdigest(), h1.hexdigest()
 
 
-def memo_hash(path, size, memo):
+def memo_hash(path, size, memo, args=None):
     """hash_file, cached per run: the identify phase may consult many
     candidate repos and adoption runs after it -- each file is hashed
     exactly ONCE."""
     key = str(path)
     if key not in memo:
-        memo[key] = hash_file(path, size)
+        memo[key] = hash_file(path, size, args)
     return memo[key]
 
 
@@ -445,7 +487,7 @@ def identify_file(args, f, size, token, manifests, searches, hash_memo):
         if all_known and size not in sizes:
             return False  # cheap pre-filter: no sibling can match
         # sizes incomplete -> fall through to the (memoized) hash compare
-        sha256, git_sha1 = memo_hash(f, size, hash_memo)
+        sha256, git_sha1 = memo_hash(f, size, hash_memo, args)
         return sha256 in lfs_by_sha256 or git_sha1 in small_by_sha1
 
     # GGUF provenance hint: an embedded source repo, once hash-proven,
@@ -454,6 +496,7 @@ def identify_file(args, f, size, token, manifests, searches, hash_memo):
     hint_repo, hint_name = gguf_repo_hint(f)
     if hint_repo:
         log(args, 2, f"# {f.name}: gguf hint -> {hint_repo}")
+        progress(args, f"  checking {hint_repo}...")
         entry = get_manifest(args, hint_repo, args.revision, token, manifests)
         if entry and hash_matches(entry[1]):
             return hint_repo, "via gguf hint; 1 candidate tried", []
@@ -464,6 +507,7 @@ def identify_file(args, f, size, token, manifests, searches, hash_memo):
     results = []
     for query in term_sets[:MAX_SEARCHES]:
         log(args, 2, f"# {f.name}: search {query!r}")
+        progress(args, f'  identifying {f.name}: searching "{query}"...')
         try:
             results = search_models(args, query, token, searches)
         except (urllib.error.URLError, TimeoutError) as e:
@@ -485,12 +529,14 @@ def identify_file(args, f, size, token, manifests, searches, hash_memo):
     tried = 0
     matches = []
     for repo in candidates:
+        progress(args, f"  checking {repo}...")
         entry = get_manifest(args, repo, args.revision, token, manifests)
         if entry is None:
             continue  # manifest fetch failed -> next candidate
         tried += 1
         if hash_matches(entry[1]):
             matches.append(repo)
+    progress_clear()
     if not matches:
         return None, (f"could not identify a HF repo containing this exact "
                       f"content (tried {tried} repo(s)); pass --repo "
@@ -684,7 +730,7 @@ def adopt_group(args, cache, repo, idx, files, hash_memo):
                          f"file in {at} (no size match)")
             refused += 1
             continue
-        sha256, git_sha1 = memo_hash(f, size, hash_memo)
+        sha256, git_sha1 = memo_hash(f, size, hash_memo, args)
         log(args, 2, f"# {f.name}: sha256={sha256[:12]}.. "
                      f"gitsha1={git_sha1[:12]}.. size={size}")
         hit = lfs_by_sha256.get(sha256)
@@ -779,7 +825,9 @@ def main(argv=None):
         repo = valid_repo_id(args.repo)
         if repo is None:
             die(f"--repo must look like org/name, got {args.repo!r}")
+        progress(args, f"  fetching manifest {repo}...")
         info = fetch_repo_info(args, repo, args.revision, token)
+        progress_clear()
         idx = index_siblings(args, info, repo)
         if idx[5]:
             log(args, 0, f"warning: ignored {idx[5]} unsafe path(s) "

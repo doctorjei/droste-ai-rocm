@@ -360,6 +360,54 @@ class AdoptTest(unittest.TestCase):
         self.assertIn("-> a/one @", out)
         self.assertEqual(h.call_count, 1)
 
+    # ----------------------------------------------------- progress (TTY only)
+    def test_progress_tty_quiet_and_hashing(self):
+        import types
+
+        class FakeTTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        args = types.SimpleNamespace(quiet=0, verbose=0)
+        # non-TTY stderr: progress is a strict no-op
+        plain = io.StringIO()
+        with contextlib.redirect_stderr(plain):
+            mod.progress(args, "  checking org/repo...")
+            mod.progress_clear()
+        self.assertEqual(plain.getvalue(), "")
+        # -q suppresses progress even on a TTY
+        tty = FakeTTY()
+        with contextlib.redirect_stderr(tty):
+            mod.progress(types.SimpleNamespace(quiet=1, verbose=0), "  x")
+            mod.progress_clear()
+        self.assertEqual(tty.getvalue(), "")
+        # TTY: \r-updated in place, then wiped clean
+        tty = FakeTTY()
+        with contextlib.redirect_stderr(tty):
+            mod.progress(args, "  checking org/longer-name...")
+            mod.progress(args, "  checking org/x...")  # shorter: padded over
+            mod.progress_clear()
+        raw = tty.getvalue()
+        self.assertIn("\r  checking org/longer-name...", raw)
+        self.assertIn("\r  checking org/x...", raw)
+        self.assertTrue(raw.endswith("\r"))  # cleared: cursor back at col 0
+        # hashing progress: thresholds patched small so a tiny file shows it
+        f = self.fx.add_download("big.bin", b"z" * 4096)
+        tty = FakeTTY()
+        with mock.patch.object(mod, "HASH_PROGRESS_MIN", 1024), \
+                mock.patch.object(mod, "HASH_PROGRESS_STEP", 1024), \
+                contextlib.redirect_stderr(tty):
+            mod.hash_file(f, 4096, args)
+        raw = tty.getvalue()
+        self.assertIn("hashing big.bin: ", raw)
+        self.assertIn("100%", raw)
+        self.assertTrue(raw.endswith("\r"))  # cleared before returning
+        # without args (backward-compatible signature): silent even on a TTY
+        tty = FakeTTY()
+        with contextlib.redirect_stderr(tty):
+            mod.hash_file(f, 4096)
+        self.assertEqual(tty.getvalue(), "")
+
     # ------------------------------------------------------------------- misc
     def test_help_exits_zero(self):
         with self.assertRaises(SystemExit) as cm:
