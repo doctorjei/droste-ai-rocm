@@ -23,6 +23,7 @@ set -euo pipefail
 : "${DROSTE_DATA_DIR:=/opt/data}"
 : "${RESOLVE_TEMPLATES_DIR:=/opt/resources/templates}"
 : "${RESOLVE_APPLY_TEMPLATES:=/opt/resources/resolve/apply_templates.py}"
+: "${DROSTE_OVERLAY_MODE:=auto}"   # auto (kernel→fuse→copy) | kernel | fuse | copy (non-auto = forced, no fallback)
 # DROSTE_RESOLVE_DRYRUN (bare name) — echo mount commands instead of running them.
 # ALLOW_EPHEMERAL     (bare name) — downgrade a CRITICAL unbound hard-error to a warning.
 
@@ -40,6 +41,62 @@ resolve::_domount() {
         return 0
     fi
     "$@"
+}
+
+# _try_mount — run a mount-ish command, capturing its stderr into RESOLVE_MOUNT_ERR for
+# diagnostics; returns the command's status. Dryrun echoes (like _domount) and succeeds.
+RESOLVE_MOUNT_ERR=""
+resolve::_try_mount() {
+    RESOLVE_MOUNT_ERR=""
+    if [ -n "${DROSTE_RESOLVE_DRYRUN:-}" ]; then
+        printf 'droste-resolve: [dryrun] %s\n' "$*" >&2
+        return 0
+    fi
+    local rc=0
+    RESOLVE_MOUNT_ERR=$("$@" 2>&1) || rc=$?
+    return $rc
+}
+
+# Classify a failed mount's stderr (RESOLVE_MOUNT_ERR).
+# EPERM shape: rootless podman strips CAP_SYS_ADMIN, so EVERY in-container mount
+# (overlay AND plain bind) fails "permission denied" without --cap-add sys_admin.
+resolve::_mount_err_is_eperm() {
+    local e=${RESOLVE_MOUNT_ERR,,}
+    case "$e" in
+        *"permission denied"*|*"operation not permitted"*) return 0 ;;
+    esac
+    return 1
+}
+# FEATURE shape: kernel overlayfs requires the upperdir fs to support O_TMPFILE +
+# RENAME_WHITEOUT; ecryptfs/NFS/virtiofs-class filesystems under /opt/data don't,
+# and mount reports the generic "wrong fs type, bad option, bad superblock" line.
+resolve::_mount_err_is_feature() {
+    local e=${RESOLVE_MOUNT_ERR,,}
+    case "$e" in
+        *"wrong fs type"*|*"bad option"*|*"bad superblock"*) return 0 ;;
+    esac
+    return 1
+}
+
+# _err_need_cap — the CAP_SYS_ADMIN diagnostic shared by every mount path.
+resolve::_err_need_cap() {
+    resolve::err "$1: mount failed with a permission error — the resolver needs CAP_SYS_ADMIN to mount inside the container."
+    resolve::err "  add '--cap-add sys_admin' to the run command. (Rootless podman: the capability is namespaced to the container's user namespace — it grants no host privilege.)"
+    resolve::err "  The distrobox lane is unaffected; it mounts nothing."
+}
+
+# _bind — plain bind mount with the EPERM diagnostic (surfaces, caches, copy mode).
+resolve::_bind() {
+    local src=$1 dest=$2
+    if resolve::_try_mount mount --bind "$src" "$dest"; then
+        return 0
+    fi
+    if resolve::_mount_err_is_eperm; then
+        resolve::_err_need_cap "bind $src -> $dest"
+        return 1
+    fi
+    resolve::err "bind mount $src -> $dest failed: ${RESOLVE_MOUNT_ERR:-unknown error}"
+    return 1
 }
 
 # _mountinfo — the mountinfo source. DROSTE_RESOLVE_MOUNTINFO overrides it (tests point
@@ -101,8 +158,17 @@ resolve::_anon_volume() {
 
 # ── Primitive: overlay (server lane only) ───────────────────────────────────
 # entry form: <upper>:<lower>  (upper = /opt/data side, lower = baked app dir)
-# Mounts kernel overlayfs OVER the baked lower: lowerdir=<lower>, upperdir=<upper>,
-# workdir=<dirname upper>/.work/<basename upper> (sibling of upper, same FS, empty).
+# Mounts a writable layer OVER the baked lower. Strategy = DROSTE_OVERLAY_MODE:
+#   kernel — mount -t overlay: lowerdir=<lower>, upperdir=<upper>,
+#            workdir=<dirname upper>/.work/<basename upper> (sibling of upper, same FS).
+#   fuse   — fuse-overlayfs, same dirs. Works without overlay-upper fs features AND
+#            without CAP_SYS_ADMIN (FUSE mounts are userns-permitted); slower I/O.
+#   copy   — LAST RESORT: cp -a the baked lower to $DROSTE_DATA_DIR/copy/<name> once,
+#            then bind that copy over the lower. Content frozen at first-copy time.
+#   auto   — kernel → fuse → copy, falling back on FEATURE failures only. EPERM
+#            ("permission denied") means the container lacks CAP_SYS_ADMIN — fuse would
+#            still mount, but the plain binds (surfaces/caches) need the cap anyway, so
+#            the run is broken regardless → fail fast with the cap diagnostic instead.
 resolve::overlay() {
     local upper=$1 lower=$2
     [ "$DROSTE_LANE" = server ] || return 0
@@ -110,11 +176,99 @@ resolve::overlay() {
         resolve::warn "overlay lower '$lower' does not exist; skipping"
         return 0
     fi
-    local work
-    work="$(dirname "$upper")/.work/$(basename "$upper")"
+    local mode=$DROSTE_OVERLAY_MODE
+    case "$mode" in
+        auto|kernel|fuse|copy) ;;
+        *) resolve::err "unknown DROSTE_OVERLAY_MODE '$mode' (want auto|kernel|fuse|copy)"; return 1 ;;
+    esac
+    local name work
+    name=$(basename "$upper")
+    work="$(dirname "$upper")/.work/$name"
     mkdir -p "$upper" "$work"
-    resolve::_domount mount -t overlay overlay \
-        -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$lower"
+
+    if [ -n "${DROSTE_RESOLVE_DRYRUN:-}" ]; then
+        local desc=$mode
+        [ "$mode" = auto ] && desc='auto(kernel→fuse→copy)'
+        resolve::info "[dryrun] overlay $lower: mode=$desc"
+    fi
+
+    # KERNEL attempt (auto's first choice; forced by mode=kernel).
+    if [ "$mode" = auto ] || [ "$mode" = kernel ]; then
+        if resolve::_try_mount mount -t overlay overlay \
+               -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$lower"; then
+            return 0
+        fi
+        if resolve::_mount_err_is_eperm; then
+            resolve::_err_need_cap "overlay $lower"
+            return 1
+        fi
+        if [ "$mode" = kernel ]; then
+            resolve::err "kernel overlay for $lower failed (DROSTE_OVERLAY_MODE=kernel, no fallback): ${RESOLVE_MOUNT_ERR:-unknown error}"
+            return 1
+        fi
+        if resolve::_mount_err_is_feature; then
+            resolve::warn "kernel overlay for $lower rejected: the $DROSTE_DATA_DIR filesystem lacks the overlay-upper features O_TMPFILE/RENAME_WHITEOUT (common on ecryptfs, NFS, virtiofs) — trying fuse-overlayfs."
+        else
+            resolve::warn "kernel overlay for $lower failed (${RESOLVE_MOUNT_ERR:-unknown error}) — trying fuse-overlayfs."
+        fi
+    fi
+
+    # FUSE attempt (auto's second choice; forced by mode=fuse). Dryrun skips the
+    # environment probe so the forced mode still reports coherently on any host.
+    if [ "$mode" = auto ] || [ "$mode" = fuse ]; then
+        local fuse_ok=""
+        if command -v fuse-overlayfs >/dev/null 2>&1 && [ -e /dev/fuse ]; then
+            fuse_ok=1
+        fi
+        [ -n "${DROSTE_RESOLVE_DRYRUN:-}" ] && fuse_ok=1
+        if [ -n "$fuse_ok" ]; then
+            if resolve::_try_mount fuse-overlayfs \
+                   -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$lower"; then
+                resolve::warn "using fuse-overlayfs for $lower (userspace overlay; slower I/O; kernel overlay unavailable on this $DROSTE_DATA_DIR filesystem)."
+                return 0
+            fi
+            if [ "$mode" = fuse ]; then
+                resolve::err "fuse-overlayfs for $lower failed (DROSTE_OVERLAY_MODE=fuse, no fallback): ${RESOLVE_MOUNT_ERR:-unknown error}"
+                return 1
+            fi
+            resolve::warn "fuse-overlayfs for $lower failed (${RESOLVE_MOUNT_ERR:-unknown error}) — falling back to copy mode."
+        else
+            if [ "$mode" = fuse ]; then
+                resolve::err "DROSTE_OVERLAY_MODE=fuse but fuse-overlayfs or /dev/fuse is unavailable in this container."
+                return 1
+            fi
+            resolve::warn "fuse-overlayfs unavailable (binary or /dev/fuse missing) — falling back to copy mode for $lower."
+        fi
+    fi
+
+    # COPY (auto's last resort; forced by mode=copy).
+    resolve::_overlay_copy "$name" "$lower" "$upper"
+}
+
+# _overlay_copy — overlay substitute of last resort: materialize a one-time writable
+# copy of the baked lower under $DROSTE_DATA_DIR/copy/<name>, bind it over the lower.
+# The copy is made only when the dir is ABSENT — deleting it forces a fresh copy.
+# ATOMIC: staged into a "$copydir.tmp" sibling and mv'd into place last, so an
+# interrupted cp leaves only a .tmp dir (removed and redone on the next run) and
+# an existing $copydir is always a reliable COMPLETED-copy marker.
+resolve::_overlay_copy() {
+    local name=$1 lower=$2 upper=$3
+    local copydir="$DROSTE_DATA_DIR/copy/$name" tmpdir
+    tmpdir="$copydir.tmp"
+    if [ ! -d "$copydir" ]; then
+        resolve::_domount rm -rf "$tmpdir"
+        resolve::_domount mkdir -p "$tmpdir"
+        resolve::_domount cp -a "$lower/." "$tmpdir/"
+        resolve::_domount mv "$tmpdir" "$copydir"
+    fi
+    resolve::warn "copy-mode engaged for $lower:"
+    resolve::warn "  - baked image content is FROZEN at first-copy time — image updates will NOT appear here;"
+    resolve::warn "  - disk cost is duplicated under $copydir;"
+    resolve::warn "  - delete $copydir to force a fresh copy from the current image."
+    if [ -d "$upper" ] && [ -n "$(ls -A "$upper" 2>/dev/null)" ]; then
+        resolve::warn "  - overlay upper $upper is non-empty — deltas from previous overlay-mode runs are NOT visible in copy mode."
+    fi
+    resolve::_bind "$copydir" "$lower"
 }
 
 # ── Primitive: surface (plain bind, server lane only) ───────────────────────
@@ -125,7 +279,7 @@ resolve::surface() {
     [ "$DROSTE_LANE" = server ] || return 0
     mkdir -p "$src"
     [ -d "$dest" ] || mkdir -p "$dest"
-    resolve::_domount mount --bind "$src" "$dest"
+    resolve::_bind "$src" "$dest"
 }
 
 # ── Primitive: cache_bind (server lane only) ────────────────────────────────
@@ -136,7 +290,7 @@ resolve::cache_bind() {
     [ "$DROSTE_LANE" = server ] || return 0
     mkdir -p "$src"
     [ -d "$dest" ] || mkdir -p "$dest"
-    resolve::_domount mount --bind "$src" "$dest"
+    resolve::_bind "$src" "$dest"
 }
 
 # ── Primitive: critical (both lanes) ────────────────────────────────────────

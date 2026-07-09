@@ -29,10 +29,11 @@ ARG GFX_TARGET=gfx1151
 ARG ROCM_INDEX_URL=https://rocm.nightlies.amd.com/v2/${GFX_TARGET}/
 ARG ROCM_SDK_LIBRARIES_VERSION=7.13.0a20260501
 
-# Re-add exactly what canopy purges, plus the venv toolchain.
+# Re-add exactly what canopy purges, plus the venv toolchain and the resolver's
+# userspace-overlay fallback (fuse-overlayfs).
 RUN apt-get -qq update \
     && apt-get -qq install -y --no-install-recommends \
-       sudo procps libnss-myhostname radeontop \
+       sudo procps libnss-myhostname radeontop fuse-overlayfs \
        python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
