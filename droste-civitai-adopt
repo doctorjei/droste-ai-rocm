@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+"""droste-civitai-adopt: adopt already-downloaded CivitAI model files into
+a shared CivitAI cache directory.
+
+WHY: droste boxes share model directories laid out the way AUTOMATIC1111-
+style webuis expect them (models/Stable-diffusion, models/Lora, ...,
+embeddings/). Checkpoints, LoRAs, VAEs and embeddings that arrived some
+other way -- browser download, rsync from another machine -- sit outside
+that tree with arbitrary names and no metadata. This tool moves such files
+INTO the cache, but only when they are PROVABLY CivitAI content: the
+file's sha256 must be found by the CivitAI API and appear among the
+matched model version's published file hashes. Everything else is refused
+with a reason. Sibling to droste-hf-adopt, same invariant: adopt only on
+hash proof, never on name similarity.
+
+HOW: every candidate file is hashed once (streamed sha256) and looked up
+with the batch by-hash API (one round-trip for a whole directory). A hit
+names the model version, the canonical filename and the file type, which
+map onto the A1111 layout:
+
+    <cache>/models/<TypeDir>/<canonical-name>       (Checkpoint, LoRA, ...)
+    <cache>/embeddings/<canonical-name>             (TextualInversion)
+    ... plus <canonical-stem>.civitai.info          metadata sidecar
+    ... plus <canonical-stem>.preview.<ext>         carried from the source
+
+Files the API does not know by hash fall back to metadata sidecars next
+to the SOURCE file (.civitai.info / .cm-info.json / .metadata.json /
+.json): a model-version id found there is fetched and accepted ONLY if
+our sha256 appears in that version's file list. --version-id N is the
+manual escape hatch with the same sha256-must-appear gate.
+
+CAVEAT: CivitAI never hashed some very old uploads; those 404 by hash
+even though they are genuine. The sidecar fallback and --version-id
+cover them. The sidecar we write is the raw model-version API response
+(Civitai Helper convention) plus our own data under extensions.droste.
+
+Placements are staged as .tmp-* and renamed into place, so there is never
+partial state; existing files are never overwritten (identical content
+counts as already cached, different content is refused); source files are
+never deleted except under --move, and only after successful placement.
+
+DEFAULT IS DRY-RUN: nothing is touched until you pass --apply.
+"""
+
+import argparse
+import errno
+import hashlib
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CHUNK = 1 << 20  # 1 MiB read chunks for streamed hashing
+API_BASE = "https://civitai.com/api/v1"
+FIXTURE_ENV = "DROSTE_CIVITAI_API_FIXTURE"  # test hook; not in --help
+BATCH_LIMIT = 100  # by-hash POST accepts at most 100 hashes per call
+HASH_PROGRESS_MIN = 256 << 20  # smaller files hash too fast to show progress
+HASH_PROGRESS_STEP = 128 << 20  # progress update cadence while hashing
+
+# model.type -> directory under the cache root (A1111 webui convention).
+# Types not listed here (Poses, Wildcards, Workflows, Other, ...) have no
+# canonical home and are refused rather than guessed at.
+TYPE_DIRS = {
+    "checkpoint": "models/Stable-diffusion",
+    "lora": "models/Lora",
+    "locon": "models/Lora",
+    "dora": "models/Lora",
+    "textualinversion": "embeddings",  # root level, not under models/
+    "hypernetwork": "models/hypernetworks",
+    "vae": "models/VAE",
+    "controlnet": "models/ControlNet",
+    "upscaler": "models/ESRGAN",
+    "motionmodule": "models/animatediff",
+}
+
+# metadata sidecars we mine for a model-version id (fallback), and the
+# preview images we carry along with a placed file
+SIDECAR_SUFFIXES = (".civitai.info", ".cm-info.json", ".metadata.json",
+                    ".json")
+PREVIEW_SUFFIXES = (".preview.png", ".preview.jpg", ".preview.jpeg",
+                    ".png", ".jpg", ".jpeg")
+
+EXAMPLES = """\
+examples:
+  # Adopt a checkpoint you fetched with a browser (dry-run first):
+  droste-civitai-adopt ~/Downloads/juggernautXL_v9.safetensors
+  droste-civitai-adopt --apply ~/Downloads/juggernautXL_v9.safetensors
+
+  # A whole downloads dir: one batch API call identifies everything,
+  # files may belong to different models/versions:
+  droste-civitai-adopt --apply --move ~/Downloads/loras/
+
+  # Rescue an old file CivitAI never hashed (404 by hash), when you know
+  # its model version id -- adoption still requires the version to list
+  # our exact sha256:
+  droste-civitai-adopt --apply --version-id 128713 ~/old/dreamshaper.ckpt
+
+Only files whose sha256 the CivitAI API can prove are adopted; everything
+else is refused with a reason. Very old uploads were never hashed by
+CivitAI and 404 by hash even though genuine -- the metadata-sidecar
+fallback and --version-id cover those.
+"""
+
+
+def log(args, level, msg):
+    """level 0 = always, 1 = normal, 2 = verbose-only."""
+    verbosity = 1 + args.verbose - args.quiet
+    if level <= verbosity:
+        progress_clear()  # never print over a transient status line
+        print(msg)
+
+
+def die(msg, code=2):
+    progress_clear()
+    print(f"droste-civitai-adopt: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+_progress = 0  # width of the transient stderr status line; 0 = none showing
+
+
+def progress(args, msg):
+    """Transient in-place status line (long hashes, API waits) -- shown
+    only on an interactive stderr and never under -q, so pipes, logs and
+    cron output are untouched. Overwritten via \\r; progress_clear()
+    wipes it before any real output can collide with it."""
+    global _progress
+    if args.quiet or not sys.stderr.isatty():
+        return
+    pad = max(_progress - len(msg), 0)
+    sys.stderr.write("\r" + msg + " " * pad)
+    sys.stderr.flush()
+    _progress = len(msg)
+
+
+def progress_clear():
+    global _progress
+    if _progress:
+        sys.stderr.write("\r" + " " * _progress + "\r")
+        sys.stderr.flush()
+        _progress = 0
+
+
+# ---------------------------------------------------------------- cache/auth
+
+def resolve_cache(override):
+    """Cache resolution: flag > DROSTE_CIVITAI_CACHE > ~/.cache/civitai."""
+    if override:
+        return Path(override).expanduser()
+    if os.environ.get("DROSTE_CIVITAI_CACHE"):
+        return Path(os.environ["DROSTE_CIVITAI_CACHE"]).expanduser()
+    return Path.home() / ".cache" / "civitai"
+
+
+def find_token():
+    """CIVITAI_API_TOKEN env var; metadata endpoints are public, so this
+    is optional (it only helps with rate limits / restricted models)."""
+    return os.environ.get("CIVITAI_API_TOKEN", "").strip() or None
+
+
+# -------------------------------------------------------------- CivitAI API
+
+def api_request(args, url, token, payload=None):
+    """GET (or, with payload, POST-json) a CivitAI API url and parse the
+    JSON response. Raises HTTPError/URLError/TimeoutError; callers decide
+    fatality."""
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=body, headers={
+        "User-Agent": "droste-civitai-adopt/0.1",
+        **({"Content-Type": "application/json"} if body else {}),
+        **({"Authorization": f"Bearer {token}"} if token else {}),
+    })
+    log(args, 2, f"# {'POST' if body else 'GET'} {url} "
+                 f"(auth: {'token' if token else 'anonymous'})")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read())
+
+
+def batch_lookup(args, shas, token):
+    """Identify hashes via POST /model-versions/by-hash (<=100 per call);
+    if that form errors, fall back to one GET .../by-hash/<sha> each
+    (404 = unknown hash, simply absent from the result). Returns a list
+    of model-version objects. Raises URLError/TimeoutError on network
+    trouble -- the caller refuses the affected files, never crashes.
+
+    Fixture (DROSTE_CIVITAI_API_FIXTURE=<dir>): reads <dir>/by-hash.json
+    -- either {sha256: version-object, ...} or a plain list of version
+    objects (filtered to the requested hashes); {"error": msg} simulates
+    a network failure.
+    """
+    fixture_dir = os.environ.get(FIXTURE_ENV)
+    if fixture_dir:
+        path = Path(fixture_dir) / "by-hash.json"
+        log(args, 2, f"# fixture mode: reading {path} for "
+                     f"{len(shas)} hash(es)")
+        try:
+            data = json.loads(path.read_text())
+        except OSError as e:
+            die(f"fixture read failed: {e}")
+        if isinstance(data, dict):
+            if "error" in data:
+                raise urllib.error.URLError(data["error"])
+            data = [v for k, v in data.items() if k.lower() in shas]
+        wanted = set(shas)
+        return [v for v in data if isinstance(v, dict)
+                and wanted & set(hash_entries(v))]
+
+    versions = []
+    for i in range(0, len(shas), BATCH_LIMIT):
+        chunk = shas[i:i + BATCH_LIMIT]
+        progress(args, f"  looking up {len(chunk)} hash(es) on CivitAI...")
+        try:
+            data = api_request(args, f"{API_BASE}/model-versions/by-hash",
+                               token, payload=chunk)
+            if isinstance(data, list):
+                versions.extend(v for v in data if isinstance(v, dict))
+                continue
+            log(args, 2, "# batch by-hash returned a non-list; "
+                         "falling back to per-hash lookups")
+        except urllib.error.HTTPError as e:
+            log(args, 2, f"# batch by-hash returned HTTP {e.code}; "
+                         f"falling back to per-hash lookups")
+        for sha in chunk:  # fallback: one GET per hash
+            progress(args, f"  looking up {sha[:12]}.. on CivitAI...")
+            try:
+                v = api_request(args,
+                                f"{API_BASE}/model-versions/by-hash/{sha}",
+                                token)
+                if isinstance(v, dict):
+                    versions.append(v)
+            except urllib.error.HTTPError as e:
+                if e.code != 404:  # 404 just means: hash unknown
+                    log(args, 2, f"# HTTP {e.code} for hash {sha[:12]}..; "
+                                 f"skipping")
+    return versions
+
+
+def fetch_version(args, vid, token, versions_cache, fatal=True):
+    """GET /model-versions/<id>, cached per run. With fatal=False
+    (sidecar fallback) any failure returns None instead of exiting.
+    Fixture: <dir>/version-<id>.json; a missing file acts like a 404."""
+    if vid in versions_cache:
+        return versions_cache[vid]
+    version = None
+    fixture_dir = os.environ.get(FIXTURE_ENV)
+    if fixture_dir:
+        path = Path(fixture_dir) / f"version-{vid}.json"
+        log(args, 2, f"# fixture mode: reading {path}")
+        try:
+            version = json.loads(path.read_text())
+        except OSError:
+            if fatal:
+                die(f"model version not found: {vid}")
+            log(args, 2, f"# fixture version {vid} missing; skipping")
+    else:
+        try:
+            version = api_request(args, f"{API_BASE}/model-versions/{vid}",
+                                  token)
+        except urllib.error.HTTPError as e:
+            if fatal:
+                if e.code == 404:
+                    die(f"model version not found: {vid}")
+                die(f"CivitAI API returned HTTP {e.code} for version {vid}")
+            log(args, 2, f"# HTTP {e.code} for version {vid}; skipping")
+        except urllib.error.URLError as e:
+            if fatal:
+                die(f"cannot reach the CivitAI API ({e.reason}); "
+                    "nothing was changed")
+            log(args, 2, f"# cannot reach CivitAI for version {vid} "
+                         f"({e.reason}); skipping")
+        except TimeoutError:
+            if fatal:
+                die("CivitAI API request timed out; nothing was changed")
+            log(args, 2, f"# CivitAI timed out for version {vid}; skipping")
+    if version is not None and not isinstance(version, dict):
+        version = None
+    versions_cache[vid] = version
+    return version
+
+
+def is_hex(s, n):
+    return isinstance(s, str) and len(s) == n and \
+        all(c in "0123456789abcdef" for c in s.lower())
+
+
+def hash_entries(version):
+    """lowercase sha256 -> files[] entry, for every hashed file the
+    version publishes. Entries without a SHA256 cannot prove anything
+    and are ignored."""
+    out = {}
+    for fl in version.get("files") or []:
+        if not isinstance(fl, dict):
+            continue
+        sha = (fl.get("hashes") or {}).get("SHA256") or ""
+        if is_hex(sha, 64):
+            out[sha.lower()] = fl
+    return out
+
+
+def safe_filename(name):
+    """Validate a bare filename from the API before using it on disk:
+    no separators, no traversal, no Windows-hostile characters."""
+    if not name or not isinstance(name, str):
+        return None
+    if "/" in name or "\\" in name or ":" in name:
+        return None
+    if name in (".", "..") or any(ch in name for ch in '<>"|?*\0'):
+        return None
+    return name
+
+
+# ------------------------------------------------------------------ hashing
+
+def hash_file(path, size, args=None):
+    """Streamed sha256 (the only digest CivitAI matches on). With args,
+    large files show a transient progress line while hashing
+    (interactive only)."""
+    h256 = hashlib.sha256()
+    show = args is not None and size >= HASH_PROGRESS_MIN
+    done = next_tick = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            h256.update(chunk)
+            if show:
+                done += len(chunk)
+                if done >= next_tick or done == size:
+                    gib = 1 << 30
+                    progress(args, f"  hashing {Path(path).name}: "
+                                   f"{done * 100 // size}% "
+                                   f"({done / gib:.1f}/{size / gib:.1f} GiB)")
+                    next_tick = done + HASH_PROGRESS_STEP
+    if show:
+        progress_clear()
+    return h256.hexdigest()
+
+
+def memo_hash(path, size, memo, args=None):
+    """hash_file, cached per run: sources are hashed once for identify +
+    adopt, and existing destination files are hashed at most once for
+    the never-clobber comparison."""
+    key = str(path)
+    if key not in memo:
+        memo[key] = hash_file(path, size, args)
+    return memo[key]
+
+
+# ----------------------------------------------------------- identification
+
+def sidecar_version_id(f):
+    """Mine Civitai-Helper-style metadata next to the SOURCE file for a
+    model-version id. The id is only a LEAD, never proof: the fetched
+    version must still contain our sha256."""
+    stem = f.name[:f.name.rfind(".")] if "." in f.name else f.name
+    for suf in SIDECAR_SUFFIXES:
+        side = f.with_name(stem + suf)
+        if side == f or not side.is_file():
+            continue
+        try:
+            data = json.loads(side.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        vid = data.get("modelVersionId") or data.get("model_version_id") \
+            or data.get("versionId") or data.get("VersionId")
+        if vid is None and ("modelId" in data or "files" in data):
+            vid = data.get("id")  # a raw model-version response (.civitai.info)
+        try:
+            vid = int(vid)
+        except (TypeError, ValueError):
+            continue
+        if vid > 0:
+            return vid
+    return None
+
+
+def describe_version(version):
+    """'<model name> / <version name> (Checkpoint, SDXL 1.0) [AIR urn:..]'"""
+    model = version.get("model") or {}
+    label = f"{model.get('name', '?')} / {version.get('name', '?')}"
+    kind = ", ".join(x for x in (model.get("type"),
+                                 version.get("baseModel")) if x)
+    if kind:
+        label += f" ({kind})"
+    if version.get("air"):
+        label += f" [AIR {version['air']}]"
+    return label
+
+
+def type_dir(version, fentry):
+    """Directory (relative to the cache root) for a matched file.
+    model.type decides, except a files[] entry typed VAE overrides --
+    checkpoints often publish their VAE as a second file. Returns None
+    for unmapped types (refused, never guessed)."""
+    ftype = (fentry.get("type") or "").strip()
+    if ftype.lower() == "vae":
+        return TYPE_DIRS["vae"], ftype
+    mtype = ((version.get("model") or {}).get("type") or "").strip()
+    return TYPE_DIRS.get(mtype.lower()), mtype or ftype or "?"
+
+
+# ---------------------------------------------------------------- placement
+
+def place_file(args, src, dest, mode):
+    """Get src's content to dest atomically. Returns a short verb
+    describing what happened ('hardlinked' / 'copied' / ...).
+
+    Stage into .tmp-<name>-<pid> beside dest, then rename -- a reader
+    never sees a partial file and a crash leaves only a .tmp-* to sweep."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.parent / f".tmp-{dest.name}-{os.getpid()}"
+    verb = None
+    try:
+        if mode in ("link", "move"):
+            try:
+                os.link(src, tmp)
+                verb = "hardlinked"
+            except OSError as e:
+                if e.errno not in (errno.EXDEV, errno.EPERM, errno.EMLINK):
+                    raise
+                log(args, 1, f"  note: hardlink not possible "
+                             f"({errno.errorcode.get(e.errno, e.errno)}); "
+                             f"copying instead")
+        if verb is None:
+            shutil.copyfile(src, tmp)
+            verb = "copied"
+        os.rename(tmp, dest)  # same dir -> atomic
+    finally:
+        tmp.unlink(missing_ok=True)
+    return verb
+
+
+def write_sidecar(args, dest, version, sha, src, apply_mode):
+    """Write <placed-stem>.civitai.info: the raw model-version response
+    (Civitai Helper convention) plus our provenance under
+    extensions.droste, so naive consumers still parse it. An existing
+    sidecar is left alone -- conservative, never clobbered."""
+    side = dest.with_name(dest.stem + ".civitai.info")
+    if side.exists():
+        log(args, 1, f"        sidecar exists; leaving it ({side.name})")
+        return
+    if not apply_mode:
+        log(args, 2, f"# would write sidecar {side}")
+        return
+    info = dict(version)
+    ext = dict(info.get("extensions") or {})
+    ext["droste"] = {"tool": "droste-civitai-adopt/0.1",
+                     "sha256": sha, "adopted_from": str(src)}
+    info["extensions"] = ext
+    tmp = side.parent / f".tmp-{side.name}-{os.getpid()}"
+    try:
+        tmp.write_text(json.dumps(info, indent=2) + "\n")
+        os.rename(tmp, side)
+    finally:
+        tmp.unlink(missing_ok=True)
+    log(args, 2, f"# sidecar written: {side}")
+
+
+def carry_preview(args, src, dest, apply_mode):
+    """Carry a preview image sitting next to the SOURCE file to
+    <placed-stem>.preview.<ext> (never clobbering an existing one; no
+    API downloads -- this is an adopt-only tool). Returns the source
+    preview path when it was carried (so --move can reclaim it)."""
+    stem = src.name[:src.name.rfind(".")] if "." in src.name else src.name
+    for suf in PREVIEW_SUFFIXES:
+        prev = src.with_name(stem + suf)
+        if prev != src and prev.is_file():
+            break
+    else:
+        return None
+    pdest = dest.with_name(f"{dest.stem}.preview{prev.suffix}")
+    if pdest.exists():
+        log(args, 1, f"        preview exists; leaving it ({pdest.name})")
+        return None
+    if apply_mode:
+        place_file(args, prev, pdest, "copy")
+        log(args, 2, f"# preview carried: {pdest}")
+    else:
+        log(args, 2, f"# would carry preview {prev.name} -> {pdest.name}")
+    return prev
+
+
+# ----------------------------------------------------------- file gathering
+
+def gather_files(args, paths):
+    """Expand CLI paths: files as-is; dirs scanned (non-recursive unless
+    --recursive). Metadata sidecars and preview images are companions of
+    the models next to them, never candidates themselves."""
+    # metadata sidecars (minus plain .json -- let hashing decide those)
+    # and every image form: images are never model files
+    companion = SIDECAR_SUFFIXES[:-1] + PREVIEW_SUFFIXES
+
+    def is_companion(name):
+        return name.lower().endswith(companion)
+
+    out = []
+    for p in paths:
+        p = Path(p).expanduser()
+        if p.is_dir():
+            if args.recursive:
+                for root, dirs, files in os.walk(p):
+                    dirs[:] = sorted(d for d in dirs if d != ".cache")
+                    out.extend(Path(root) / f for f in sorted(files)
+                               if not is_companion(f))
+            else:
+                out.extend(sorted(c for c in p.iterdir()
+                                  if c.is_file() and not is_companion(c.name)))
+        elif p.is_file():
+            out.append(p)  # named explicitly: the user means it
+        else:
+            die(f"no such file or directory: {p}")
+    files = [f for f in out if f.is_file()]
+    if not files:
+        die("no candidate files found (empty dir? need --recursive?)")
+    return files
+
+
+# --------------------------------------------------------------------- main
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="droste-civitai-adopt",
+        description="Adopt already-downloaded CivitAI model files "
+                    "(checkpoints, LoRAs, VAEs, embeddings, ...) into a "
+                    "webui-style cache dir -- no re-download. Each file is "
+                    "IDENTIFIED by its sha256 via the CivitAI API and "
+                    "adopted only on hash proof, with a .civitai.info "
+                    "metadata sidecar; everything else is refused. NOTE: "
+                    "CivitAI never hashed some very old uploads -- those "
+                    "404 by hash even though genuine; local metadata "
+                    "sidecars and --version-id cover them. DRY-RUN by "
+                    "default: pass --apply to actually change the cache.",
+        epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version-id", type=int, metavar="N",
+                   help="CivitAI model-version id the files claim to "
+                        "belong to (escape hatch for old unhashed "
+                        "uploads; files must still hash-match the "
+                        "version's file list)")
+    p.add_argument("paths", nargs="+", metavar="PATH",
+                   help="files to adopt, or a directory to scan")
+    p.add_argument("--apply", action="store_true",
+                   help="actually modify the cache (default: dry-run)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report only, change nothing (this is the default)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--link", dest="mode", action="store_const",
+                      const="link",
+                      help="hardlink into the cache (default; falls back "
+                           "to copy across filesystems)")
+    mode.add_argument("--copy", dest="mode", action="store_const",
+                      const="copy", help="copy into the cache")
+    mode.add_argument("--move", dest="mode", action="store_const",
+                      const="move",
+                      help="move into the cache (source removed only "
+                           "after successful placement)")
+    p.set_defaults(mode="link")
+    p.add_argument("--recursive", action="store_true",
+                   help="recurse into directories")
+    p.add_argument("--cache", metavar="DIR",
+                   help="cache dir laid out like a webui root (default: "
+                        "$DROSTE_CIVITAI_CACHE or ~/.cache/civitai)")
+    p.add_argument("-q", "--quiet", action="count", default=0,
+                   help="only refusals, warnings and the summary")
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="show hashes, API details, per-step decisions")
+    return p
+
+
+def adopt_group(args, cache, version, entries, hash_memo):
+    """Place all files matched to one model version: canonical name +
+    type dir + sidecar + preview, never clobbering anything. `entries`
+    is [(src, sha256, files[]-entry), ...]. Returns
+    (adopted, already, refused)."""
+    apply_mode = args.apply
+    log(args, 1, f"version {describe_version(version)} "
+                 f"(id {version.get('id', '?')}) | {len(entries)} file(s) "
+                 f"| mode: {args.mode}")
+
+    adopted = already = refused = 0
+    for src, sha, fentry in entries:
+        shown = str(src)
+        name = safe_filename(fentry.get("name"))
+        if name is None:
+            log(args, 0, f"REFUSE  {shown}: unsafe filename from the API: "
+                         f"{fentry.get('name')!r}")
+            refused += 1
+            continue
+        rel, tlabel = type_dir(version, fentry)
+        if rel is None:
+            log(args, 0, f"REFUSE  {shown}: unmapped CivitAI type "
+                         f"{tlabel!r}; place it manually")
+            refused += 1
+            continue
+        dest = cache / rel / name
+
+        if dest.exists():
+            if memo_hash(dest, dest.stat().st_size, hash_memo, args) != sha:
+                log(args, 0, f"REFUSE  {shown}: {rel}/{name} exists with "
+                             f"DIFFERENT content; refusing to overwrite")
+                refused += 1
+                continue
+            log(args, 1, f"ALREADY {shown}")
+            log(args, 1, f"        == {rel}/{name} (same content already "
+                         f"in cache)")
+            write_sidecar(args, dest, version, sha, src, apply_mode)
+            carry_preview(args, src, dest, apply_mode)
+            already += 1
+            if apply_mode and args.mode == "move" \
+                    and src.resolve() != dest.resolve():
+                src.unlink()
+                log(args, 1, "        source removed (--move)")
+            continue
+
+        if apply_mode:
+            verb = place_file(args, src, dest, args.mode)
+        else:
+            verb = {"link": "would hardlink", "copy": "would copy",
+                    "move": "would move"}[args.mode]
+        log(args, 0, f"ADOPT   {shown}")
+        log(args, 0, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
+                     f"[{verb}]")
+        write_sidecar(args, dest, version, sha, src, apply_mode)
+        prev = carry_preview(args, src, dest, apply_mode)
+        if apply_mode and args.mode == "move":
+            src.unlink()
+            if prev is not None:
+                prev.unlink()  # carried successfully -> reclaim it too
+            log(args, 1, "        source removed (--move)")
+        adopted += 1
+    return adopted, already, refused
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.dry_run and args.apply:
+        die("--dry-run and --apply are mutually exclusive")
+    apply_mode = args.apply
+
+    cache = resolve_cache(args.cache)
+    token = find_token()
+    files = gather_files(args, args.paths)
+    hash_memo = {}  # each file (and clobber-checked dest) hashed once
+    header = (f"{'DRY RUN (pass --apply to make changes)' if not apply_mode else 'APPLY'}"
+              f" | cache: {cache}")
+
+    refused = 0
+    versions_cache = {}  # version id -> version object (or None), per run
+    groups = {}  # version id -> [(src, sha, files[]-entry), ...]
+
+    if args.version_id:
+        progress(args, f"  fetching version {args.version_id}...")
+        version = fetch_version(args, args.version_id, token,
+                                versions_cache, fatal=True)
+        progress_clear()
+        if version is None or version.get("id") is None:
+            die(f"CivitAI returned no usable data for version "
+                f"{args.version_id}")
+        log(args, 1, header)
+        entries = hash_entries(version)
+        for f in files:
+            sha = memo_hash(f, f.stat().st_size, hash_memo, args)
+            fentry = entries.get(sha)
+            if fentry is None:
+                log(args, 0, f"REFUSE  {f}: not byte-identical to any "
+                             f"file in version {args.version_id}")
+                refused += 1
+                continue
+            groups.setdefault(version["id"], []).append((f, sha, fentry))
+        versions_cache[version["id"]] = version
+    else:
+        # IDENTIFY phase: hash everything, one batch by-hash round-trip,
+        # then per-file sidecar fallback for the misses. One directory
+        # may hold files from many models/versions.
+        log(args, 1, header)
+        shas = {f: memo_hash(f, f.stat().st_size, hash_memo, args)
+                for f in files}
+        unique = list(dict.fromkeys(shas.values()))
+        try:
+            found = batch_lookup(args, unique, token)
+        except (urllib.error.URLError, TimeoutError) as e:
+            log(args, 0, f"warning: CivitAI hash lookup failed "
+                         f"({getattr(e, 'reason', e)})")
+            found = None
+        by_sha = {}  # our sha -> (version, files[]-entry)
+        for v in found or []:
+            if v.get("id") is None:
+                continue  # no id -> unusable for grouping/sidecars
+            for sha, fentry in hash_entries(v).items():
+                by_sha.setdefault(sha, (v, fentry))
+            versions_cache.setdefault(v["id"], v)
+
+        for f in files:
+            sha = shas[f]
+            if found is None:
+                log(args, 0, f"REFUSE  {f}: CivitAI lookup unavailable; "
+                             f"try again or pass --version-id")
+                refused += 1
+                continue
+            hit = by_sha.get(sha)
+            note = "via hash lookup"
+            if hit is None:
+                # sidecar fallback: a version id found in local metadata
+                # is a lead only -- the fetched version must contain OUR
+                # sha256 before anything is adopted.
+                vid = sidecar_version_id(f)
+                if vid is not None:
+                    progress(args, f"  fetching version {vid}...")
+                    v = fetch_version(args, vid, token, versions_cache,
+                                      fatal=False)
+                    usable = v is not None and v.get("id") is not None
+                    fentry = hash_entries(v).get(sha) if usable else None
+                    if fentry is not None:
+                        versions_cache.setdefault(v["id"], v)
+                        hit = (v, fentry)
+                        note = f"via local sidecar -> version {vid}"
+                    else:
+                        log(args, 0, f"REFUSE  {f}: sidecar points at "
+                                     f"version {vid} but this file's hash "
+                                     f"is not among its published files")
+                        refused += 1
+                        continue
+            if hit is None:
+                log(args, 0, f"REFUSE  {f}: not found by hash on CivitAI "
+                             f"and no provable local metadata (old "
+                             f"unhashed file? pass --version-id)")
+                refused += 1
+                continue
+            v, fentry = hit
+            log(args, 1, f"IDENTIFIED {f} -> {describe_version(v)} "
+                         f"({note})")
+            groups.setdefault(v.get("id"), []).append((f, sha, fentry))
+
+    adopted = already = 0
+    for vid, entries in groups.items():
+        a, c, r = adopt_group(args, cache, versions_cache[vid], entries,
+                              hash_memo)
+        adopted += a
+        already += c
+        refused += r
+
+    tag = " (dry-run; nothing was changed)" if not apply_mode else ""
+    log(args, 0, f"summary: {adopted} adopted, {already} already cached, "
+                 f"{refused} refused{tag}")
+    if adopted == 0 and already == 0 and refused > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
