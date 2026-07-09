@@ -94,8 +94,11 @@ into servers-by-default with ONE shared runtime mechanism. The moving parts:
 - `base/resolve/droste-resolve.sh` — a sourced primitive library (overlay, surface,
   cache-bind, critical, optional-marker, template seeding), baked at
   `/opt/resources/resolve/`. Lane-aware: `DROSTE_LANE=server` (default) mounts;
-  `DROSTE_LANE=distrobox` skips every internal mount ($HOME is the persistent host
-  home there) and runs only the non-mount steps.
+  `DROSTE_LANE=distrobox` (since v0.2.0) runs the SAME mounts with deliberate
+  deviations only — no HF-cache bind (the real home is auto-bound), `/root/`
+  destinations remapped to the box user's home, created dirs chowned to the box
+  user. (Pre-0.2.0 the distrobox lane skipped every internal mount — see
+  "2026-07-09 — lane unification" below for why that was wrong and reversed.)
 - `droste-entrypoint.sh` — the server-lane ENTRYPOINT for every port. Sources the
   library + the port's `/opt/resources/build-spec`, runs `resolve::apply_spec` in
   the fixed design order (ensure `/opt/data` → SURFACES/OVERLAYS/CACHES → CRITICAL
@@ -128,7 +131,9 @@ One sourced-bash file per port (`targets/<port>/build-spec`, baked at
 PRE_LAUNCH` — all paths explicit + absolute (`$HOME` allowed and preferred for
 home-relative paths: it is the only form correct in BOTH lanes). SURFACES and
 CACHES are structurally identical binds kept as separate rows by design (future
-cache-specific behaviour). There is deliberately no DEFAULTS row — ALL content
+cache-specific behaviour — which arrived in v0.2.0, when CACHES retargeted to
+the shared `/opt/caches` volume; see the 2026-07-09 shared compute-cache
+entry). There is deliberately no DEFAULTS row — ALL content
 seeding is owned by templates.yaml. Contract doc: `base/resolve/build-spec.example`.
 
 ### Templates (first-run seeding)
@@ -176,9 +181,10 @@ not baked. comfyui's `scripts/tests/` is repo-only (never COPY'd).
   (`scripts/gen_vllm_config.py`) — hermetic, and upstream drift is visible as a
   vendored-file diff, not a silent build change. `VLLM_NO_USAGE_STATS=1` is baked
   instead of persisting `~/.config/vllm` (do-not-track > carrying state). The
-  `cache/vllm` bind is deliberately OMITTED: `VLLM_DISABLE_COMPILE_CACHE=1`
-  should keep `~/.cache/vllm` empty — VERIFY at first runtime test, add the bind
-  if artifacts land there. `/opt/fp8` is trimmed to the runtime import surface
+  `cache/vllm` bind IS present (owner decision 2026-07-09, resolving the old
+  VERIFY-at-test note that had it omitted): `~/.cache/vllm` — vLLM's
+  compile/artifact cache — joins the shared compute-cache store under the
+  v0.2.0 cache policy. `/opt/fp8` is trimmed to the runtime import surface
   (top-level `*.py` + LICENSE/NOTICE + `licenses/` kept for compliance; bench/
   docs/serve scripts dropped).
 - **llama** — `llama.env` is BUILD-generated from the pinned llama-server's own
@@ -189,7 +195,7 @@ not baked. comfyui's `scripts/tests/` is repo-only (never COPY'd).
   cache-path resolution and setting it would re-separate the shared HF cache.
   Slot save/restore: the pinned fork ships `--slot-save-path` with NO env
   annotation (verified by the first CI run failing loudly, as designed), so
-  the entrypoint launch line passes `--slot-save-path /opt/data/cache/slots`
+  the entrypoint launch line passes `--slot-save-path /opt/data/slots`
   (user override = own flag in LLAMA_EXTRA_ARGS; later flags win); the dir is
   pre-created in PRE_LAUNCH.
 - **ds4** — ds4 has no native per-flag env vars, so PRE_LAUNCH translates
@@ -222,7 +228,8 @@ hardware surfaced three findings and one decided design change.
   user's uid, so the cap confers nothing the user couldn't already do via
   `unshare -Urm`. Under ROOTFUL podman/docker it is real host SYS_ADMIN — a
   bigger ask, though still confined by the container's private mount
-  namespace. The distrobox lane is unaffected (the init hook mounts nothing).
+  namespace. The distrobox lane was unaffected at the time (the init hook
+  mounted nothing) — superseded by the lane unification below.
   On EPERM the resolver fails FAST with a message naming `--cap-add
   sys_admin` — deliberately no fallback, because without mount capability the
   plain binds are just as broken as the overlays; there is nothing sane to
@@ -262,6 +269,95 @@ hardware surfaced three findings and one decided design change.
 - **check-rocm.sh hardening:** the sweep now self-carries `--cap-add
   sys_admin` and a tmpfs `/opt/data` for its probes (tmpfs is always a valid
   overlay upper), so validation results are host-filesystem-agnostic.
+
+### 2026-07-09 — lane unification (v0.2.0: distrobox gets the server lane's mounts)
+
+The v0.1.0 "distrobox lane mounts nothing in-container" design is REVERSED.
+Decision (Jei, 2026-07-09): the two lanes' mounts are now MOSTLY IDENTICAL —
+the init hook runs the same resolver mounts as the server entrypoint, with
+deviations allowed only where there is a real engineering reason ("there may
+be necessary deviations — and that's ok"), justified case-by-case, never
+assumed.
+
+- **Provenance, recorded honestly:** the shipped no-overlay distrobox design
+  was NOT an owner decision. It was a proposal of this project's AI assistant
+  that got written into the design record with a false "Direction (Jei)"
+  attribution, and shipped on that basis; when the record was challenged, Jei
+  disowned it ("Yeah, I never said that"). Worse than the bad paper trail, the
+  design contradicted the project's FOUNDING requirement: the project exists
+  because Jei lost data to a distrobox wipe, yet under the shipped design
+  in-box state (pip installs into `/opt/venv`, custom nodes) lived in the
+  container layer and died on box recreation — recreating exactly that
+  prior failure mode. This entry keeps the mistake on the record so neither
+  the false attribution nor the requirement it violated gets papered over.
+- **What unifies:** OVERLAYS (venv, comfyui custom_nodes — uppers on
+  `/opt/data`; the kernel→fuse→copy fallback chain applies as-is), SURFACES
+  (including comfyui's model-tree and `user/` — so M4's "the ini carries both
+  lanes' binds" workaround dissolves and the comfyui ini drops its special
+  model-tree/user `volume=` lines), and CACHES (the compute-cache binds land
+  over `~/.cache/*` in-box instead of leaking into the real `$HOME`; their
+  source is the shared `/opt/caches` volume — see the shared compute-cache
+  entry below). Consequences: every `distrobox.ini` gains
+  `additional_flags` with `--cap-add sys_admin` + `--device /dev/fuse`, and
+  the `/opt/data` filesystem rule (plus its automatic fallback) now applies to
+  the distrobox lane too.
+- **Deliberate deviations** (the sanctioned class; each has a reason):
+  - HF cache: NO bind in distrobox — the real home is auto-bound, so
+    `~/.cache/huggingface` is natively persistent and the critical check
+    passes as-is. (Dotfile/config state likewise stays `$HOME`-native — that
+    is the lane's purpose.)
+  - `/root/` remap: init_hooks run as root (`HOME=/root`), so destinations
+    under `/root/` remap to the box user's home before mounting.
+  - Ownership: dirs the hook creates (overlay uppers, cache dirs) are chowned
+    to the box user — a root-run hook serving a non-root user.
+  - Idempotent re-entry: hooks fire on every cold start, so every mount is
+    skip-if-bound.
+- **Migration:** boxes created from v0.1.0 inis do NOT pick this up in place —
+  `distrobox rm` + `distrobox assemble create` is required.
+- **Acceptance test** (the founding requirement, made executable): pip-install
+  a package inside a box → destroy the box → recreate it → the change
+  survived.
+
+### 2026-07-09 — shared compute-cache volume (`/opt/caches`, folded into v0.2.0)
+
+Decision (Jei, 2026-07-09): the compute caches (MIOpen / Triton / torch-hub)
+move from per-box `/opt/data/cache` to ONE shared volume, bound at
+`/opt/caches` in every container and box (host default `~/droste/caches`,
+user-overridable). Rationale, his: "easier to make the caches all shared,
+generally". The resulting mount story is TWO shared stores plus one private
+volume — models (the HF cache) and compute caches (`/opt/caches`) shared
+across all five ports; `/opt/data` stays strictly box-private.
+
+- **Conflict profile, per cache** (why sharing is safe, and the one place it
+  is only mostly safe):
+  - Triton: the JIT cache is content-addressed — concurrent boxes writing the
+    same key write the same artifact. Conflict-free.
+  - torch-hub: downloads are byte-identical per URL — last-writer-wins is
+    harmless. Safe.
+  - MIOpen: the single concurrency caveat. Its user tuning DB is a real
+    shared database, not a content-addressed blob store — boxes tuning
+    concurrently can contend on it (lock waits, redone tuning work; not
+    corruption of results). Accepted as the price of warm-starting every box
+    with every other box's tuning; revisit only if it bites in practice.
+- **Degrade semantics:** unbound `/opt/caches` → graceful fallback to the old
+  per-box `/opt/data/cache` with a one-time INFO. This store is OPTIONAL —
+  never a critical, never an error (nothing in it is irreplaceable, only
+  recomputable).
+- **What deliberately stays per-box:** llama's slot store remains on
+  `/opt/data` (`/opt/data/slots`) — slot save/restore is session STATE, not a
+  recomputable compute cache; sharing it across boxes would be semantically
+  wrong, not merely contended. Same for ds4's kv-disk (`/opt/data/kv-disk`);
+  both moved out of the `cache/` pathname on 2026-07-09 precisely because they
+  are state, not cache. Migration note: a v0.1.0 box's existing `slots`/
+  `kv-disk` dir under the old `/opt/data/cache/` location is left orphaned
+  (safe to delete); llama/ds4 re-create the new dirs on demand.
+- **Credit where due:** the build-spec's SURFACES ≠ CACHES row split exists
+  because Jei insisted on it. In the s22 design round the two rows were
+  structurally identical binds and the engineering lean was to merge them;
+  Jei kept them separate for "future cache magic". This is that magic: the
+  shared-cache retarget lands as a CACHES-row semantics change — no SURFACES
+  touch, no build-spec format change — because the seam was already there.
+  His foresight, on the record as his.
 
 ---
 

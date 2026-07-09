@@ -65,14 +65,6 @@ declare -A BOX_HAS_MODELS=(
   [comfyui]=1 [llama]=1 [vllm]=1 [ds4]=1 [finetuning]=0
 )
 
-# Distrobox-lane extra volume lines: the server lane's SURFACES mirrored into
-# the ini (the resolver mounts nothing in distrobox mode). comfyui only —
-# model-tree + user/ MUST track the /opt/data host dir (@DATA@ substituted).
-declare -A BOX_INI_SURFACES=(
-  [comfyui]="@DATA@/model-tree:/opt/ComfyUI/models @DATA@/user:/opt/ComfyUI/user"
-  [llama]="" [vllm]="" [ds4]="" [finetuning]=""
-)
-
 # Config file seeded (if missing) onto /opt/data at first start.
 declare -A BOX_CONFIG=(
   [comfyui]="extra_model_paths.yaml"
@@ -329,6 +321,7 @@ declare -A SESSION_STATE     # box → ACTIVE|STOPPED (what this run did)
 SELECTED=()                  # chosen boxes, canonical order
 CONFIGURE=()                 # SELECTED minus keeps
 HF_CACHE=""
+COMPUTE_CACHE=""             # shared MIOpen/Triton/torch/vLLM kernel cache
 MODELS_DIR=""                # "" = not configured
 EMIT_DIR=""
 RUNG="w"                     # w|p|c|a
@@ -408,6 +401,7 @@ dest_to_label() {  # box dest → label ("" if unknown)
   case "$dest" in
     /opt/data) printf 'data'; return 0 ;;
     /opt/models) printf 'models'; return 0 ;;
+    /opt/caches) printf 'caches'; return 0 ;;
     */.cache/huggingface) printf 'hf'; return 0 ;;
   esac
   for pair in ${BOX_EXTRA_BINDS[$box]}; do
@@ -451,6 +445,10 @@ parse_existing_ini() {  # box
         [[ -n $label && -z "${EXD_PATH["$box:$label"]:-}" ]] \
           && EXD_PATH["$box:$label"]=$src
       done
+    elif [[ $line =~ DROSTE_OVERLAY_MODE=([a-z]+) ]]; then
+      # additional_flags carries --env DROSTE_OVERLAY_MODE=<mode>; a parsed
+      # compose file (both-lane box) wins over the ini copy.
+      [[ -z "${EXD_MODE[$box]:-}" ]] && EXD_MODE[$box]=${BASH_REMATCH[1]}
     fi
   done < "$f"
   return 0
@@ -586,6 +584,16 @@ shared_questions() {
   done
   ask_path "the shared HF cache" "$def"
   HF_CACHE=$ANS_PATH
+  wrap "The compute cache (MIOpen/Triton/torch/vLLM kernels) is likewise shared by every box — safe to share: its content is keyed by version and architecture."
+  def=$HOME/droste/caches
+  for box in "${BOXES[@]}"; do
+    if [[ -n "${EXD_PATH["$box:caches"]:-}" ]]; then
+      def=${EXD_PATH["$box:caches"]}
+      break
+    fi
+  done
+  ask_path "the shared compute cache (MIOpen/Triton/torch/vLLM)" "$def"
+  COMPUTE_CACHE=$ANS_PATH
   ask_yn "Bind a read-only local model collection at /opt/models (optional)?" N
   if [[ $ANS_YN -eq 1 ]]; then
     def=$HOME/models
@@ -698,13 +706,8 @@ choose_data_dir() {  # box
       CFG_MODE[$box]=""
       break
     fi
-    if [[ ${CFG_LANE[$box]} == distrobox ]]; then
-      # No in-container mounts in the distrobox lane — informational only.
-      say "  Note: $FSTYPE is overlay-hostile, but the distrobox lane mounts"
-      say "  nothing in-container, so this path is fine for distrobox use."
-      CFG_MODE[$box]=""
-      break
-    fi
+    # Both lanes build the same overlays on /opt/data (the init hook runs
+    # the resolver in-box), so distrobox-only boxes get the same menu.
     if [[ -n $MIT_ALL ]]; then
       CFG_MODE[$box]=$MIT_ALL
       say "  $FSTYPE detected — applying your earlier choice ($MIT_ALL)."
@@ -870,6 +873,8 @@ emit_compose() {  # box → writes droste-halo-<box>.compose.yaml
       printf '      - %s:%s\n' "${PATHS["$box:$label"]}" "$dest"
     done
     printf '      - %s:/root/.cache/huggingface\n' "$HF_CACHE"
+    printf '      # shared compute cache (MIOpen/Triton/torch/vLLM kernels):\n'
+    printf '      - %s:/opt/caches\n' "$COMPUTE_CACHE"
     if [[ -n $MODELS_DIR && ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
       printf '      - %s:/opt/models:ro\n' "$MODELS_DIR"
     fi
@@ -889,7 +894,7 @@ emit_compose() {  # box → writes droste-halo-<box>.compose.yaml
 }
 
 emit_ini() {  # box → writes droste-halo-<box>.ini (distrobox assemble record)
-  local box=$1 f pair label dest vols surf data
+  local box=$1 f pair label dest vols flags data
   f=$(ini_file "$box")
   data=${PATHS["$box:data"]}
   {
@@ -897,22 +902,30 @@ emit_ini() {  # box → writes droste-halo-<box>.ini (distrobox assemble record)
       "$NAME_PREFIX" "$box" "$(date +%F)"
     printf '# Create/recreate with:  distrobox assemble create --file %s\n' "$f"
     printf '# Modeled on targets/%s/distrobox.ini (droste-ai-rocm repo).\n' "$box"
+    printf '# Unified lane: the init hook runs the same resolver as the\n'
+    printf '# server lane — overlays, surfaces, and caches are mounted\n'
+    printf '# in-box on /opt/data, so in-box installs survive recreation.\n'
     printf '\n'
     printf '[%s%s]\n' "$NAME_PREFIX" "$box"
     printf 'image=%s%s%s\n' "$IMAGE_PREFIX" "$box" "$IMAGE_SUFFIX"
     printf 'init_hooks="%s"\n' "$INIT_HOOK"
+    # additional_flags append to `podman|docker create` (--env is the
+    # distrobox docs' own example flag): sys_admin permits the in-box
+    # resolver mounts, /dev/fuse enables the fuse-overlayfs fallback,
+    # and --env carries the overlay-mitigation mode to the init hook.
+    flags="--cap-add sys_admin --device /dev/fuse"
+    case "${CFG_MODE[$box]:-}" in
+      fuse|copy) flags+=" --env DROSTE_OVERLAY_MODE=${CFG_MODE[$box]}" ;;
+    esac
+    printf 'additional_flags="%s"\n' "$flags"
     vols="$data:/opt/data"
     for pair in ${BOX_EXTRA_BINDS[$box]}; do
       label=${pair%%:*} dest=${pair#*:}
       vols="$vols ${PATHS["$box:$label"]}:$dest"
     done
     printf 'volume="%s"\n' "$vols"
-    if [[ -n "${BOX_INI_SURFACES[$box]}" ]]; then
-      surf=${BOX_INI_SURFACES[$box]//@DATA@/$data}
-      printf '# Server-lane SURFACES mirrored here (the resolver mounts nothing\n'
-      printf '# in distrobox mode); MUST track the /opt/data host dir above.\n'
-      printf 'volume="%s"\n' "$surf"
-    fi
+    printf '# Shared compute cache (MIOpen/Triton/torch/vLLM kernels):\n'
+    printf 'volume="%s:/opt/caches"\n' "$COMPUTE_CACHE"
     if [[ -n $MODELS_DIR && ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
       printf '# Optional read-only local model collection:\n'
       printf 'volume="%s:/opt/models:ro"\n' "$MODELS_DIR"
@@ -945,6 +958,7 @@ plain_create_args() {  # box → prints podman/docker create args (one per line)
     printf -- '-v\n%s:%s\n' "${PATHS["$box:$label"]}" "$dest"
   done
   printf -- '-v\n%s:/root/.cache/huggingface\n' "$HF_CACHE"
+  printf -- '-v\n%s:/opt/caches\n' "$COMPUTE_CACHE"
   if [[ -n $MODELS_DIR && ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
     printf -- '-v\n%s:/opt/models:ro\n' "$MODELS_DIR"
   fi
@@ -1059,6 +1073,12 @@ write_notes() {
     else
       printf 'Local model collection: not configured (/opt/models unbound).\n'
     fi
+    printf 'Shared compute cache: %s — bound at /opt/caches in every\n' \
+      "\`$COMPUTE_CACHE\`"
+    printf 'box (MIOpen/Triton/torch/vLLM kernels; safe to share — content is\n'
+    printf 'keyed by version/arch). ONE caveat: avoid heavy simultaneous\n'
+    printf 'first-run MIOpen tuning in two boxes at once; everything else\n'
+    printf 'is conflict-free.\n'
     printf '\n## Day-to-day commands\n\n'
     printf '    podman start <name>        # start a server box\n'
     printf '    podman stop <name>         # stop it\n'
@@ -1116,6 +1136,14 @@ write_notes() {
         printf '    distrobox assemble create --file %s\n' "$(ini_file "$box")"
       fi
     done
+    printf '\n## Distrobox lane\n\n'
+    printf 'Distroboxes get the SAME in-box mounts as the server lane: the\n'
+    printf 'init hook mounts the overlays, surfaces, and caches from your\n'
+    printf 'data dir (/opt/data in-box), so in-box installs (pip packages,\n'
+    printf 'custom nodes) persist across box recreation. The overlay-hostile\n'
+    printf 'filesystem rule therefore applies to BOTH lanes. Boxes created\n'
+    printf 'by v0.1.0-era setups must be recreated (distrobox rm <name>,\n'
+    printf 'then the assemble one-liner above) to pick this up.\n'
     printf '\n## Auto-start\n\n'
     printf 'Boxes with auto-start use `restart: unless-stopped`. For rootless\n'
     printf 'podman that policy is applied at boot by a user service — enable it\n'

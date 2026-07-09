@@ -100,21 +100,28 @@ Full contract + rationale: [BUILD_NOTES](BUILD_NOTES.md).
 
 Mount contract (all ports):
 
-- **`/opt/data`** — the one container-specific volume (venv overlay upper, compute
-  caches, the seeded config file, comfyui's model tree). Unbound → anonymous
+- **`/opt/data`** — the one container-private volume (venv overlay upper, the
+  seeded config file, comfyui's model tree, llama's slot store). Unbound → anonymous
   volume + a warning. Because overlay uppers live here, the backing filesystem
   must be ext4/btrfs/xfs-class (tmpfs also works) — **not** ecryptfs (encrypted
   homes), NFS, or virtiofs, which kernel overlayfs rejects as an upper. On such
   hosts the resolver falls back to fuse-overlayfs automatically (add
   `--device /dev/fuse` to the run to enable it), with a copy-mode last resort;
   `DROSTE_OVERLAY_MODE=auto|kernel|fuse|copy` overrides (default `auto`).
-  Plain binds (HF cache, input/output, workspace) have no filesystem
-  requirement.
+  Plain binds (HF cache, `/opt/caches`, input/output, workspace) have no
+  filesystem requirement.
 - **Critical binds** — hard-error at start unless bound; `ALLOW_EPHEMERAL=1`
   downgrades that to a warning. Always the **HF cache** (`~/.cache/huggingface` —
   the SINGLE model store, shared across all five ports; bind the same host dir
   everywhere and any model one tool downloads is available to the rest); plus
   comfyui `input`/`output` and finetuning `workspace` (irreplaceable user work).
+- **`/opt/caches`** — the shared compute-cache store (MIOpen / Triton /
+  torch-hub). The story is TWO shared stores plus one private volume: models
+  live in the HF cache, compute caches live here, and everything box-private
+  stays on `/opt/data`. Bind the same host dir (default `~/droste/caches`; any
+  dir you like) into every container/box and kernels tuned or JIT-compiled by
+  one are warm for the rest. Optional: unbound → the resolver degrades
+  gracefully to per-box `/opt/data/cache` with an INFO, never an error.
 - **`/opt/models`** — optional read-only local model collection (comfyui scanner
   source #2; the llama/ds4/vllm config model path may point here). Unbound →
   one-time INFO + marker file, never an error.
@@ -126,6 +133,7 @@ podman run -d -p 8188:8188 --device /dev/kfd --device /dev/dri \
   -v ~/droste/comfyui/input:/opt/ComfyUI/input \
   -v ~/droste/comfyui/output:/opt/ComfyUI/output \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ~/droste/caches:/opt/caches \
   ghcr.io/doctorjei/droste-comfyui-halo:latest
 ```
 
@@ -138,8 +146,8 @@ podman/docker it is real host `SYS_ADMIN` — a bigger ask, though still confine
 to the container's private mount namespace. `--group-add keep-groups` carries
 the invoking user's supplementary groups (render/video) into the container for
 rootless GPU access — the invoking user must be in those host groups. The
-distrobox lane needs neither the cap nor the fs requirement above (its init
-hook mounts nothing in-container).
+distrobox lane has the same needs (its init hook performs the same mounts);
+the shipped inis carry the cap and `/dev/fuse` via `additional_flags`.
 
 comfyui additionally runs a pre-launch **model scanner**: it classifies everything
 in the HF cache (+ `/opt/models`) and maintains a ComfyUI-friendly symlink tree
@@ -147,24 +155,39 @@ in the HF cache (+ `/opt/models`) and maintains a ComfyUI-friendly symlink tree
 pulls into the shared cache appear in ComfyUI's pickers automatically.
 
 **distrobox lane:** the same images double as `$HOME`-native interactive
-toolboxes — `distrobox assemble create --file targets/<port>/distrobox.ini`. The
-ini declares the volume binds plus an init hook that runs the same resolver in
-distrobox mode (no internal mounts; the auto-bound host home persists the HF
-cache and dotfile state natively). Because nothing is mounted in-container,
-this lane needs neither `--cap-add sys_admin` nor the `/opt/data` filesystem
-requirement.
+toolboxes — `distrobox assemble create --file targets/<port>/distrobox.ini`.
+As of v0.2.0 the lanes are unified: the ini's init hook runs the **same
+resolver mounts as the server entrypoint** — the overlays (venv, comfyui
+custom_nodes; kernel→fuse→copy fallback included), the surfaces (including
+comfyui's model tree and `user/`, so the ini no longer carries its own volume
+lines for those), and the cache binds (the inis carry the same shared
+`~/droste/caches` → `/opt/caches` volume). The payoff is the whole point of this
+project: in-box changes (`pip install` into `/opt/venv`, custom nodes) live on
+`/opt/data` and **survive box deletion/recreation** instead of dying with the
+container layer. Consequently the inis carry `additional_flags` with
+`--cap-add sys_admin` and `--device /dev/fuse`, and the `/opt/data` filesystem
+rule above (with its automatic fallback) applies to this lane too. Deliberate
+deviations from the server lane: the HF cache gets no bind (the auto-bound
+real home already provides it), destinations under `/root/` remap to the box
+user's home, and directories the hook creates are chowned to the box user.
+**Upgrading from v0.1.0:** existing boxes must be recreated (`distrobox rm`
+then `distrobox assemble create`) to pick up the unified mounts.
 
 ### Troubleshooting
 
 - **`mount: <path>: permission denied` at startup** → the container lacks
-  `CAP_SYS_ADMIN`, so the entrypoint cannot mount anything (overlays *or* plain
-  binds). Fix: add `--cap-add sys_admin` to the run (server lane only).
+  `CAP_SYS_ADMIN`, so the resolver cannot mount anything (overlays *or* plain
+  binds). Fix: add `--cap-add sys_admin` to the run. In the distrobox lane the
+  v0.2.0 inis pass it via `additional_flags` — if a box hits this, it was
+  created from a v0.1.0 ini and must be recreated.
 - **`wrong fs type, bad option, bad superblock`** (dmesg: `overlayfs: upper fs
   missing required features`) → `/opt/data` sits on an overlay-hostile
   filesystem (ecryptfs/NFS/virtiofs) that kernel overlayfs cannot use as an
   upper. Fix: move `/opt/data` to ext4/btrfs/xfs-class storage, or add
   `--device /dev/fuse` and the resolver falls back to fuse-overlayfs
-  automatically (copy-mode is the last resort). Note: podman's *own* image
+  automatically (copy-mode is the last resort). This applies to both lanes —
+  the distrobox init hook runs the same overlays, and the v0.2.0 inis already
+  pass `/dev/fuse`. Note: podman's *own* image
   storage on such filesystems is a separate concern, solved by `storage.conf`
   `mount_program = "/usr/bin/fuse-overlayfs"` (relevant for VMs with the
   graphroot on virtiofs) — that config does not affect the entrypoint's mounts.
