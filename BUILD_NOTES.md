@@ -361,6 +361,105 @@ across all five ports; `/opt/data` stays strictly box-private.
 
 ---
 
+## Host adopt tooling — droste-hf-adopt / droste-civitai-adopt
+
+The two repo-root adopt tools move already-downloaded model files into the
+shared stores the containers mount — the HF hub cache, and a webui-style
+CivitAI tree suited to the `/opt/models` bind. Both are host-side,
+stdlib-only, dry-run by default. The design rationale:
+
+### The hash-proof adoption gate
+- Content enters a shared store ONLY on cryptographic proof, NEVER on
+  filename similarity — a shared cache poisoned by a name-guessed adoption
+  poisons every consumer at once. droste-hf-adopt matches the file's digest
+  against the repo manifest from the HF API (`?blobs=true`, metadata only:
+  the LFS content sha256 — the live API spells it `lfs.sha256`, older
+  payloads `lfs.oid`, both accepted — for LFS files, git blob sha1
+  (`blobId`) for small ones; one streamed pass computes both). droste-civitai-adopt matches sha256 via the
+  CivitAI batch by-hash API (one round trip per directory).
+- IDENTIFICATION is exactly as strict as a claimed identity. Without
+  `--repo` (HF) the search API only proposes candidate repos — the published
+  hashes decide; a CivitAI `--version-id` (the escape hatch for old uploads
+  CivitAI never hashed) is accepted only if our sha256 appears in that
+  version's file list. Refused files are not failures to fix by hand-placing
+  them in the cache — their home is the `/opt/models` bind.
+- Never partial, never destructive: placements stage as `.tmp-*` and rename
+  into place; existing content is never overwritten (identical content =
+  ALREADY, different content = refused); `--move` deletes the source only
+  after successful placement. Hardlink is the default placement (free when
+  cache and download share a filesystem; falls back to copy across).
+
+### The three-file sidecar scheme + the 4-outcome field policy
+- Each adopted CivitAI model gets up to three sidecars; the namespace suffix
+  sits LAST so the terminal extension is the unique `.droste`:
+  `.civitai.info` (the live CivitAI API response — shareable, tool-owned,
+  regenerated), `.meta.droste` (our objective block: sha256, normalized
+  name, IDs, api/resolved type, routing, sniff verdicts, fine `sub_type`),
+  and `.user.droste` (user curation — written only when non-empty, and
+  MONOTONIC: sync never drops preserved data).
+- Pre-existing source sidecars next to the download (a1111 `.json`, ComfyUI
+  `.metadata.json`, Stability Matrix `.cm-info.json`) are mined field by
+  field under a 4-outcome policy: user curation → `.user.droste` (tags and
+  trigger words kept as the user-distinct DELTA vs CivitAI's own
+  trainedWords/tags); model metadata with no CivitAI home (e.g. a fine
+  functional subtype like text_encoder/bbox) → `.meta.droste`; metadata that
+  COMPLETES a blank/missing CivitAI field → enriches `.civitai.info` (blank
+  scalars filled, local preview URLs unioned into `images[]`); tool-internal
+  or redundant state → dropped. A single `extensions.droste.enriched` marker
+  records exactly what was completed — and is ABSENT when nothing was, so an
+  unenriched `.civitai.info` stays byte-pure API output. Fields no table
+  knows land in an `unmatched` discovery bucket surfaced on screen — the
+  taxonomy grows from evidence instead of silently eating unknowns.
+- Every run (new placement AND already-cached) is an idempotent SYNC: each
+  sidecar is recomputed, canonically serialized, and written only on
+  difference. A conflicting incoming user field refuses that file's ENTIRE
+  adoption with a side-by-side diff unless `--force` — user curation is the
+  one thing the tool must never silently rewrite.
+
+### Content-sniff routing (and why the unpickler is safe)
+- The hash pass buffers a prefix of the file, from which the sniffer derives
+  facts (ControlNet vs T2I-Adapter, upscaler architecture, base model,
+  dtype), each tagged `absolute` or `uncertain`. safetensors is trivial (the
+  header is JSON). Pickled checkpoints go through a RESTRICTED unpickler
+  that executes none of the payload: `find_class` never imports or resolves
+  a real class — it returns a single inert stand-in — and `persistent_load`
+  (torch tensor storages) returns the same, so every REDUCE/instantiation
+  calls the inert stub instead of attacker code; the stub only records dict
+  keys assigned to it, which is exactly what a state dict's tensor names
+  are. Both modern torch zip pickles and legacy bare pickles are covered.
+- An ABSOLUTE sniff that contradicts the API's declared type wins the
+  ROUTING (a mislabelled T2I-adapter lands in `T2IAdapter/`, not
+  `ControlNet/`); an uncertain sniff defers to the API. Sniffing never
+  overrides the hash-proven identity — only the placement directory.
+
+### Long filenames — byte budget, advisory cascade, --rename
+- Normalized `<Model>_<Version>` names can outgrow NAME_MAX (255 bytes on
+  ext4 — BYTES, so CJK costs 3 per character). The budget is computed per
+  destination via `os.pathconf` (walking up past not-yet-created components;
+  255 when it cannot say), minus the WIDEST family member built over the
+  stem — the model file, the widest sidecar (`.civitai.info`), the widest
+  carried preview, and the `.tmp-<name>-<pid>` staging form of each.
+- The fit check runs in bytes and BEFORE any `exists()`/stat — a too-long
+  name would make even `Path.exists` raise ENAMETOOLONG — so an over-budget
+  name is refused untouched and the batch continues.
+- The recommendation is ADVISORY ONLY — the tool never truncates a name
+  itself; the user pastes the suggested stem into `--rename`. It is a
+  CUMULATIVE cascade of ever-blunter filters, each narrowing the previous
+  step's candidate: NFKC-normalize + drop historic/archaic-script
+  characters, then drop Unicode planes 2–16, plane 1, 3-byte UTF-8 (all
+  CJK), non-ASCII, and finally right-truncate keeping the last 8 characters.
+  Deleted characters leave their surrounding punctuation intact — no
+  re-collapse — so the result stays honest about what was removed.
+- `--rename NAME` (the run must match exactly one file) is recorded as the
+  guarded `filename` field in `.user.droste` and READ BACK on later runs:
+  the routed directory's `*.meta.droste` sidecars are scanned for the file's
+  sha256 and the paired `.user.droste` name is reused, so a plain re-run
+  lands on ALREADY instead of re-refusing — and because the read-back record
+  is the guard's basis, a DIFFERENT `--rename` cannot silently shed the
+  previously recorded name.
+
+---
+
 ## Base images
 
 ### base/Container.runtime

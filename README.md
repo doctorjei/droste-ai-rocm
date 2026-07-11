@@ -199,6 +199,116 @@ then `distrobox assemble create`) to pick up the unified mounts.
   `--security-opt seccomp=unconfined` (`check-rocm.sh`'s known-good flag set
   carries both).
 
+## Host tools
+
+Three helpers live at the repo root. They run on the **host** (plain bash /
+python3, stdlib only — no container, no pip installs) and feed the mount
+contract above: `droste-setup` writes the run records; the two `*-adopt` tools
+populate the shared model stores the containers mount.
+
+### droste-setup — interactive installer
+
+One self-contained bash script with zero repo-checkout dependencies (safe as
+`curl <url> | bash`). It guides lane choice (server container and/or
+distrobox), every bind in the mount contract, and host ports; it **probes each
+data dir's filesystem** and, on an overlay-hostile one (ecryptfs/NFS/…, see
+Troubleshooting), offers another location, the fuse-overlayfs fallback, or
+copy-mode. It then emits per-box **recreation records** into `~/droste/` —
+`droste-halo-<box>.compose.yaml` (server lane; when no compose provider is
+installed, creation falls back to plain `podman create` with identical flags),
+`droste-halo-<box>.ini` (distrobox lane), and a `NOTES.md` guide with your real
+paths baked in — and can pull images, create boxes, and start servers.
+**Safe to re-run:** existing compose/ini files, containers, and distroboxes are
+detected and listed; per box you choose keep / recreate / modify — nothing is
+silently clobbered.
+
+```bash
+./droste-setup                  # interactive menu over all five boxes
+./droste-setup comfyui llama    # direct-to-box shortcut
+./droste-setup --plain          # ASCII output (no emoji / ANSI)
+```
+
+### droste-hf-adopt — local downloads → the shared HF cache
+
+Adopts already-downloaded model files (browser, wget, rsync from another
+machine) into the shared HF hub cache — the SINGLE model store from the mount
+contract — with **no re-download**, stored exactly the way `hf download` would
+have stored them. Adoption is **hash-proven**: only files byte-identical to
+the repo's published content (per the HF API manifest) are adopted; everything
+else is refused with a reason — its home is the `/opt/models` bind instead.
+`--repo` is optional: without it each file is **identified** via the HF search
+API, still hash-gated (a repo is only accepted when its published hashes prove
+it contains this exact content, never on name similarity). **Dry-run by
+default** — pass `--apply` to change the cache. Hardlink is the default
+placement (`--copy` / `--move` alternatives); small repo files you don't have
+locally are reported as GAP, filled cheaply by a later `hf download <repo>`.
+
+```bash
+# Adopt a GGUF you fetched with wget into the shared cache (dry-run first):
+./droste-hf-adopt --repo Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+    ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
+./droste-hf-adopt --apply --repo Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+    ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+# Don't know (or trust) the repo? Omit --repo: each file is IDENTIFIED
+# via the HF search API and adopted only on hash proof:
+./droste-hf-adopt ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+# Adopt a whole diffusers checkout (nested dirs need --recursive),
+# reclaiming the disk space afterwards:
+./droste-hf-adopt --apply --move --recursive \
+    --repo stabilityai/stable-diffusion-xl-base-1.0 ~/sdxl-download/
+```
+
+Anything adopted here is immediately visible to every container that binds the
+HF cache — including ComfyUI's pickers, via the model scanner.
+
+### droste-civitai-adopt — CivitAI downloads → a webui-style tree
+
+Sibling to `droste-hf-adopt`, same invariant, for CivitAI content (checkpoints,
+LoRAs, VAEs, embeddings, …): each file is identified by its **sha256** via the
+CivitAI API and adopted **only on hash proof**, into a cache dir laid out like
+a webui root (default `$DROSTE_CIVITAI_CACHE` or `~/.cache/civitai`). During
+the same hash pass the file's **content is sniffed** (safetensors header, or
+state-dict keys via a restricted execution-free unpickler) to route it to a
+fine-grained directory — ControlNet vs T2IAdapter, upscaler by architecture,
+LyCORIS/DoRA split out of Lora, unknown types to `other/<Type>/`. Files are
+placed under a normalized **`<Model>_<Version>`** name with **three sidecars**:
+`.civitai.info` (the CivitAI API response, kept shareable), `.meta.droste`
+(our objective block: sha256, routing, sniff verdicts), and `.user.droste`
+(your curation — notes, trigger-word/tag deltas, a `--rename` choice — written
+only when non-empty, guarded against overwrite unless `--force`). Sidecars are
+re-synced idempotently on every run. **Dry-run by default** — pass `--apply`.
+`--version-id` is the escape hatch for very old uploads CivitAI never hashed
+(still sha256-gated against the version's file list).
+
+A normalized name can exceed the filesystem's 255-**byte** name limit (CJK is
+3 bytes/char): the tool refuses it with a recommended shorter stem — it never
+truncates on its own — and `--rename` lets you pick the stem; the choice is
+recorded in `.user.droste` and reused on later runs.
+
+```bash
+# Dry-run first (default), then adopt — routed + normalized + sidecars:
+./droste-civitai-adopt ~/Downloads/juggernautXL_v9.safetensors
+./droste-civitai-adopt --apply ~/Downloads/juggernautXL_v9.safetensors
+
+# A whole mixed downloads dir: one batch API call identifies everything,
+# files route per-file to different model/version dirs:
+./droste-civitai-adopt --apply --move ~/Downloads/mixed/
+
+# A <Model>_<Version> name past the 255-byte limit is REFUSEd with a
+# "recommend: --rename '<stem>'" line; adopt under your own name instead
+# (recorded, and reused on re-runs):
+./droste-civitai-adopt --apply --rename 'Wan21-FLF2V-14B-720P' ~/dl/wan.safetensors
+```
+
+The resulting tree is webui-shaped (`models/Stable-diffusion`, `models/Lora`,
+`embeddings/`, …), so it slots straight into the **`/opt/models`** bind from
+the mount contract — the comfyui scanner's second source — and the llama/ds4/
+vllm config model paths can point into it. That is also where both adopt tools
+send you for files that fail the hash gate: provably-published content lives in
+the caches, everything else on `/opt/models`.
+
 ## Building
 
 ROCm/HIP is **ahead-of-time cross-compiled** — images build on any x86 host (no GPU).
