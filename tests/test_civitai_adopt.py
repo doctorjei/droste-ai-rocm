@@ -242,7 +242,8 @@ class CivitaiAdoptTest(unittest.TestCase):
         rc, out, err = self.fx.run("--apply", str(f))
         self.assertEqual(rc, 0, err)
         u = json.loads(self.fx.user("models/Lora", "Styl_v1").read_text())
-        self.assertEqual(u["trigger_words"], "styl, masterpiece")
+        # trigger_words is now the user-distinct DELTA vs trainedWords ([] here)
+        self.assertEqual(u["trigger_words"], ["styl", "masterpiece"])
         self.assertEqual(u["preferred_weight"], 0.8)
         self.assertEqual(u["notes"], "works best at 0.8")
         # standard fields (description, sd version) are NOT copied up ...
@@ -300,6 +301,338 @@ class CivitaiAdoptTest(unittest.TestCase):
                          {"MyCustomField": "keepme"})
         self.assertIn("note: unrecognized field(s) in sm.cm-info.json: "
                       "MyCustomField — kept under 'unmatched'", out)
+
+    # ----------------------------------- 4-outcome: user deltas / title / etc.
+    def test_trigger_words_delta_vs_trainedwords(self):
+        content = b"trigger delta lora"
+        f = self.fx.add_download("t.safetensors", content)
+        self.fx.add_download("t.json", json.dumps(
+            {"activation text": "foo, baz, qux"}).encode())
+        v = version_obj(1010, "TW", "v1", "LORA",
+                        [file_entry("t.safetensors", content)])
+        v["trainedWords"] = ["Foo", "bar"]  # case-insensitive overlap
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user("models/Lora", "TW_v1").read_text())
+        self.assertEqual(u["trigger_words"], ["baz", "qux"])  # foo dropped
+
+    def test_trigger_words_delta_all_overlap_no_field(self):
+        content = b"trigger all overlap"
+        f = self.fx.add_download("t2.safetensors", content)
+        self.fx.add_download("t2.json",
+                             json.dumps({"activation text": "foo, bar"}).encode())
+        v = version_obj(1011, "TW2", "v1", "LORA",
+                        [file_entry("t2.safetensors", content)])
+        v["trainedWords"] = ["foo", "bar"]
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        # every trigger overlaps trainedWords -> empty delta -> no user file
+        self.assertFalse(self.fx.user("models/Lora", "TW2_v1").exists())
+
+    def test_tags_delta_vs_civitai_tags(self):
+        content = b"tags delta lora"
+        f = self.fx.add_download("tg.safetensors", content)
+        self.fx.add_download("tg.metadata.json",
+                             json.dumps({"tags": ["Anime", "user-only"]}).encode())
+        v = version_obj(1012, "TG", "v1", "LORA",
+                        [file_entry("tg.safetensors", content)])
+        v["model"]["tags"] = ["anime", "style"]  # case-insensitive overlap
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user("models/Lora", "TG_v1").read_text())
+        self.assertEqual(u["tags"], ["user-only"])  # anime dropped
+
+    def test_title_kept_when_different_dropped_when_equal(self):
+        # kept
+        c1 = b"title diff"
+        f1 = self.fx.add_download("td.safetensors", c1)
+        self.fx.add_download("td.cm-info.json",
+                             json.dumps({"UserTitle": "My Nickname"}).encode())
+        v1 = version_obj(1013, "Official Name", "v1", "LORA",
+                         [file_entry("td.safetensors", c1)])
+        # dropped (equal to model.name, case-insensitive)
+        c2 = b"title same"
+        f2 = self.fx.add_download("ts.safetensors", c2)
+        self.fx.add_download("ts.cm-info.json",
+                             json.dumps({"UserTitle": "official NAME"}).encode())
+        v2 = version_obj(1014, "Official Name", "v2", "LORA",
+                         [file_entry("ts.safetensors", c2)])
+        self.fx.set_by_hash({sha256(c1): v1, sha256(c2): v2})
+        rc, out, err = self.fx.run("--apply", str(f1), str(f2))
+        self.assertEqual(rc, 0, err)
+        u1 = json.loads(self.fx.user("models/Lora", "Official-Name_v1")
+                        .read_text())
+        self.assertEqual(u1["title"], "My Nickname")
+        # equal-to-model.name UserTitle -> no title -> no user file at all
+        self.assertFalse(self.fx.user("models/Lora", "Official-Name_v2")
+                         .exists())
+
+    def test_inference_defaults_structured_passthrough(self):
+        content = b"inference defaults"
+        f = self.fx.add_download("inf.safetensors", content)
+        idefs = {"cfg": 7, "steps": 20, "sampler": "DPM++ 2M"}
+        self.fx.add_download("inf.cm-info.json",
+                             json.dumps({"InferenceDefaults": idefs}).encode())
+        v = version_obj(1015, "Inf", "v1", "LORA",
+                        [file_entry("inf.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user("models/Lora", "Inf_v1").read_text())
+        self.assertEqual(u["inference_defaults"], idefs)  # structured verbatim
+
+    # ------------------------------------------ 4-outcome: ENRICH .civitai.info
+    def test_enrich_fills_blank_scalars_and_marks(self):
+        content = b"enrich blanks"
+        f = self.fx.add_download("e.safetensors", content)
+        self.fx.add_download("e.metadata.json", json.dumps({
+            "modelDescription": "local description",
+            "base_model": "Pony"}).encode())
+        v = version_obj(1020, "E", "v1", "LORA",
+                        [file_entry("e.safetensors", content)], base="")
+        v["description"] = ""  # blank -> fill
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Lora", "E_v1").read_text())
+        self.assertEqual(info["description"], "local description")
+        self.assertEqual(info["baseModel"], "Pony")
+        enriched = info["extensions"]["droste"]["enriched"]
+        self.assertEqual(sorted(enriched["fields"]), ["baseModel", "description"])
+        self.assertEqual(enriched["images"], [])
+        # marker carries NO source filenames (privacy)
+        self.assertNotIn("e.metadata.json", json.dumps(enriched))
+
+    def test_enrich_does_not_overwrite_populated_and_stays_pure(self):
+        content = b"enrich populated"
+        f = self.fx.add_download("ep.safetensors", content)
+        self.fx.add_download("ep.metadata.json", json.dumps({
+            "modelDescription": "local", "base_model": "SD 1.5"}).encode())
+        v = version_obj(1021, "EP", "v1", "LORA",
+                        [file_entry("ep.safetensors", content)], base="SDXL 1.0")
+        v["description"] = "the official description"
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Lora", "EP_v1").read_text())
+        # populated CivitAI values control -> unchanged, no marker, byte-pure
+        self.assertEqual(info, v)
+        self.assertNotIn("extensions", info)
+
+    def test_enrich_description_from_a1111_json(self):
+        # A1111 .json `description` fills a blank CivitAI description (no
+        # ComfyUI source present) and shows up in the marker.
+        content = b"a1111 enrich desc"
+        f = self.fx.add_download("ad.safetensors", content)
+        self.fx.add_download("ad.json", json.dumps({
+            "description": "a1111 model description",
+            "sd version": "SDXL"}).encode())
+        v = version_obj(1026, "AD", "v1", "LORA",
+                        [file_entry("ad.safetensors", content)])
+        v["description"] = ""  # blank -> fill from A1111
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Lora", "AD_v1").read_text())
+        self.assertEqual(info["description"], "a1111 model description")
+        self.assertEqual(info["extensions"]["droste"]["enriched"]["fields"],
+                         ["description"])
+
+    def test_enrich_description_comfy_wins_over_a1111(self):
+        # BOTH sources present -> ComfyUI modelDescription wins, A1111 is
+        # only the fallback (order-independent).
+        content = b"both desc sources"
+        f = self.fx.add_download("bd.safetensors", content)
+        self.fx.add_download("bd.json",
+                             json.dumps({"description": "from a1111"}).encode())
+        self.fx.add_download("bd.metadata.json",
+                             json.dumps({"modelDescription": "from comfy"}).encode())
+        v = version_obj(1027, "BD", "v1", "LORA",
+                        [file_entry("bd.safetensors", content)])
+        v["description"] = ""
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Lora", "BD_v1").read_text())
+        self.assertEqual(info["description"], "from comfy")
+
+    def test_enrich_a1111_description_does_not_overwrite_populated(self):
+        content = b"a1111 desc populated"
+        f = self.fx.add_download("adp.safetensors", content)
+        self.fx.add_download("adp.json",
+                             json.dumps({"description": "local a1111"}).encode())
+        v = version_obj(1028, "ADP", "v1", "LORA",
+                        [file_entry("adp.safetensors", content)])
+        v["description"] = "the official description"
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Lora", "ADP_v1").read_text())
+        # populated CivitAI description untouched -> byte-pure, no marker
+        self.assertEqual(info, v)
+        self.assertNotIn("extensions", info)
+
+    def test_enrich_basemodel_absolute_sniff_override(self):
+        # tensors say FLUX; CivitAI (wrongly) says SD 1.5 -> absolute override
+        content = safetensors_bytes(["double_blocks.0.img_attn.qkv.weight",
+                                     "single_blocks.0.linear1.weight"])
+        f = self.fx.add_download("ov.safetensors", content)
+        v = version_obj(1022, "OV", "v1", "Checkpoint",
+                        [file_entry("ov.safetensors", content)], base="SD 1.5")
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Stable-diffusion", "OV_v1")
+                          .read_text())
+        self.assertEqual(info["baseModel"], "FLUX.1")
+        self.assertIn("baseModel",
+                      info["extensions"]["droste"]["enriched"]["fields"])
+
+    def test_enrich_image_union(self):
+        content = b"image union"
+        f = self.fx.add_download("im.safetensors", content)
+        self.fx.add_download("im.metadata.json", json.dumps({
+            "preview_url": "https://cdn.invalid/new.png",
+            "preview_nsfw_level": 4}).encode())
+        self.fx.add_download("im.cm-info.json", json.dumps({
+            "ThumbnailImageUrl": "https://cdn.invalid/thumb.png"}).encode())
+        v = version_obj(1023, "IM", "v1", "LORA",
+                        [file_entry("im.safetensors", content)])
+        v["images"] = [{"url": "https://example.invalid/existing.jpg",
+                        "nsfwLevel": 1}]
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Lora", "IM_v1").read_text())
+        urls = {im["url"]: im for im in info["images"]}
+        self.assertIn("https://example.invalid/existing.jpg", urls)  # kept
+        # ComfyUI preview: nsfw rides
+        self.assertEqual(urls["https://cdn.invalid/new.png"],
+                         {"url": "https://cdn.invalid/new.png", "nsfwLevel": 4})
+        # cm-info thumbnail: no source nsfw -> nsfwLevel OMITTED (honest
+        # "unknown rating"), not defaulted
+        self.assertEqual(urls["https://cdn.invalid/thumb.png"],
+                         {"url": "https://cdn.invalid/thumb.png"})
+        self.assertEqual(
+            sorted(info["extensions"]["droste"]["enriched"]["images"]),
+            ["https://cdn.invalid/new.png", "https://cdn.invalid/thumb.png"])
+
+    def test_enrich_image_skips_present_and_local_paths(self):
+        content = b"image skip"
+        f = self.fx.add_download("is.safetensors", content)
+        self.fx.add_download("is.metadata.json", json.dumps({
+            "preview_url": "/home/user/private/preview.png"}).encode())  # local
+        v = version_obj(1024, "IS", "v1", "LORA",
+                        [file_entry("is.safetensors", content)])
+        v["images"] = [{"url": "https://example.invalid/keep.jpg"}]
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        info = json.loads(self.fx.civ("models/Lora", "IS_v1").read_text())
+        # local-path preview dropped -> nothing added -> byte-pure
+        self.assertEqual(info, v)
+        self.assertNotIn("extensions", info)
+
+    def test_idempotent_enriched_rerun_writes_nothing(self):
+        content = b"idempotent enriched"
+        f = self.fx.add_download("ie.safetensors", content)
+        self.fx.add_download("ie.metadata.json", json.dumps({
+            "modelDescription": "desc",
+            "preview_url": "https://cdn.invalid/x.png"}).encode())
+        v = version_obj(1025, "IE", "v1", "LORA",
+                        [file_entry("ie.safetensors", content)])
+        v["description"] = ""
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        civ = self.fx.civ("models/Lora", "IE_v1")
+        before = (civ.read_bytes(), civ.stat().st_mtime_ns)
+        time.sleep(0.01)
+        rc, out, err = self.fx.run("--apply", str(f))  # identical inputs
+        self.assertEqual(rc, 0, err)
+        self.assertIn("1 already cached", out)
+        self.assertEqual(civ.read_bytes(), before[0])
+        self.assertEqual(civ.stat().st_mtime_ns, before[1])  # no rewrite
+
+    # ---------------------------------------- 4-outcome: sub_type -> .meta
+    def test_sub_type_fine_to_meta_coarse_not_stored(self):
+        # fine subtype -> meta.sub_type
+        c1 = b"fine subtype"
+        f1 = self.fx.add_download("st1.safetensors", c1)
+        self.fx.add_download("st1.metadata.json",
+                             json.dumps({"sub_type": "text_encoder"}).encode())
+        v1 = version_obj(1030, "ST1", "v1", "LORA",
+                         [file_entry("st1.safetensors", c1)])
+        # coarse subtype -> NOT stored (redundant with model.type)
+        c2 = b"coarse subtype"
+        f2 = self.fx.add_download("st2.safetensors", c2)
+        self.fx.add_download("st2.metadata.json",
+                             json.dumps({"sub_type": "lora"}).encode())
+        v2 = version_obj(1031, "ST2", "v1", "LORA",
+                         [file_entry("st2.safetensors", c2)])
+        self.fx.set_by_hash({sha256(c1): v1, sha256(c2): v2})
+        rc, out, err = self.fx.run("--apply", str(f1), str(f2))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fx.meta("models/Lora", "ST1_v1")["sub_type"],
+                         "text_encoder")
+        self.assertNotIn("sub_type", self.fx.meta("models/Lora", "ST2_v1"))
+
+    # ------------------------------------------------- 4-outcome: DROP bucket
+    def test_drop_fields_absent_everywhere_incl_file_path(self):
+        secret = "/home/someone/private/models/thing.safetensors"
+        content = b"drop bucket"
+        f = self.fx.add_download("d.safetensors", content)
+        self.fx.add_download("d.metadata.json", json.dumps({
+            "sha256": "abc", "size": 1234, "file_name": "thing",
+            "file_path": secret, "from_civitai": True, "db_checked": True,
+            "hash_status": "ok", "metadata_source": "civitai",
+            "last_checked_at": "2026", "modified": 1.0, "exclude": False,
+            "skip_metadata_refresh": False, "civitai_deleted": False}).encode())
+        v = version_obj(1040, "D", "v1", "LORA",
+                        [file_entry("d.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        # nothing surfaced: no user file, no note, no meta sub_type, no enrich
+        self.assertFalse(self.fx.user("models/Lora", "D_v1").exists())
+        self.assertNotIn("unrecognized field", out)
+        self.assertNotIn("sub_type", self.fx.meta("models/Lora", "D_v1"))
+        info = json.loads(self.fx.civ("models/Lora", "D_v1").read_text())
+        self.assertEqual(info, v)  # no enrichment
+        # the local path leaked into NO written sidecar
+        for p in self.fx.cache.rglob("*"):
+            if p.is_file():
+                self.assertNotIn(secret, p.read_text(errors="ignore"), p.name)
+
+    # -------------------------------------- guard now covers title + inference
+    def test_guard_covers_title_and_inference_defaults(self):
+        content = b"title inference guard"
+        f = self.fx.add_download("gi.safetensors", content)
+        self.fx.add_download("gi.cm-info.json", json.dumps({
+            "UserTitle": "Original", "InferenceDefaults": {"cfg": 7}}).encode())
+        v = version_obj(1050, "Model", "v1", "LORA",
+                        [file_entry("gi.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        rel, stem = "models/Lora", "Model_v1"
+        # change BOTH guarded fields -> conflict, refuse without --force
+        (self.fx.downloads / "gi.cm-info.json").write_text(json.dumps({
+            "UserTitle": "Renamed", "InferenceDefaults": {"cfg": 3}}))
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 1)
+        self.assertIn("sheepishly refusing", err)
+        self.assertIn("title", err)
+        self.assertIn("inference_defaults", err)
+        # --force overwrites both
+        rc, out, err = self.fx.run("--apply", "--force", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user(rel, stem).read_text())
+        self.assertEqual(u["title"], "Renamed")
+        self.assertEqual(u["inference_defaults"], {"cfg": 3})
 
     def test_pure_standard_source_makes_no_user_file_or_note(self):
         content = b"no prefs here"

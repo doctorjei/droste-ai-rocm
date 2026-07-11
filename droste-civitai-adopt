@@ -35,19 +35,28 @@ not ControlNet/); an uncertain sniff keeps the API type. Sniffing NEVER
 overrides the hash-proven identity -- only the placement category.
 
 THREE-FILE METADATA SCHEME (namespace suffix LAST so the terminal
-extension is the unique '.droste'):
-  1. <Model_Version>.civitai.info -- PURE CivitAI API response (shareable,
-     community-standard; nothing of ours injected).
+extension is the unique '.droste'). Source-sidecar fields (from a1111
+.json / ComfyUI .metadata.json / Stability Matrix .cm-info.json next to
+the download) are sorted by a 4-outcome policy: user-curation -> .user,
+model-metadata-with-no-CivitAI-home -> .meta, model-metadata that
+COMPLETES a blank/missing CivitAI field -> enrich .civitai.info, and
+tool-internal/redundant -> drop.
+  1. <Model_Version>.civitai.info -- the live CivitAI response, ENRICHED:
+     blank scalars (description/name/baseModel) filled from local sidecars;
+     local preview URLs unioned into images[]; baseModel overridden by an
+     ABSOLUTE content sniff when it contradicts. A single marker
+     extensions.droste.enriched={fields,images} records what was completed
+     -- ABSENT when nothing was (then the file stays byte-pure). Shareable.
   2. <Model_Version>.meta.droste  -- our objective block: sha256,
      normalized_name, IDs, api_type/resolved_type, routing, sniff verdicts,
-     upscaler_arch, detected_base_model.
-  3. <Model_Version>.user.droste  -- user preferences ingested from any
-     pre-existing SOURCE sidecars (.json/.metadata.json/.cm-info.json):
-     notes/preferred_weight/trigger_words/usage_tips/tags/favorite plus an
-     'unmatched' bucket capturing every source field that is neither
-     mapped nor known-standard (so unrecognized/bespoke fields are never
-     lost, and recurring ones get surfaced on screen for later promotion
-     to explicit maps). Written ONLY when such data exists; never empty.
+     upscaler_arch, detected_base_model, and a FINE sub_type (e.g.
+     text_encoder/bbox/facerestore) when the source names one CivitAI lacks.
+  3. <Model_Version>.user.droste  -- user curation from source sidecars:
+     notes/preferred_weight/usage_tips/favorite, title (cm-info UserTitle
+     when it differs from the model name), trigger_words and tags kept as
+     the user-distinct DELTA vs CivitAI trainedWords/tags, inference_defaults
+     (cm-info), plus an 'unmatched' discovery bucket for truly-unknown keys
+     (surfaced on screen). Written ONLY when non-empty.
 
 Every adopt (new placement AND already-cached) runs an idempotent SYNC:
 each sidecar is recomputed, canonically serialized, and written ONLY if it
@@ -157,44 +166,90 @@ DROSTE_SIDECAR_SUFFIXES = (".meta.droste", ".user.droste")
 
 TOOL_ID = "droste-civitai-adopt/0.3"
 
-# ----- user-preference ingestion (source sidecars -> .user.droste) -----
-# The normalized user-preference fields the guard protects and the sync
-# monotonically preserves. An `unmatched` bucket rides alongside for every
-# source field that is neither MAPped nor known-STANDARD (uniformly across
-# all three formats): keys neither we nor CivitAI already account for.
-USER_PREF_FIELDS = ("notes", "preferred_weight", "trigger_words",
-                    "usage_tips", "tags", "favorite")
+# ----- source-sidecar field categorization (the 4-outcome policy) -----
+# Each pre-existing source-sidecar field sorts into exactly one outcome:
+#   user            -> a normalized field in .user.droste (guarded)
+#   user_delta_*    -> user field, kept as the user-distinct DELTA vs CivitAI
+#   user_title / user_inference -> the title / inference_defaults user fields
+#   enrich_scalar   -> fill a blank CivitAI scalar in .civitai.info
+#   enrich_image_*  -> add a preview URL (+nsfw) to CivitAI images[]
+#   meta_subtype    -> a FINE functional subtype -> .meta.droste sub_type
+#   drop            -> tool-internal / redundant / private (never preserved)
+# Anything NOT in a format's table is 'unmatched' -> the discovery bucket.
+
+# The normalized user fields the guard protects + the sync monotonically
+# preserves (title + inference_defaults included -> 8 guarded fields).
+USER_PREF_FIELDS = ("notes", "preferred_weight", "usage_tips", "favorite",
+                    "tags", "trigger_words", "title", "inference_defaults")
 # suffix -> source format, for the per-format extraction below
 USER_SIDECAR_FORMATS = {
     ".json": "a1111",             # AUTOMATIC1111 flat sidecar
     ".metadata.json": "comfyui",  # ComfyUI Lora-Manager nested sidecar
     ".cm-info.json": "stability_matrix",
 }
-# Per format: <fmt>_MAP keys -> our normalized field; <fmt>_STANDARD =
-# CivitAI-standard / bookkeeping keys to skip; anything in neither set is
-# "unmatched" and preserved + surfaced. All key comparisons are lowercased.
-A1111_MAP = {"activation text": "trigger_words",
-             "preferred weight": "preferred_weight",
-             "notes": "notes"}
-A1111_STANDARD = {"description", "sd version", "sd_version"}
-# ComfyUI nested: `civitai` = embedded standard dump, `preview` = image.
-COMFY_MAP = {"notes": "notes", "usage_tips": "usage_tips",
-             "tags": "tags", "favorite": "favorite"}
-COMFY_STANDARD = {"civitai", "preview"}
-# Stability Matrix .cm-info.json is a typed mirror of the CivitAI record.
-CM_MAP = {"notes": "notes", "favorite": "favorite",
-          "isfavorite": "favorite", "usagetips": "usage_tips"}
-# The cm-info fields that are standard CivitAI mirror / local bookkeeping
-# (model & version identity, base model, tags, hashes, file size, connected
-# ids, preview refs, timestamps). Anything else is treated as unmatched.
-CM_STANDARD = {
-    "modelname", "modeltype", "modeldescription", "modelurl",
-    "modelid", "versionid", "versionname", "versiondescription",
-    "basemodel", "trainedwords", "tags", "nsfw", "nsfwlevel",
-    "filename", "filemetadata", "filesize", "hashes", "sha256",
-    "autov2", "blake3", "crc32", "author", "images", "previewimage",
-    "importedat", "updatedat", "lastupdated",
+# CivitAI `sub_type` values that just duplicate model.type / our
+# resolved_type: coarse -> back-fill model.type when blank (~never) + drop;
+# anything else (text_encoder/bbox/segmentation/facedetection/faceparsing/
+# facerestore/future) is a genuine FINE subtype -> .meta.droste sub_type.
+COARSE_SUBTYPES = {"lora", "vae", "hypernetwork", "upscaler", "detection"}
+
+# Per-format field dispositions. Keys are compared LOWERCASED; values are
+# (outcome, *target).
+A1111_FIELDS = {
+    "notes": ("user", "notes"),
+    "activation text": ("user_delta_trigger",),
+    "preferred weight": ("user", "preferred_weight"),
+    # enrich CivitAI description, but only as a FALLBACK: ComfyUI
+    # modelDescription (the primary enrich_scalar) wins when both are present.
+    "description": ("enrich_scalar_alt", "description"),
+    "sd version": ("drop",),
+    "sd_version": ("drop",),
 }
+COMFY_FIELDS = {
+    "notes": ("user", "notes"),
+    "usage_tips": ("user", "usage_tips"),
+    "tags": ("user_delta_tags",),
+    "favorite": ("user", "favorite"),
+    "modeldescription": ("enrich_scalar", "description"),
+    "model_name": ("enrich_scalar", "model_name"),
+    "base_model": ("enrich_scalar", "base_model"),
+    "preview_url": ("enrich_image_url",),
+    "preview_nsfw_level": ("enrich_image_nsfw",),
+    "sub_type": ("meta_subtype",),
+    "civitai": ("drop",), "preview": ("drop",),
+    "sha256": ("drop",), "size": ("drop",),
+    "file_name": ("drop",), "file_path": ("drop",),  # file_path = privacy
+    "from_civitai": ("drop",), "db_checked": ("drop",),
+    "hash_status": ("drop",), "metadata_source": ("drop",),
+    "last_checked_at": ("drop",), "modified": ("drop",),
+    "exclude": ("drop",), "skip_metadata_refresh": ("drop",),
+    "civitai_deleted": ("drop",),
+}
+CM_FIELDS = {
+    "notes": ("user", "notes"),
+    "favorite": ("user", "favorite"),
+    "isfavorite": ("user", "favorite"),
+    "usagetips": ("user", "usage_tips"),
+    "usertitle": ("user_title",),
+    "inferencedefaults": ("user_inference",),
+    "thumbnailimageurl": ("enrich_image_url",),
+    "source": ("drop",), "stats": ("drop",),
+    # standard CivitAI mirror / local bookkeeping
+    "modelname": ("drop",), "modeltype": ("drop",),
+    "modeldescription": ("drop",), "modelurl": ("drop",),
+    "modelid": ("drop",), "versionid": ("drop",),
+    "versionname": ("drop",), "versiondescription": ("drop",),
+    "basemodel": ("drop",), "trainedwords": ("drop",),
+    "tags": ("drop",), "nsfw": ("drop",), "nsfwlevel": ("drop",),
+    "filename": ("drop",), "filemetadata": ("drop",),
+    "filesize": ("drop",), "hashes": ("drop",), "sha256": ("drop",),
+    "autov2": ("drop",), "blake3": ("drop",), "crc32": ("drop",),
+    "author": ("drop",), "images": ("drop",), "previewimage": ("drop",),
+    "importedat": ("drop",), "updatedat": ("drop",),
+    "lastupdated": ("drop",),
+}
+FORMAT_FIELDS = {"a1111": A1111_FIELDS, "comfyui": COMFY_FIELDS,
+                 "stability_matrix": CM_FIELDS}
 
 EXAMPLES = """\
 examples:
@@ -902,44 +957,74 @@ def write_if_changed(args, path, obj, apply_mode, label):
     return "written"
 
 
-# --------------------------------------------- user-preference ingestion
+# ------------------------------- source-sidecar categorization + enrichment
 
-FORMAT_TABLES = {
-    "a1111": (A1111_MAP, A1111_STANDARD),
-    "comfyui": (COMFY_MAP, COMFY_STANDARD),
-    "stability_matrix": (CM_MAP, CM_STANDARD),
-}
+_EMPTY = (None, "", [], {})
 
 
-def _map_source(fmt, raw):
-    """Per-format extraction from a source sidecar. Returns
-    (mapped, unmatched): mapped = our canonical user fields; unmatched =
-    {key: value} for every source key that is neither mapped nor a known-
-    standard/bookkeeping field -- the discovery bucket, uniform for all
-    three formats. Key comparison is lowercased; original keys are kept in
-    the unmatched dict."""
-    table, standard = FORMAT_TABLES[fmt]
-    known = set(table) | standard
-    mapped, unmatched = {}, {}
-    for k, v in raw.items():
-        low = k.strip().lower()
-        field = table.get(low)
-        if field and v not in (None, "", [], {}):
-            mapped.setdefault(field, v)
-        elif low not in known:
-            unmatched[k] = v
-    return mapped, unmatched
+def _tokenize(value):
+    """A source list/comma-string -> trimmed non-empty token list."""
+    if isinstance(value, list):
+        toks = [str(t).strip() for t in value]
+    elif isinstance(value, str):
+        toks = [t.strip() for t in value.split(",")]
+    else:
+        return []
+    return [t for t in toks if t]
 
 
-def build_user_prefs(src):
-    """Ingest pre-existing SOURCE sidecars next to `src`: normalized user
-    fields plus an `unmatched` bucket of unrecognized fields keyed by
-    source filename. Returns (user_or_None, discoveries) where discoveries
-    is a list of (source_filename, [unmatched key names]) for the on-screen
-    note. user is None when neither normalized fields nor unmatched keys
-    exist (so .user.droste is never created empty)."""
+def _delta(tokens, civitai_values):
+    """User-distinct tokens: keep those NOT already in the CivitAI values
+    (case-insensitive), order-preserving, de-duplicated."""
+    have = {str(t).strip().lower() for t in (civitai_values or [])}
+    out = []
+    for t in tokens:
+        if t.lower() not in have and t not in out:
+            out.append(t)
+    return out
+
+
+def _civitai_tags(version):
+    tags = []
+    model = version.get("model") or {}
+    for src_tags in (version.get("tags"), model.get("tags")):
+        if isinstance(src_tags, list):
+            tags.extend(src_tags)
+    return tags
+
+
+def _base_family(s):
+    """Coarse base-model family token, for the enrich override contradiction
+    check (so 'SDXL' the sniff agrees with 'SDXL 1.0' the API, but 'FLUX.1'
+    disagrees with 'SD 1.5')."""
+    t = (s or "").lower()
+    if "flux" in t:
+        return "flux"
+    if "sd3" in t or "sd 3" in t or "stable diffusion 3" in t:
+        return "sd3"
+    if "xl" in t:
+        return "sdxl"
+    if "sd 2" in t or "sd2" in t or "2.0" in t or "2.1" in t:
+        return "sd2"
+    if "1.5" in t or "sd 1" in t or "sd1" in t:
+        return "sd1"
+    return t or None
+
+
+def categorize_sources(src, version):
+    """Read every source sidecar next to `src` and sort its fields by the
+    4-outcome policy (relative to the hash-proven CivitAI `version`).
+    Returns a dict: user (normalized fields), unmatched (per-file), discoveries
+    (for the screen note), meta_sub_type (fine only), enrich_scalars (blank-
+    fill candidates), enrich_images ([(url, nsfw_or_None)])."""
     stem = src.name[:src.name.rfind(".")] if "." in src.name else src.name
-    normalized, unmatched, discoveries = {}, {}, []
+    user, unmatched, discoveries = {}, {}, []
+    meta_sub_type = None
+    enrich_scalars = {}
+    enrich_alt = {}  # fallback enrich candidates (used only if primary absent)
+    enrich_images = []
+    model_name = ((version.get("model") or {}).get("name") or "").strip()
+
     for suffix, fmt in USER_SIDECAR_FORMATS.items():
         side = src.with_name(stem + suffix)
         if side == src or not side.is_file():
@@ -947,18 +1032,146 @@ def build_user_prefs(src):
         raw = _read_json(side)
         if raw is None:
             continue
-        mapped, extra = _map_source(fmt, raw)
-        for field, value in mapped.items():
-            normalized.setdefault(field, value)  # first source wins
+        table = FORMAT_FIELDS[fmt]
+        extra, img_urls, img_nsfw = {}, [], None
+        for k, v in raw.items():
+            disp = table.get(k.strip().lower())
+            if disp is None:
+                extra[k] = v
+                continue
+            tag = disp[0]
+            if tag == "drop":
+                continue
+            if tag == "user":
+                if v not in _EMPTY:
+                    user.setdefault(disp[1], v)
+            elif tag == "user_delta_trigger":
+                toks = _delta(_tokenize(v), version.get("trainedWords"))
+                if toks:
+                    user.setdefault("trigger_words", toks)
+            elif tag == "user_delta_tags":
+                toks = _delta(_tokenize(v), _civitai_tags(version))
+                if toks:
+                    user.setdefault("tags", toks)
+            elif tag == "user_title":
+                if isinstance(v, str) and v.strip() \
+                        and v.strip().lower() != model_name.lower():
+                    user.setdefault("title", v.strip())
+            elif tag == "user_inference":
+                if v not in _EMPTY:
+                    user.setdefault("inference_defaults", v)
+            elif tag == "enrich_scalar":
+                if v not in _EMPTY:
+                    enrich_scalars.setdefault(disp[1], v)
+            elif tag == "enrich_scalar_alt":
+                # a lower-priority enrich source (e.g. A1111 description);
+                # folded in AFTER the loop so a primary source always wins
+                if v not in _EMPTY:
+                    enrich_alt.setdefault(disp[1], v)
+            elif tag == "enrich_image_url":
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    if v not in img_urls:
+                        img_urls.append(v)
+            elif tag == "enrich_image_nsfw":
+                if img_nsfw is None and isinstance(v, int) \
+                        and not isinstance(v, bool):
+                    img_nsfw = v
+            elif tag == "meta_subtype":
+                if isinstance(v, str) and v.strip():
+                    if v.strip().lower() in COARSE_SUBTYPES:
+                        enrich_scalars.setdefault("model.type", v.strip())
+                    elif meta_sub_type is None:
+                        meta_sub_type = v.strip()
+        seen = {u for u, _ in enrich_images}
+        for u in img_urls:
+            if u not in seen:
+                enrich_images.append((u, img_nsfw))
+                seen.add(u)
         if extra:
             unmatched[side.name] = extra
             discoveries.append((side.name, sorted(extra)))
-    if not normalized and not unmatched:
-        return None, discoveries
-    user = dict(normalized)
-    if unmatched:
-        user["unmatched"] = unmatched
-    return user, discoveries
+
+    # comfy-first precedence: fallback candidates fill only where no primary
+    # enrich source supplied the scalar (order-independent).
+    for k, val in enrich_alt.items():
+        enrich_scalars.setdefault(k, val)
+
+    return {"user": user, "unmatched": unmatched, "discoveries": discoveries,
+            "meta_sub_type": meta_sub_type, "enrich_scalars": enrich_scalars,
+            "enrich_images": enrich_images}
+
+
+def incoming_user_prefs(cat):
+    """Assemble the incoming .user.droste dict (normalized fields + the
+    unmatched bucket) from a categorization, or None when empty."""
+    user = dict(cat["user"])
+    if cat["unmatched"]:
+        user["unmatched"] = cat["unmatched"]
+    return user or None
+
+
+def enrich_civitai_info(version, enrich_scalars, enrich_images, facts):
+    """Return a COPY of the live CivitAI response COMPLETED from local data:
+    blank scalars filled, local preview URLs unioned into images[], and
+    baseModel overridden by an absolute-confidence base-model sniff when it
+    contradicts CivitAI. When anything changed, embed the sole droste marker
+    extensions.droste.enriched={fields,images}. Byte-identical to `version`
+    when nothing was enriched. Never mutates `version`."""
+    info = json.loads(json.dumps(version))  # deep copy
+    facts = facts or {}
+    filled = []
+
+    def blank(x):
+        return x is None or x == "" or x == []
+
+    if "description" in enrich_scalars and blank(info.get("description")):
+        info["description"] = enrich_scalars["description"]
+        filled.append("description")
+    model = info.get("model")
+    if isinstance(model, dict):
+        if "model_name" in enrich_scalars and blank(model.get("name")):
+            model["name"] = enrich_scalars["model_name"]
+            filled.append("model.name")
+        if "model.type" in enrich_scalars and blank(model.get("type")):
+            model["type"] = enrich_scalars["model.type"]
+            filled.append("model.type")
+
+    civ_bm = info.get("baseModel")
+    sniff_bm = facts.get("base_model")
+    local_bm = enrich_scalars.get("base_model")
+    if sniff_bm and sniff_bm[1] == "absolute" and not blank(civ_bm) \
+            and _base_family(sniff_bm[0]) and _base_family(civ_bm) \
+            and _base_family(sniff_bm[0]) != _base_family(civ_bm):
+        info["baseModel"] = sniff_bm[0]        # good-reason override
+        filled.append("baseModel")
+    elif blank(civ_bm):
+        new_bm = local_bm or (sniff_bm[0] if sniff_bm else None)
+        if new_bm:
+            info["baseModel"] = new_bm
+            filled.append("baseModel")
+
+    images = info.get("images")
+    have_list = isinstance(images, list)
+    work = images if have_list else []
+    existing = {im.get("url") for im in work if isinstance(im, dict)}
+    added = []
+    for url, nsfw in enrich_images:
+        if url in existing:
+            continue
+        # nsfwLevel only when the source actually provided one; absent = an
+        # honest "unknown rating", not a default we don't know.
+        img = {"url": url} if nsfw is None else {"url": url, "nsfwLevel": nsfw}
+        work.append(img)
+        existing.add(url)
+        added.append(url)
+    if added and not have_list:
+        info["images"] = work
+
+    if filled or added:
+        ext = dict(info.get("extensions") or {})
+        ext["droste"] = {"enriched": {"fields": filled, "images": added}}
+        info["extensions"] = ext
+    return info
 
 
 def merge_user_prefs(ondisk, incoming):
@@ -1137,11 +1350,12 @@ def build_parser():
     return p
 
 
-def _meta_payload(version, plan, name):
+def _meta_payload(version, plan, name, meta_sub_type=None):
     """.meta.droste payload: our objective/tool block. Shareable -- no
     private data (adopted_from / original_name dropped). sha256/api_type/
     baseModel are also native CivitAI fields, but kept here as a self-
-    identifying anchor plus the sniff verdicts that are novel to us."""
+    identifying anchor plus the sniff verdicts (and any FINE sub_type) that
+    are novel to us."""
     model = version.get("model") or {}
     facts = {k: {"value": v[0], "confidence": v[1]}
              for k, v in (plan["facts"] or {}).items()}
@@ -1160,16 +1374,18 @@ def _meta_payload(version, plan, name):
         meta["upscaler_arch"] = plan["arch"]
     if "base_model" in (plan["facts"] or {}):
         meta["detected_base_model"] = plan["facts"]["base_model"][0]
+    if meta_sub_type:
+        meta["sub_type"] = meta_sub_type
     return meta
 
 
-def sync_sidecars(args, dest, version, meta, merged_user, apply_mode):
-    """Idempotent write-if-changed of all THREE sidecars. .civitai.info +
-    .meta.droste are tool/API-owned (regenerated); .user.droste is written
-    only when it holds data (the caller has already merged monotonically
-    and cleared any guard)."""
+def sync_sidecars(args, dest, info, meta, merged_user, apply_mode):
+    """Idempotent write-if-changed of all THREE sidecars. `info` is the
+    already-ENRICHED CivitAI response; .meta.droste is tool/API-owned; both
+    are regenerated. .user.droste is written only when it holds data (the
+    caller has already merged monotonically and cleared any guard)."""
     civ_p, meta_p, user_p = sidecar_paths(dest)
-    write_if_changed(args, civ_p, version, apply_mode, "civitai.info")
+    write_if_changed(args, civ_p, info, apply_mode, "civitai.info")
     write_if_changed(args, meta_p, meta, apply_mode, "meta.droste")
     if merged_user:
         write_if_changed(args, user_p, merged_user, apply_mode, "user.droste")
@@ -1216,11 +1432,16 @@ def adopt_group(args, cache, version, entries, scan_memo):
         dest = cache / rel / name
         _, _, user_p = sidecar_paths(dest)
 
+        # Sort the source-sidecar fields once (user / meta-subtype / enrich /
+        # drop / unmatched), relative to the hash-proven CivitAI version.
+        cat = categorize_sources(src, version)
+        discoveries = cat["discoveries"]
+
         # USER-DATA GUARD -- run BEFORE any placement/move/write. Compare
         # incoming ingested prefs against an on-disk .user.droste; a
         # conflicting field aborts this file's entire adoption unless
         # --force is given.
-        incoming_user, discoveries = build_user_prefs(src)
+        incoming_user = incoming_user_prefs(cat)
         merged_user, conflicts = merge_user_prefs(_read_json(user_p),
                                                   incoming_user)
         if conflicts and not args.force:
@@ -1233,7 +1454,9 @@ def adopt_group(args, cache, version, entries, scan_memo):
             for field, _old, new in conflicts:
                 merged_user[field] = new
 
-        meta = _meta_payload(version, p, name)
+        meta = _meta_payload(version, p, name, cat["meta_sub_type"])
+        info = enrich_civitai_info(version, cat["enrich_scalars"],
+                                   cat["enrich_images"], p["facts"])
         dest_exists = dest.exists()
         if dest_exists:
             d_sha, _ = memo_scan(dest, dest.stat().st_size, scan_memo, args)
@@ -1269,7 +1492,7 @@ def adopt_group(args, cache, version, entries, scan_memo):
                              f"{', '.join(keys)} — kept under 'unmatched'")
 
         # idempotent metadata sync -- both branches, write-only-if-changed
-        sync_sidecars(args, dest, version, meta, merged_user, apply_mode)
+        sync_sidecars(args, dest, info, meta, merged_user, apply_mode)
         prev = carry_preview(args, src, dest, apply_mode)
 
         if apply_mode and args.mode == "move" \
