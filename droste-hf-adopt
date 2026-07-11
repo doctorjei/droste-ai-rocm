@@ -18,14 +18,20 @@ blob sha1 (blobId). Each local candidate is hashed once (streamed, both
 digests in one pass) and matched. A match is adopted exactly the way
 `hf download` would have stored it:
 
-Without --repo each file goes through an IDENTIFY phase first: search
-terms derived from the filename (plus, for GGUF, any provenance embedded
-in the header) are fed to the HF model-search API, and each candidate
-repo's manifest is checked for a sibling whose published hash equals the
-local file's. Identification is therefore exactly as strict as --repo --
-a repo is only ever accepted on hash proof, never on name similarity.
-Files in one directory may identify to different repos; adoption then
-runs per identified repo. Unidentifiable files are refused.
+Without --repo each file goes through an IDENTIFY phase first: candidate
+repos are PROPOSED by several signals, tried in priority order -- a
+sibling transformers config.json carrying an absolute org/name
+_name_or_path, a curated ecosystem map of well-known aux-model filenames
+(ECOSYSTEM_MAP: ComfyUI text/vision encoders, detectors, ControlNets,
+annotators), any provenance embedded in a GGUF header, and finally
+search terms derived from the filename fed to the HF model-search API.
+Every candidate faces the same gate: the repo's manifest must publish
+the hash of the local file's actual bytes. Identification is therefore
+exactly as strict as --repo -- a repo is only ever accepted on hash
+proof, never on name similarity or hint say-so, so a stale or wrong
+hint can only fail to confirm and fall through. Files in one directory
+may identify to different repos; adoption then runs per identified
+repo. Unidentifiable files are refused.
 
     <cache>/models--<org>--<name>/
         blobs/<digest>                      content-addressed blob
@@ -69,8 +75,9 @@ examples:
       ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
   # Don't know (or trust) the repo? Omit --repo: each file is IDENTIFIED
-  # via the HF search API and adopted only if a repo's published hashes
-  # prove it contains this exact content:
+  # (sibling config.json, ecosystem map, GGUF provenance, HF search) and
+  # adopted only if a repo's published hashes prove it contains this
+  # exact content:
   droste-hf-adopt ~/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
   # Adopt a whole diffusers checkout (nested dirs need --recursive),
@@ -335,6 +342,128 @@ def valid_repo_id(s):
     return s if s.count("/") == 1 and all(s.split("/")) else None
 
 
+# A sibling config's _name_or_path only counts as a repo hint when it is
+# an ABSOLUTE org/name id. transformers writes relative paths like
+# "./image_encoder" (or a bare local dir) for local checkouts -- those
+# identify nothing and are ignored.
+CONFIG_NAME_OR_PATH_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+CONFIG_SIDECAR_MAX = 1 << 20  # a transformers config.json is a few KiB
+
+
+def config_repo_hints(f):
+    """Candidate signal 1: a sibling transformers config.json.
+
+    For a model file X.ext, real-world trees spell the sidecar several
+    ways: 'X..json' (double-dot quirk some managers write), 'X.ext.json',
+    'X.json', and the standard transformers layout's plain 'config.json'
+    next to the weights. A sidecar contributes a candidate only if it
+    parses as JSON with an absolute org/name `_name_or_path`; relative
+    paths ('./image_encoder') are ignored. Returns a deduped list of
+    (repo_id, sidecar_name) -- proposals only, the hash gate still rules.
+    """
+    stem = f.name[:f.name.rfind(".")] if "." in f.name else f.name
+    sidecars = (f.with_name(stem + "..json"),   # X..json (double-dot)
+                f.with_name(f.name + ".json"),  # X.<ext>.json
+                f.with_name(stem + ".json"),    # X.json
+                f.with_name("config.json"))     # transformers layout
+    out, seen = [], set()
+    for sc in sidecars:
+        if sc == f or not sc.is_file():
+            continue
+        try:
+            if sc.stat().st_size > CONFIG_SIDECAR_MAX:
+                continue
+            data = json.loads(sc.read_text())
+        except (OSError, ValueError):
+            continue
+        name = data.get("_name_or_path") if isinstance(data, dict) else None
+        if not isinstance(name, str) \
+                or not CONFIG_NAME_OR_PATH_RE.match(name) \
+                or any(p in (".", "..") for p in name.split("/")):
+            continue  # relative ('./image_encoder') or malformed
+        if name not in seen:
+            seen.add(name)
+            out.append((name, sc.name))
+    return out
+
+
+# Candidate signal 2: curated ecosystem map -- filename fingerprint ->
+# candidate HF repo(s), covering ubiquitous ComfyUI aux models that a
+# name-search cannot find (renamed/loose/component files). Entries are
+# ONLY proposals: adoption still requires the file's computed sha256 (or
+# git sha1) in the candidate's manifest, so a wrong or stale entry can
+# never place a file -- it just fails to confirm and falls through.
+# Extend freely; keep the provenance comment per entry.
+ECOSYSTEM_MAP = (
+    # (key, filename regex, candidate repos tried in order)
+
+    # Flux/SD3 text encoders: ComfyUI docs point clip_l / t5xxl_* here.
+    ("flux-text-encoders",
+     re.compile(r"(?i)^(clip_l|t5xxl)([._-]|$)"),
+     ("comfyanonymous/flux_text_encoders",)),
+    # IP-Adapter's CLIP-ViT-bigG/14 image encoder (SDXL flavour), lives
+    # under sdxl_models/image_encoder. Checked before ViT-H: bigG names
+    # can also carry H-ish tokens.
+    ("clip-vision-bigG",
+     re.compile(r"(?i)clip[-_.]?vi(t|sion).*(big[-_]?g|[-_]g([-_.]|$))"),
+     ("h94/IP-Adapter",)),
+    # IP-Adapter's CLIP-ViT-H/14 image encoder (LAION-2B;
+    # CLIPVisionModelWithProjection, hidden 1280), lives under
+    # models/image_encoder.
+    ("clip-vision-H",
+     re.compile(r"(?i)clip[-_.]?vi(t|sion).*[-_]h([-_.\d]|$)"),
+     ("h94/IP-Adapter",)),
+    # adetailer's face/hand/person YOLOv8/9/11 detectors (bbox + seg).
+    ("adetailer-yolo",
+     re.compile(r"(?i)(face|hand|person)[-_]?yolov?(8|9|11)"),
+     ("Bingsu/adetailer",)),
+    # Ultralytics base YOLO11 weights (yolo11n/s/m/l/x, -seg/-pose/...).
+    ("ultralytics-yolo11",
+     re.compile(r"(?i)^yolo11"),
+     ("Ultralytics/YOLO11",)),
+    # ControlNet v1.1 for SD1.5 (control_v11p_sd15_canny.pth etc.,
+    # including the f1/e/s2 variants).
+    ("controlnet-v1-1",
+     re.compile(r"(?i)^control_v11[a-z0-9]*_sd15"),
+     ("lllyasviel/ControlNet-v1-1",)),
+    # ControlNet-aux annotators. lllyasviel/Annotators aggregates most of
+    # them; specific upstreams added where known.
+    ("depth-anything",
+     re.compile(r"(?i)depth[-_]?anything"),
+     ("lllyasviel/Annotators", "LiheYoung/depth_anything")),
+    ("midas-dpt",
+     re.compile(r"(?i)(midas|(^|[._-])dpt[._-])"),
+     ("lllyasviel/Annotators", "Intel/dpt-hybrid-midas")),
+    ("zoe-depth",
+     re.compile(r"(?i)zoed(epth)?([._-]|$)"),  # ZoeD_M12_N.pt et al.
+     ("lllyasviel/Annotators",)),
+    ("openpose",
+     re.compile(r"(?i)(openpose|body_pose|hand_pose|facenet)"),
+     ("lllyasviel/Annotators",)),
+    ("pidinet",
+     re.compile(r"(?i)pidinet"),  # table5_pidinet.pth
+     ("lllyasviel/Annotators",)),
+    ("lineart",
+     re.compile(r"(?i)lineart"),
+     ("lllyasviel/Annotators",)),
+)
+
+
+def ecosystem_candidates(name):
+    """Candidate signal 2 lookup: ECOSYSTEM_MAP entries matching a
+    filename. Returns a deduped list of (repo_id, map_key) in map order
+    -- proposals only, the hash gate still rules."""
+    out, seen = [], set()
+    for key, rx, repos in ECOSYSTEM_MAP:
+        if not rx.search(name):
+            continue
+        for repo in repos:
+            if repo not in seen:
+                seen.add(repo)
+                out.append((repo, key))
+    return out
+
+
 def derive_term_sets(name):
     """Filename -> ladder of HF search queries, most specific first:
     the full stem, then quant/dtype tokens stripped, then the trailing
@@ -478,7 +607,11 @@ def get_manifest(args, repo, revision, token, manifests):
 
 def identify_file(args, f, size, token, manifests, searches, hash_memo):
     """IDENTIFY phase for one file (no --repo): find HF repos whose
-    published hashes prove they contain this exact content. Returns
+    published hashes prove they contain this exact content. Candidate
+    repos are proposed by several signals, tried in priority order --
+    sibling config `_name_or_path`, the curated ECOSYSTEM_MAP, an
+    embedded GGUF provenance hint, then the filename-search ladder --
+    all deduped and all facing the same hash gate. Returns
     (repo, note, alternatives) on success, (None, refusal_reason, [])
     otherwise."""
 
@@ -490,17 +623,47 @@ def identify_file(args, f, size, token, manifests, searches, hash_memo):
         sha256, git_sha1 = memo_hash(f, size, hash_memo, args)
         return sha256 in lfs_by_sha256 or git_sha1 in small_by_sha1
 
-    # GGUF provenance hint: an embedded source repo, once hash-proven,
-    # is definitive -- no search needed. A stale/wrong hint just falls
-    # through to the search path.
+    seen = set()  # every candidate proposed so far (dedup across signals)
+    tried = []    # candidates whose manifest we actually hash-checked
+
+    def proves(repo):
+        """Fetch one candidate's manifest and run the hash gate."""
+        if repo in seen:
+            return False  # already failed under a higher-priority signal
+        seen.add(repo)
+        progress(args, f"  checking {repo}...")
+        entry = get_manifest(args, repo, args.revision, token, manifests)
+        if entry is None:
+            return False  # manifest fetch failed -> next candidate
+        tried.append(repo)
+        return hash_matches(entry[1])
+
+    # Signal 1: sibling transformers config with an absolute
+    # _name_or_path -- the strongest local provenance we can have.
+    for repo, src in config_repo_hints(f):
+        log(args, 2, f"# {f.name}: config _name_or_path ({src}) -> {repo}")
+        if proves(repo):
+            return repo, (f"via config:_name_or_path ({src}); "
+                          f"{len(tried)} candidate(s) tried"), []
+
+    # Signal 2: curated ecosystem map (filename fingerprint).
+    for repo, key in ecosystem_candidates(f.name):
+        log(args, 2, f"# {f.name}: ecosystem map [{key}] -> {repo}")
+        if proves(repo):
+            return repo, (f"via ecosystem-map:{key}; "
+                          f"{len(tried)} candidate(s) tried"), []
+
+    # Signal 3: GGUF provenance hint: an embedded source repo, once
+    # hash-proven, is definitive -- no search needed. A stale/wrong hint
+    # just falls through to the search path.
     hint_repo, hint_name = gguf_repo_hint(f)
     if hint_repo:
         log(args, 2, f"# {f.name}: gguf hint -> {hint_repo}")
-        progress(args, f"  checking {hint_repo}...")
-        entry = get_manifest(args, hint_repo, args.revision, token, manifests)
-        if entry and hash_matches(entry[1]):
-            return hint_repo, "via gguf hint; 1 candidate tried", []
+        if proves(hint_repo):
+            return hint_repo, (f"via gguf hint; "
+                               f"{len(tried)} candidate(s) tried"), []
 
+    # Signal 4 (fallback): the filename-search ladder.
     term_sets = derive_term_sets(f.name)
     if hint_name and hint_name not in term_sets:
         term_sets.insert(0, hint_name)  # e.g. gguf general.name
@@ -526,23 +689,30 @@ def identify_file(args, f, size, token, manifests, searches, hash_memo):
     log(args, 2, f"# {f.name}: candidates: "
                  f"{', '.join(candidates) or '(none)'}")
 
-    tried = 0
     matches = []
     for repo in candidates:
+        if repo in seen:
+            continue  # already hash-checked under a higher-priority signal
+        seen.add(repo)
         progress(args, f"  checking {repo}...")
         entry = get_manifest(args, repo, args.revision, token, manifests)
         if entry is None:
             continue  # manifest fetch failed -> next candidate
-        tried += 1
+        tried.append(repo)
         if hash_matches(entry[1]):
             matches.append(repo)
     progress_clear()
     if not matches:
-        return None, (f"could not identify a HF repo containing this exact "
-                      f"content (tried {tried} repo(s)); pass --repo "
-                      f"explicitly or place it in /opt/models"), []
+        if tried:
+            return None, (f"no candidate repo's manifest contained this "
+                          f"file's sha256 (tried: {', '.join(tried)}); "
+                          f"pass --repo, or the file may have been "
+                          f"re-saved (hash drift)"), []
+        return None, ("no candidate repos found (config/ecosystem/search "
+                      "all came up empty); pass --repo explicitly or "
+                      "place it in /opt/models"), []
     matches.sort(key=lambda r: -downloads[r])  # stable: keeps search order
-    return (matches[0], f"via search; {tried} candidate(s) tried",
+    return (matches[0], f"via search; {len(tried)} candidate(s) tried",
             matches[1:])
 
 
@@ -660,15 +830,17 @@ def build_parser():
                     "HuggingFace hub cache -- no re-download. Only files "
                     "byte-identical to the repo's published content are "
                     "adopted; everything else is refused. Without --repo "
-                    "each file is first IDENTIFIED via the HF search API "
-                    "(still hash-proven, never name-guessed). DRY-RUN by "
-                    "default: pass --apply to actually change the cache.",
+                    "each file is first IDENTIFIED -- candidate repos come "
+                    "from a sibling config.json, a curated ecosystem map, "
+                    "GGUF provenance and HF search, accepted only on hash "
+                    "proof, never name-guessed. DRY-RUN by default: pass "
+                    "--apply to actually change the cache.",
         epilog=EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--repo", metavar="ORG/NAME",
                    help="HF repo id the files claim to belong to "
-                        "(omit to identify the repo per file via HF "
-                        "search + hash proof)")
+                        "(omit to identify the repo per file via local "
+                        "hints + HF search, always hash-proven)")
     p.add_argument("paths", nargs="+", metavar="PATH",
                    help="files to adopt, or a directory to scan")
     p.add_argument("--apply", action="store_true",

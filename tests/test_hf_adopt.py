@@ -13,7 +13,11 @@ never touches the search endpoint), identify single-candidate, multiple
 matching repos (downloads tiebreak), identify miss -> refusal, mixed-repo
 directory, search API error -> per-file refusal, candidate manifest
 error -> skip to next candidate, GGUF provenance hint short-circuiting
-the search, term derivation, and one-hash-per-file memoization.
+the search, term derivation, one-hash-per-file memoization, the sibling
+config.json signal (absolute _name_or_path only, stem-tolerant sidecar
+discovery), the curated ecosystem map (short-circuit, renamed-file
+placement at the manifest path, wrong hint falls through, hash gate
+always required), and the config > map > search priority order.
 
 Run:  python3 tests/test_hf_adopt.py -v
 """
@@ -219,9 +223,9 @@ class AdoptTest(unittest.TestCase):
                              [lfs_sibling("other.bin", b"different stuff")])
         rc, out, err = self.fx.run(str(f))
         self.assertEqual(rc, 1)
-        self.assertIn(f"REFUSE  {f}: could not identify a HF repo containing "
-                      f"this exact content (tried 1 repo(s)); pass --repo "
-                      f"explicitly or place it in /opt/models", out)
+        self.assertIn(f"REFUSE  {f}: no candidate repo's manifest contained "
+                      f"this file's sha256 (tried: acme/other); pass --repo, "
+                      f"or the file may have been re-saved (hash drift)", out)
         self.assertIn("0 adopted, 0 already cached, 1 refused", out)
 
     def test_identify_no_search_hits_refuses(self):
@@ -229,7 +233,7 @@ class AdoptTest(unittest.TestCase):
         self.fx.set_search([])  # every broadened query comes back empty
         rc, out, err = self.fx.run(str(f))
         self.assertEqual(rc, 1)
-        self.assertIn("tried 0 repo(s)", out)
+        self.assertIn("no candidate repos found", out)
 
     # ---------------------------------------------------- identify: directories
     def test_mixed_repo_directory(self):
@@ -294,7 +298,7 @@ class AdoptTest(unittest.TestCase):
         rc, out, err = self.fx.run(str(f))
         self.assertEqual(rc, 0, err)
         self.assertIn(f"-> acme/gguf-home @ {REV_A[:7]} "
-                      f"(via gguf hint; 1 candidate tried)", out)
+                      f"(via gguf hint; 1 candidate(s) tried)", out)
 
     def test_gguf_hint_wrong_falls_through_to_search(self):
         content = gguf_bytes(
@@ -327,6 +331,217 @@ class AdoptTest(unittest.TestCase):
         truncated.write_bytes(gguf_bytes(
             {"general.source.huggingface.repository": "a/b"})[:30])
         self.assertEqual(mod.gguf_repo_hint(truncated), (None, None))
+
+    # ------------------------------------------- identify: config sidecar signal
+    def test_config_sidecar_absolute_name_or_path_wins(self):
+        # no search.json: reaching the search endpoint would rc-2 die, so
+        # a pass proves the config signal short-circuited the ladder
+        content = b"image encoder weights"
+        f = self.fx.add_download("model.safetensors", content)
+        self.fx.add_download("config.json", json.dumps(
+            {"_name_or_path": "h94/IP-Adapter",
+             "architectures": ["CLIPVisionModelWithProjection"]}).encode())
+        self.fx.add_manifest("h94/IP-Adapter", [
+            lfs_sibling("models/image_encoder/model.safetensors", content)])
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-> h94/IP-Adapter @", out)
+        self.assertIn("via config:_name_or_path (config.json)", out)
+        self.assertIn("1 adopted", out)
+
+    def test_config_sidecar_relative_name_or_path_ignored(self):
+        # transformers writes './image_encoder' for local checkouts --
+        # that identifies nothing; the ladder falls through to search
+        content = b"local checkout weights"
+        f = self.fx.add_download("model.safetensors", content)
+        self.fx.add_download("config.json", json.dumps(
+            {"_name_or_path": "./image_encoder"}).encode())
+        self.fx.set_search([{"id": "real/home", "downloads": 1}])
+        self.fx.add_manifest("real/home",
+                             [lfs_sibling("model.safetensors", content)])
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-> real/home @", out)
+        self.assertIn("via search", out)
+        self.assertNotIn("config:_name_or_path", out)
+
+    def test_config_repo_hints_stem_tolerance(self):
+        # all real-world sidecar spellings attach, in priority order,
+        # deduped by repo id
+        d = self.fx.downloads
+        f = d / "encoder.safetensors"
+        f.write_bytes(b"w")
+        (d / "encoder..json").write_text(
+            json.dumps({"_name_or_path": "org/a"}))       # X..json
+        (d / "encoder.safetensors.json").write_text(
+            json.dumps({"_name_or_path": "org/b"}))       # X.<ext>.json
+        (d / "encoder.json").write_text(
+            json.dumps({"_name_or_path": "org/a"}))       # X.json (dup)
+        (d / "config.json").write_text(
+            json.dumps({"_name_or_path": "org/c"}))       # transformers
+        self.assertEqual(mod.config_repo_hints(f),
+                         [("org/a", "encoder..json"),
+                          ("org/b", "encoder.safetensors.json"),
+                          ("org/c", "config.json")])
+
+    def test_config_repo_hints_rejects_non_repo_values(self):
+        d = self.fx.downloads
+        f = d / "m.pth"
+        f.write_bytes(b"w")
+        for bad in ("./image_encoder", "/abs/path", "no-slash",
+                    "a/b/c", "../x", "", 42, None):
+            (d / "config.json").write_text(
+                json.dumps({"_name_or_path": bad}))
+            self.assertEqual(mod.config_repo_hints(f), [], repr(bad))
+        (d / "config.json").write_text("not json at all")
+        self.assertEqual(mod.config_repo_hints(f), [])
+        (d / "config.json").write_text(json.dumps(["a", "list"]))
+        self.assertEqual(mod.config_repo_hints(f), [])
+
+    # --------------------------------------------- identify: ecosystem map signal
+    def test_ecosystem_map_controlnet_short_circuits_search(self):
+        # no search.json: a pass proves the map signal short-circuited
+        content = b"controlnet canny weights"
+        f = self.fx.add_download("control_v11p_sd15_canny.pth", content)
+        self.fx.add_manifest(
+            "lllyasviel/ControlNet-v1-1",
+            [lfs_sibling("control_v11p_sd15_canny.pth", content)])
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-> lllyasviel/ControlNet-v1-1 @", out)
+        self.assertIn("via ecosystem-map:controlnet-v1-1", out)
+        self.assertIn("1 adopted", out)
+
+    def test_ecosystem_map_renamed_clip_vision_places_at_repo_path(self):
+        # the real-world case: a renamed IP-Adapter CLIP-ViT-H image
+        # encoder that name-search can't find; the map proposes the repo,
+        # the hash proves it, placement follows the manifest's relative
+        # filename -- transparent to the rename, no --repo needed
+        content = b"ViT-H image encoder bytes"
+        f = self.fx.add_download("LAION_CLIP_ViT-H-14.safetensors", content)
+        self.fx.add_manifest("h94/IP-Adapter", [
+            lfs_sibling("models/image_encoder/model.safetensors", content)])
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("via ecosystem-map:clip-vision-H", out)
+        self.assertIn("-> models/image_encoder/model.safetensors", out)
+        blob = self.fx.blob("h94/IP-Adapter", content)
+        self.assertEqual(blob.read_bytes(), content)
+        link = (self.fx.cache / "models--h94--IP-Adapter" / "snapshots"
+                / REV_A / "models" / "image_encoder" / "model.safetensors")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), blob.resolve())
+
+    def test_ecosystem_map_clip_l_flux_text_encoders(self):
+        content = b"clip_l text encoder"
+        f = self.fx.add_download("clip_l.safetensors", content)
+        self.fx.add_manifest("comfyanonymous/flux_text_encoders",
+                             [lfs_sibling("clip_l.safetensors", content)])
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-> comfyanonymous/flux_text_encoders @", out)
+        self.assertIn("via ecosystem-map:flux-text-encoders", out)
+
+    def test_ecosystem_map_wrong_hint_falls_through_to_search(self):
+        # the map repo's manifest does NOT publish this sha256 -> the
+        # gate refuses it and identify falls through to search; a wrong
+        # hint can never cause a wrong adoption. Search returning the
+        # already-failed repo again also proves cross-signal dedup: the
+        # candidate count stays at 2.
+        content = b"a different clip_l variant"
+        f = self.fx.add_download("clip_l.safetensors", content)
+        self.fx.add_manifest(
+            "comfyanonymous/flux_text_encoders",
+            [lfs_sibling("clip_l.safetensors", b"other bytes entirely")])
+        self.fx.set_search(
+            [{"id": "comfyanonymous/flux_text_encoders", "downloads": 999},
+             {"id": "someone/finetune", "downloads": 2}])
+        self.fx.add_manifest("someone/finetune",
+                             [lfs_sibling("clip_l.safetensors", content)])
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("-> someone/finetune @", out)
+        self.assertIn("via search; 2 candidate(s) tried", out)
+        # nothing was ever staged for the wrongly-hinted repo
+        self.assertFalse(
+            (self.fx.cache
+             / "models--comfyanonymous--flux_text_encoders").exists())
+
+    def test_ecosystem_map_hint_never_adopts_without_hash_proof(self):
+        # map hit + repo reachable, but the manifest lacks this sha256
+        # and search finds nothing else -> REFUSE listing the candidates
+        # tried and advising --repo / hash drift
+        content = b"not actually published anywhere"
+        f = self.fx.add_download("control_v11p_sd15_canny.pth", content)
+        self.fx.add_manifest(
+            "lllyasviel/ControlNet-v1-1",
+            [lfs_sibling("control_v11p_sd15_canny.pth", b"the real one")])
+        self.fx.set_search([])
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 1)
+        self.assertIn("REFUSE", out)
+        self.assertIn("tried: lllyasviel/ControlNet-v1-1", out)
+        self.assertIn("--repo", out)
+        self.assertIn("hash drift", out)
+        self.assertIn("0 adopted, 0 already cached, 1 refused", out)
+
+    # ------------------------------------------------- identify: signal priority
+    def test_priority_config_beats_ecosystem_map(self):
+        # both signals propose repos whose manifests contain the sha; the
+        # sibling config (here the X..json double-dot spelling) must win
+        # and be reported as the source
+        content = b"weights present in both repos"
+        f = self.fx.add_download("control_v11p_sd15_canny.pth", content)
+        self.fx.add_download("control_v11p_sd15_canny..json", json.dumps(
+            {"_name_or_path": "mirror/controlnet-repack"}).encode())
+        sib = [lfs_sibling("control_v11p_sd15_canny.pth", content)]
+        self.fx.add_manifest("mirror/controlnet-repack", sib, sha=REV_B)
+        self.fx.add_manifest("lllyasviel/ControlNet-v1-1", sib, sha=REV_A)
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"-> mirror/controlnet-repack @ {REV_B[:7]}", out)
+        self.assertIn("via config:_name_or_path "
+                      "(control_v11p_sd15_canny..json)", out)
+
+    def test_priority_ecosystem_map_beats_search(self):
+        # a search hit with sky-high downloads also contains the sha, but
+        # the map candidate is tried (and wins) first
+        content = b"canny weights"
+        f = self.fx.add_download("control_v11p_sd15_canny.pth", content)
+        sib = [lfs_sibling("control_v11p_sd15_canny.pth", content)]
+        self.fx.add_manifest("lllyasviel/ControlNet-v1-1", sib, sha=REV_A)
+        self.fx.set_search([{"id": "mirror/hoard", "downloads": 99999}])
+        self.fx.add_manifest("mirror/hoard", sib, sha=REV_B)
+        rc, out, err = self.fx.run(str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"-> lllyasviel/ControlNet-v1-1 @ {REV_A[:7]}", out)
+        self.assertIn("via ecosystem-map:controlnet-v1-1", out)
+
+    # ------------------------------------------------- unit: ecosystem map table
+    def test_ecosystem_candidates_unit(self):
+        ec = mod.ecosystem_candidates
+        self.assertEqual(ec("clip_l.safetensors"),
+                         [("comfyanonymous/flux_text_encoders",
+                           "flux-text-encoders")])
+        self.assertEqual(ec("t5xxl_fp8_e4m3fn.safetensors"),
+                         [("comfyanonymous/flux_text_encoders",
+                           "flux-text-encoders")])
+        self.assertEqual(ec("LAION_CLIP_ViT-H-14.safetensors"),
+                         [("h94/IP-Adapter", "clip-vision-H")])
+        self.assertEqual(ec("CLIP-ViT-bigG-14-laion2B-39B-b160k.safetensors"),
+                         [("h94/IP-Adapter", "clip-vision-bigG")])
+        self.assertEqual(ec("face_yolov8m.pt"),
+                         [("Bingsu/adetailer", "adetailer-yolo")])
+        self.assertEqual(ec("control_v11f1e_sd15_tile.pth"),
+                         [("lllyasviel/ControlNet-v1-1", "controlnet-v1-1")])
+        self.assertEqual(ec("depth_anything_vitl14.pth"),
+                         [("lllyasviel/Annotators", "depth-anything"),
+                          ("LiheYoung/depth_anything", "depth-anything")])
+        self.assertEqual(ec("ZoeD_M12_N.pt"),
+                         [("lllyasviel/Annotators", "zoe-depth")])
+        # no fingerprint -> no proposals; identify falls through to search
+        self.assertEqual(ec("qwen2.5-0.5b-instruct-q4_k_m.gguf"), [])
+        self.assertEqual(ec("model.safetensors"), [])
 
     # -------------------------------------------------------- unit: term ladder
     def test_derive_term_sets(self):
