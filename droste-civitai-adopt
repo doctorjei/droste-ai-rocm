@@ -25,32 +25,54 @@ fine-grained directory (one per distinct kind, created on demand):
     <cache>/models/<TypeDir>/<Model_Version.ext>    (Checkpoint, LoRA, ...)
     <cache>/embeddings/<Model_Version.ext>          (TextualInversion)
     <cache>/other/<Type>/<Model_Version.ext>        (unknown/future types)
-    ... plus <Model_Version>.civitai.info           metadata sidecar
-    ... plus <Model_Version>.preview.<ext>           carried from the source
+    ... plus THREE sidecars (see below) + <Model_Version>.preview.<ext>
 
 Filenames are NORMALIZED to <model.name>_<version.name> + original ext
 (sanitized), so the cache is consistent regardless of the uploader's
-filename; the sidecar retains the original name and all IDs. An absolute
-content sniff that disagrees with the API's declared type wins the routing
-(e.g. a mislabelled T2I-adapter lands in T2IAdapter/, not ControlNet/); an
-uncertain sniff keeps the API type. Sniffing NEVER overrides the hash-
-proven identity -- only the placement category -- and every decision is
-recorded in the sidecar's extensions.droste.
+filename. An absolute content sniff that disagrees with the API's declared
+type wins the routing (e.g. a mislabelled T2I-adapter lands in T2IAdapter/,
+not ControlNet/); an uncertain sniff keeps the API type. Sniffing NEVER
+overrides the hash-proven identity -- only the placement category.
+
+THREE-FILE METADATA SCHEME (namespace suffix LAST so the terminal
+extension is the unique '.droste'):
+  1. <Model_Version>.civitai.info -- PURE CivitAI API response (shareable,
+     community-standard; nothing of ours injected).
+  2. <Model_Version>.meta.droste  -- our objective block: sha256,
+     normalized_name, IDs, api_type/resolved_type, routing, sniff verdicts,
+     upscaler_arch, detected_base_model.
+  3. <Model_Version>.user.droste  -- user preferences ingested from any
+     pre-existing SOURCE sidecars (.json/.metadata.json/.cm-info.json):
+     notes/preferred_weight/trigger_words/usage_tips/tags/favorite plus an
+     'unmatched' bucket capturing every source field that is neither
+     mapped nor known-standard (so unrecognized/bespoke fields are never
+     lost, and recurring ones get surfaced on screen for later promotion
+     to explicit maps). Written ONLY when such data exists; never empty.
+
+Every adopt (new placement AND already-cached) runs an idempotent SYNC:
+each sidecar is recomputed, canonically serialized, and written ONLY if it
+differs from disk -- so re-pointing the tool at a cached model refreshes
+its metadata (richer API, a source sidecar that appeared, a better sniff)
+or no-ops. The .civitai.info and .meta.droste files are tool/API-owned and
+regenerated; .user.droste is MONOTONIC (never drops preserved data). If an
+incoming user field conflicts with one already on disk, the file's ENTIRE
+adoption is refused (no placement, move, or writes) with a side-by-side
+diff unless you pass --force.
 
 Files the API does not know by hash fall back to metadata sidecars next
-to the SOURCE file (.civitai.info / .cm-info.json / .metadata.json /
-.json): a model-version id found there is fetched and accepted ONLY if
-our sha256 appears in that version's file list. --version-id N is the
-manual escape hatch with the same sha256-must-appear gate.
+to the SOURCE file: a model-version id found there is fetched and accepted
+ONLY if our sha256 appears in that version's file list. --version-id N is
+the manual escape hatch with the same sha256-must-appear gate.
 
 CAVEAT: CivitAI never hashed some very old uploads; those 404 by hash
 even though they are genuine. The sidecar fallback and --version-id
 cover them.
 
 Placements are staged as .tmp-* and renamed into place, so there is never
-partial state; existing files are never overwritten (identical content
-counts as already cached, different content is refused); source files are
-never deleted except under --move, and only after successful placement.
+partial state; existing model files are never overwritten (identical
+content counts as already cached, different content is refused); source
+files are never deleted except under --move, and only after successful
+placement.
 
 DEFAULT IS DRY-RUN: nothing is touched until you pass --apply.
 """
@@ -130,6 +152,49 @@ SIDECAR_SUFFIXES = (".civitai.info", ".cm-info.json", ".metadata.json",
                     ".json")
 PREVIEW_SUFFIXES = (".preview.png", ".preview.jpg", ".preview.jpeg",
                     ".png", ".jpg", ".jpeg")
+# our own sidecar outputs (never candidates when scanning a cache dir)
+DROSTE_SIDECAR_SUFFIXES = (".meta.droste", ".user.droste")
+
+TOOL_ID = "droste-civitai-adopt/0.3"
+
+# ----- user-preference ingestion (source sidecars -> .user.droste) -----
+# The normalized user-preference fields the guard protects and the sync
+# monotonically preserves. An `unmatched` bucket rides alongside for every
+# source field that is neither MAPped nor known-STANDARD (uniformly across
+# all three formats): keys neither we nor CivitAI already account for.
+USER_PREF_FIELDS = ("notes", "preferred_weight", "trigger_words",
+                    "usage_tips", "tags", "favorite")
+# suffix -> source format, for the per-format extraction below
+USER_SIDECAR_FORMATS = {
+    ".json": "a1111",             # AUTOMATIC1111 flat sidecar
+    ".metadata.json": "comfyui",  # ComfyUI Lora-Manager nested sidecar
+    ".cm-info.json": "stability_matrix",
+}
+# Per format: <fmt>_MAP keys -> our normalized field; <fmt>_STANDARD =
+# CivitAI-standard / bookkeeping keys to skip; anything in neither set is
+# "unmatched" and preserved + surfaced. All key comparisons are lowercased.
+A1111_MAP = {"activation text": "trigger_words",
+             "preferred weight": "preferred_weight",
+             "notes": "notes"}
+A1111_STANDARD = {"description", "sd version", "sd_version"}
+# ComfyUI nested: `civitai` = embedded standard dump, `preview` = image.
+COMFY_MAP = {"notes": "notes", "usage_tips": "usage_tips",
+             "tags": "tags", "favorite": "favorite"}
+COMFY_STANDARD = {"civitai", "preview"}
+# Stability Matrix .cm-info.json is a typed mirror of the CivitAI record.
+CM_MAP = {"notes": "notes", "favorite": "favorite",
+          "isfavorite": "favorite", "usagetips": "usage_tips"}
+# The cm-info fields that are standard CivitAI mirror / local bookkeeping
+# (model & version identity, base model, tags, hashes, file size, connected
+# ids, preview refs, timestamps). Anything else is treated as unmatched.
+CM_STANDARD = {
+    "modelname", "modeltype", "modeldescription", "modelurl",
+    "modelid", "versionid", "versionname", "versiondescription",
+    "basemodel", "trainedwords", "tags", "nsfw", "nsfwlevel",
+    "filename", "filemetadata", "filesize", "hashes", "sha256",
+    "autov2", "blake3", "crc32", "author", "images", "previewimage",
+    "importedat", "updatedat", "lastupdated",
+}
 
 EXAMPLES = """\
 examples:
@@ -149,9 +214,10 @@ examples:
   droste-civitai-adopt --apply --version-id 128713 ~/old/dreamshaper.ckpt
 
 Only files whose sha256 the CivitAI API can prove are adopted; everything
-else is refused with a reason. Content is sniffed (safetensors header /
-restricted-unpickler key recovery) during the hash pass to route by the
-real network kind, recorded in the .civitai.info sidecar.
+else is refused with a reason. Each model gets three sidecars -- a pure
+.civitai.info, our .meta.droste (routing + sniff verdicts), and a
+.user.droste built from any pre-existing source sidecars -- kept in sync
+idempotently on every run (use --force to overwrite conflicting user data).
 """
 
 
@@ -219,7 +285,7 @@ def api_request(args, url, token, payload=None):
     fatality."""
     body = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=body, headers={
-        "User-Agent": "droste-civitai-adopt/0.2",
+        "User-Agent": TOOL_ID,
         **({"Content-Type": "application/json"} if body else {}),
         **({"Authorization": f"Bearer {token}"} if token else {}),
     })
@@ -788,29 +854,163 @@ def place_file(args, src, dest, mode):
     return verb
 
 
-def write_sidecar(args, dest, version, extra, apply_mode):
-    """Write <placed-stem>.civitai.info: the raw model-version response
-    (Civitai Helper convention) plus our provenance + routing/sniff record
-    under extensions.droste, so naive consumers still parse it. An existing
-    sidecar is left alone -- conservative, never clobbered."""
-    side = dest.with_name(dest.stem + ".civitai.info")
-    if side.exists():
-        log(args, 1, f"        sidecar exists; leaving it ({side.name})")
-        return
-    if not apply_mode:
-        log(args, 2, f"# would write sidecar {side}")
-        return
-    info = dict(version)
-    ext = dict(info.get("extensions") or {})
-    ext["droste"] = {"tool": "droste-civitai-adopt/0.2", **extra}
-    info["extensions"] = ext
-    tmp = side.parent / f".tmp-{side.name}-{os.getpid()}"
+def sidecar_paths(dest):
+    """(civitai.info, meta.droste, user.droste) for a placed model file.
+    Namespace suffix LAST so the terminal extension is the unique .droste."""
+    stem = dest.stem
+    return (dest.with_name(stem + ".civitai.info"),
+            dest.with_name(stem + ".meta.droste"),
+            dest.with_name(stem + ".user.droste"))
+
+
+def _canon(obj):
+    """Canonical JSON: sorted keys, stable indent -- the serialization the
+    idempotent sync compares against disk (identical inputs -> byte-
+    identical output -> no rewrite)."""
+    return json.dumps(obj, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+def _read_json(path):
     try:
-        tmp.write_text(json.dumps(info, indent=2) + "\n")
-        os.rename(tmp, side)
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_if_changed(args, path, obj, apply_mode, label):
+    """Write canon(obj) to path only if it differs from what's there
+    (no needless rewrite / mtime churn). Returns the action taken."""
+    text = _canon(obj)
+    try:
+        if path.read_text() == text:
+            return "unchanged"
+    except OSError:
+        pass
+    if not apply_mode:
+        log(args, 2, f"# would sync {label}: {path.name}")
+        return "would-write"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".tmp-{path.name}-{os.getpid()}"
+    try:
+        tmp.write_text(text)
+        os.rename(tmp, path)  # same dir -> atomic
     finally:
         tmp.unlink(missing_ok=True)
-    log(args, 2, f"# sidecar written: {side}")
+    log(args, 2, f"# synced {label}: {path.name}")
+    return "written"
+
+
+# --------------------------------------------- user-preference ingestion
+
+FORMAT_TABLES = {
+    "a1111": (A1111_MAP, A1111_STANDARD),
+    "comfyui": (COMFY_MAP, COMFY_STANDARD),
+    "stability_matrix": (CM_MAP, CM_STANDARD),
+}
+
+
+def _map_source(fmt, raw):
+    """Per-format extraction from a source sidecar. Returns
+    (mapped, unmatched): mapped = our canonical user fields; unmatched =
+    {key: value} for every source key that is neither mapped nor a known-
+    standard/bookkeeping field -- the discovery bucket, uniform for all
+    three formats. Key comparison is lowercased; original keys are kept in
+    the unmatched dict."""
+    table, standard = FORMAT_TABLES[fmt]
+    known = set(table) | standard
+    mapped, unmatched = {}, {}
+    for k, v in raw.items():
+        low = k.strip().lower()
+        field = table.get(low)
+        if field and v not in (None, "", [], {}):
+            mapped.setdefault(field, v)
+        elif low not in known:
+            unmatched[k] = v
+    return mapped, unmatched
+
+
+def build_user_prefs(src):
+    """Ingest pre-existing SOURCE sidecars next to `src`: normalized user
+    fields plus an `unmatched` bucket of unrecognized fields keyed by
+    source filename. Returns (user_or_None, discoveries) where discoveries
+    is a list of (source_filename, [unmatched key names]) for the on-screen
+    note. user is None when neither normalized fields nor unmatched keys
+    exist (so .user.droste is never created empty)."""
+    stem = src.name[:src.name.rfind(".")] if "." in src.name else src.name
+    normalized, unmatched, discoveries = {}, {}, []
+    for suffix, fmt in USER_SIDECAR_FORMATS.items():
+        side = src.with_name(stem + suffix)
+        if side == src or not side.is_file():
+            continue
+        raw = _read_json(side)
+        if raw is None:
+            continue
+        mapped, extra = _map_source(fmt, raw)
+        for field, value in mapped.items():
+            normalized.setdefault(field, value)  # first source wins
+        if extra:
+            unmatched[side.name] = extra
+            discoveries.append((side.name, sorted(extra)))
+    if not normalized and not unmatched:
+        return None, discoveries
+    user = dict(normalized)
+    if unmatched:
+        user["unmatched"] = unmatched
+    return user, discoveries
+
+
+def merge_user_prefs(ondisk, incoming):
+    """Monotonic merge of an incoming user-prefs dict onto what's on disk:
+    never drop existing data; add new fields; deep-union the `unmatched`
+    bucket (retain entries whose source later vanished, refresh changed
+    values, add new). Returns (merged, conflicts) where conflicts =
+    [(field, old, new)] for normalized fields whose value would change."""
+    merged = json.loads(json.dumps(ondisk)) if ondisk else {}
+    incoming = incoming or {}
+    conflicts = []
+    for field in USER_PREF_FIELDS:
+        if field not in incoming:
+            continue
+        new = incoming[field]
+        if field not in merged:
+            merged[field] = new           # add: not a conflict
+        elif merged[field] != new:
+            conflicts.append((field, merged[field], new))  # differs: guard
+        # equal -> no-op
+    inc_unmatched = incoming.get("unmatched") or {}
+    if inc_unmatched:
+        munm = dict(merged.get("unmatched") or {})
+        for name, extra in inc_unmatched.items():
+            if isinstance(munm.get(name), dict) and isinstance(extra, dict):
+                union = dict(munm[name])
+                union.update(extra)       # refresh, never drop old keys
+                munm[name] = union
+            else:
+                munm[name] = extra
+        merged["unmatched"] = munm
+    return merged, conflicts
+
+
+def _fmt_value(v):
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
+def print_user_conflict(user_path, conflicts):
+    """The exact guard message: a side-by-side old/new diff of the
+    conflicting user fields. Printed to stderr (an error), independent of
+    verbosity."""
+    progress_clear()
+    width = max(len(f) for f, _, _ in conflicts)
+    lines = [f"Error: sheepishly refusing to overwrite existing user data "
+             f"in {user_path}.", ""]
+    for field, old, new in conflicts:
+        lines.append(f"  {field.ljust(width)}     "
+                     f"old: {_fmt_value(old)}     new: {_fmt_value(new)}")
+    lines.append("")
+    lines.append("If you are sure you want to overwrite this data, add the "
+                 "--force flag to ignore this error.")
+    print("\n".join(lines), file=sys.stderr)
 
 
 def carry_preview(args, src, dest, apply_mode):
@@ -843,9 +1043,10 @@ def gather_files(args, paths):
     """Expand CLI paths: files as-is; dirs scanned (non-recursive unless
     --recursive). Metadata sidecars and preview images are companions of
     the models next to them, never candidates themselves."""
-    # metadata sidecars (minus plain .json -- let hashing decide those)
-    # and every image form: images are never model files
-    companion = SIDECAR_SUFFIXES[:-1] + PREVIEW_SUFFIXES
+    # metadata sidecars (minus plain .json -- let hashing decide those),
+    # our own .droste outputs, and every image form: none are model files
+    companion = (SIDECAR_SUFFIXES[:-1] + DROSTE_SIDECAR_SUFFIXES
+                 + PREVIEW_SUFFIXES)
 
     def is_companion(name):
         return name.lower().endswith(companion)
@@ -914,6 +1115,13 @@ def build_parser():
                       help="move into the cache (source removed only "
                            "after successful placement)")
     p.set_defaults(mode="link")
+    p.add_argument("--force", action="store_true",
+                   help="DANGEROUS -- I understand the consequences: "
+                        "overwrite conflicting user data in a "
+                        ".user.droste sidecar. Overrides ONLY that guard; "
+                        "does NOT imply --apply and does NOT bypass the "
+                        "hash identity gate or the different-content "
+                        "model-file refusal")
     p.add_argument("--recursive", action="store_true",
                    help="recurse into directories")
     p.add_argument("--cache", metavar="DIR",
@@ -926,16 +1134,17 @@ def build_parser():
     return p
 
 
-def _sidecar_extra(version, plan, name):
-    """extensions.droste payload: provenance + normalization + routing +
-    the full sniff record (each fact as {value, confidence})."""
+def _meta_payload(version, plan, name):
+    """.meta.droste payload: our objective/tool block. Shareable -- no
+    private data (adopted_from / original_name dropped). sha256/api_type/
+    baseModel are also native CivitAI fields, but kept here as a self-
+    identifying anchor plus the sniff verdicts that are novel to us."""
     model = version.get("model") or {}
     facts = {k: {"value": v[0], "confidence": v[1]}
              for k, v in (plan["facts"] or {}).items()}
-    extra = {
+    meta = {
+        "tool": TOOL_ID,
         "sha256": plan["sha"],
-        "adopted_from": str(plan["src"]),
-        "original_name": plan["fentry"].get("name"),
         "normalized_name": name,
         "modelId": version.get("modelId") or model.get("id"),
         "modelVersionId": version.get("id"),
@@ -945,10 +1154,22 @@ def _sidecar_extra(version, plan, name):
         "sniff": facts,
     }
     if plan["arch"]:
-        extra["upscaler_arch"] = plan["arch"]
+        meta["upscaler_arch"] = plan["arch"]
     if "base_model" in (plan["facts"] or {}):
-        extra["sniffed_base_model"] = plan["facts"]["base_model"][0]
-    return extra
+        meta["detected_base_model"] = plan["facts"]["base_model"][0]
+    return meta
+
+
+def sync_sidecars(args, dest, version, meta, merged_user, apply_mode):
+    """Idempotent write-if-changed of all THREE sidecars. .civitai.info +
+    .meta.droste are tool/API-owned (regenerated); .user.droste is written
+    only when it holds data (the caller has already merged monotonically
+    and cleared any guard)."""
+    civ_p, meta_p, user_p = sidecar_paths(dest)
+    write_if_changed(args, civ_p, version, apply_mode, "civitai.info")
+    write_if_changed(args, meta_p, meta, apply_mode, "meta.droste")
+    if merged_user:
+        write_if_changed(args, user_p, merged_user, apply_mode, "user.droste")
 
 
 def adopt_group(args, cache, version, entries, scan_memo):
@@ -989,9 +1210,28 @@ def adopt_group(args, cache, version, entries, scan_memo):
             refused += 1
             continue
         dest = cache / rel / name
-        extra = _sidecar_extra(version, p, name)
+        _, _, user_p = sidecar_paths(dest)
 
-        if dest.exists():
+        # USER-DATA GUARD -- run BEFORE any placement/move/write. Compare
+        # incoming ingested prefs against an on-disk .user.droste; a
+        # conflicting field aborts this file's entire adoption unless
+        # --force is given.
+        incoming_user, discoveries = build_user_prefs(src)
+        merged_user, conflicts = merge_user_prefs(_read_json(user_p),
+                                                  incoming_user)
+        if conflicts and not args.force:
+            print_user_conflict(user_p, conflicts)
+            log(args, 0, f"REFUSE  {shown}: existing user data in "
+                         f"{user_p.name} would be overwritten; pass --force")
+            refused += 1
+            continue
+        if conflicts:  # --force: overwrite the conflicting fields
+            for field, _old, new in conflicts:
+                merged_user[field] = new
+
+        meta = _meta_payload(version, p, name)
+        dest_exists = dest.exists()
+        if dest_exists:
             d_sha, _ = memo_scan(dest, dest.stat().st_size, scan_memo, args)
             if d_sha != sha:
                 log(args, 0, f"REFUSE  {shown}: {rel}/{name} exists with "
@@ -1001,33 +1241,38 @@ def adopt_group(args, cache, version, entries, scan_memo):
             log(args, 1, f"ALREADY {shown}")
             log(args, 1, f"        == {rel}/{name} (same content already "
                          f"in cache)")
-            write_sidecar(args, dest, version, extra, apply_mode)
-            carry_preview(args, src, dest, apply_mode)
-            already += 1
-            if apply_mode and args.mode == "move" \
-                    and src.resolve() != dest.resolve():
-                src.unlink()
-                log(args, 1, "        source removed (--move)")
-            continue
-
-        if apply_mode:
-            verb = place_file(args, src, dest, args.mode)
         else:
-            verb = {"link": "would hardlink", "copy": "would copy",
-                    "move": "would move"}[args.mode]
-        note = f" via {p['routing']}" \
-            if p["routing"].startswith("sniff-override") else ""
-        log(args, 0, f"ADOPT   {shown}")
-        log(args, 0, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
-                     f"[{verb}]{note}")
-        write_sidecar(args, dest, version, extra, apply_mode)
+            if apply_mode:
+                verb = place_file(args, src, dest, args.mode)
+            else:
+                verb = {"link": "would hardlink", "copy": "would copy",
+                        "move": "would move"}[args.mode]
+            note = f" via {p['routing']}" \
+                if p["routing"].startswith("sniff-override") else ""
+            log(args, 0, f"ADOPT   {shown}")
+            log(args, 0, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
+                         f"[{verb}]{note}")
+
+        # discovery signal: unrecognized source fields kept under 'unmatched'
+        for fname, keys in discoveries:
+            log(args, 1, f"note: unrecognized field(s) in {fname}: "
+                         f"{', '.join(keys)} — kept under 'unmatched'")
+
+        # idempotent metadata sync -- both branches, write-only-if-changed
+        sync_sidecars(args, dest, version, meta, merged_user, apply_mode)
         prev = carry_preview(args, src, dest, apply_mode)
-        if apply_mode and args.mode == "move":
+
+        if apply_mode and args.mode == "move" \
+                and src.resolve() != dest.resolve():
             src.unlink()
             if prev is not None:
                 prev.unlink()  # carried successfully -> reclaim it too
             log(args, 1, "        source removed (--move)")
-        adopted += 1
+
+        if dest_exists:
+            already += 1
+        else:
+            adopted += 1
     return adopted, already, refused
 
 

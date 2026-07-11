@@ -7,16 +7,15 @@ hook -- NO live network. A fixture dir stands in for the CivitAI API:
                       simulates a network failure.
 - version-<id>.json   GET /model-versions/<id> (missing file = 404).
 
-Covers the taxonomy/naming rework: fine-grained type dirs (LyCORIS/DoRA/
-motion_modules/aesthetic/detection/poses/wildcards/workflows/other),
-content sniff (CN-vs-T2I safetensors, upscaler-arch split incl. unknown
-catch-all, base model), the restricted (execution-free) unpickler +
-malicious-pickle safety, sniff-vs-API routing (absolute overrides,
-uncertain keeps API), Model_Version normalization incl. unicode/unsafe
-sanitize, multi-file same-dir disambiguation, sidecar records
-api_type+sniff+winner -- plus the retained behaviors (identity gate,
-never-clobber, --version-id, preview carry, network-error refusal,
-progress helpers).
+Covers the taxonomy/sniff rework AND the three-file sidecar scheme
+(TWEAK 2): pure .civitai.info, objective .meta.droste, ingested
+.user.droste; per-format preference extraction; the `unmatched`
+discovery bucket (+ on-screen note) across all three source formats;
+monotonic merge; idempotent write-if-changed sync (incl. the ALREADY
+branch); the user-data overwrite guard + --force -- plus the retained
+behaviors (identity gate, taxonomy dirs, sniff routing, normalization,
+never-clobber model file, --version-id, preview carry, network-error
+refusal, progress helpers, restricted unpickler).
 
 Run:  python3 tests/test_civitai_adopt.py -v
 """
@@ -29,8 +28,8 @@ import io
 import json
 import os
 import pickle
-import struct
 import sys
+import time
 import types
 import unittest
 import zipfile
@@ -88,13 +87,15 @@ def file_entry(name: str, content: bytes, ftype: str = "Model") -> dict:
 
 
 def version_obj(vid: int, model_name: str, vname: str, mtype: str,
-                files: list, base: str = "SDXL 1.0", air: str = None) -> dict:
+                files: list, base: str = "SDXL 1.0", air: str = None,
+                **extra) -> dict:
     return {"id": vid, "modelId": vid * 10, "name": vname,
             "baseModel": base, "trainedWords": [],
             **({"air": air} if air else {}),
             "model": {"name": model_name, "type": mtype, "nsfw": False},
             "files": files,
-            "images": [{"url": "https://example.invalid/x.jpg"}]}
+            "images": [{"url": "https://example.invalid/x.jpg"}],
+            **extra}
 
 
 class Fixture:
@@ -142,9 +143,15 @@ class Fixture:
     def dest(self, rel: str, name: str) -> Path:
         return self.cache / rel / name
 
-    def sidecar(self, rel: str, stem: str) -> dict:
-        return json.loads((self.cache / rel / (stem + ".civitai.info"))
+    def civ(self, rel: str, stem: str) -> Path:
+        return self.cache / rel / (stem + ".civitai.info")
+
+    def meta(self, rel: str, stem: str) -> dict:
+        return json.loads((self.cache / rel / (stem + ".meta.droste"))
                           .read_text())
+
+    def user(self, rel: str, stem: str) -> Path:
+        return self.cache / rel / (stem + ".user.droste")
 
 
 class CivitaiAdoptTest(unittest.TestCase):
@@ -174,8 +181,6 @@ class CivitaiAdoptTest(unittest.TestCase):
                       f"(Checkpoint, SDXL 1.0) "
                       f"[AIR urn:air:sdxl:checkpoint:civitai:1000@100] "
                       f"(via hash lookup)", out)
-        self.assertIn("ADOPT", out)
-        # normalized name, not the download's arbitrary filename
         self.assertIn("-> models/Stable-diffusion/Great-Model_v1.0.safetensors",
                       out)
         self.assertIn("1 adopted, 0 already cached, 0 refused", out)
@@ -188,8 +193,8 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.assertEqual(dest.read_bytes(), content)
         self.assertTrue(f.exists())  # --link never removes the source
 
-    def test_sidecar_records_identity_routing_and_sniff(self):
-        # a real safetensors SDXL-ish checkpoint so sniff has something
+    # ------------------------------------------------ three-file scheme
+    def test_civitai_info_is_pure_and_meta_holds_our_block(self):
         content = safetensors_bytes([
             "model.diffusion_model.input_blocks.0.0.weight",
             "conditioner.embedders.1.model.ln_final.weight",
@@ -198,26 +203,340 @@ class CivitaiAdoptTest(unittest.TestCase):
         v = self.simple_checkpoint(content)
         rc, out, err = self.fx.run("--apply", str(f))
         self.assertEqual(rc, 0, err)
-        info = self.fx.sidecar("models/Stable-diffusion", "Great-Model_v1.0")
-        # raw API response preserved (Civitai Helper convention) ...
-        self.assertEqual(info["id"], v["id"])
-        self.assertEqual(info["files"][0]["name"],
-                         "greatModel_v10.safetensors")
-        d = info["extensions"]["droste"]
-        self.assertEqual(d["sha256"], sha256(content))
-        self.assertEqual(d["original_name"], "greatModel_v10.safetensors")
-        self.assertEqual(d["normalized_name"], "Great-Model_v1.0.safetensors")
-        self.assertEqual(d["modelId"], v["modelId"])
-        self.assertEqual(d["modelVersionId"], v["id"])
-        self.assertEqual(d["api_type"], "Checkpoint")
-        self.assertEqual(d["resolved_type"], "Checkpoint")
-        self.assertEqual(d["routing"], "api")  # no absolute kind -> API wins
-        # sniff facts recorded with confidences
-        self.assertEqual(d["sniff"]["format"],
-                         {"value": "safetensors", "confidence": "absolute"})
-        self.assertEqual(d["sniff"]["base_model"]["value"], "SDXL")
-        self.assertEqual(d["sniffed_base_model"], "SDXL")
-        self.assertTrue(d["sniff"]["embedded_vae"]["value"])
+        rel, stem = "models/Stable-diffusion", "Great-Model_v1.0"
+        # 1) .civitai.info is the PURE API response -- nothing of ours
+        info = json.loads(self.fx.civ(rel, stem).read_text())
+        self.assertEqual(info, v)
+        self.assertNotIn("extensions", info)
+        # 2) .meta.droste carries the objective block, minus private fields
+        m = self.fx.meta(rel, stem)
+        self.assertEqual(m["tool"], mod.TOOL_ID)
+        self.assertEqual(m["sha256"], sha256(content))
+        self.assertEqual(m["normalized_name"], "Great-Model_v1.0.safetensors")
+        self.assertEqual(m["modelId"], v["modelId"])
+        self.assertEqual(m["modelVersionId"], v["id"])
+        self.assertEqual(m["api_type"], "Checkpoint")
+        self.assertEqual(m["resolved_type"], "Checkpoint")
+        self.assertEqual(m["routing"], "api")
+        self.assertNotIn("adopted_from", m)
+        self.assertNotIn("original_name", m)
+        self.assertNotIn("sniffed_base_model", m)
+        self.assertEqual(m["detected_base_model"], "SDXL")
+        self.assertEqual(m["sniff"]["base_model"],
+                         {"value": "SDXL", "confidence": "absolute"})
+        # 3) no source prefs -> no .user.droste (never created empty)
+        self.assertFalse(self.fx.user(rel, stem).exists())
+
+    # --------------------------------------- user-prefs ingestion per format
+    def test_ingest_a1111_json_prefs(self):
+        content = b"a1111 lora"
+        f = self.fx.add_download("styl.safetensors", content)
+        self.fx.add_download("styl.json", json.dumps({
+            "description": "standard blurb", "sd version": "SDXL",
+            "activation text": "styl, masterpiece",
+            "preferred weight": 0.8, "notes": "works best at 0.8",
+            "my_bespoke_flag": True}).encode())
+        v = version_obj(910, "Styl", "v1", "LORA",
+                        [file_entry("styl.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user("models/Lora", "Styl_v1").read_text())
+        self.assertEqual(u["trigger_words"], "styl, masterpiece")
+        self.assertEqual(u["preferred_weight"], 0.8)
+        self.assertEqual(u["notes"], "works best at 0.8")
+        # standard fields (description, sd version) are NOT copied up ...
+        self.assertNotIn("description", u)
+        # ... and only the UNMATCHED field is kept -- not the whole raw file
+        self.assertEqual(u["unmatched"]["styl.json"], {"my_bespoke_flag": True})
+        # discovery note names the unmatched key at normal log level
+        self.assertIn("note: unrecognized field(s) in styl.json: "
+                      "my_bespoke_flag — kept under 'unmatched'", out)
+
+    def test_ingest_comfyui_metadata_json_prefs(self):
+        content = b"comfy lora"
+        f = self.fx.add_download("cf.safetensors", content)
+        self.fx.add_download("cf.metadata.json", json.dumps({
+            "civitai": {"id": 42, "some": "standard dump"},  # standard: skip
+            "preview": "cf.png",
+            "notes": "my note", "usage_tips": "cfg 4", "tags": ["anime"],
+            "favorite": True, "date_added": "2026-01-01"}).encode())
+        v = version_obj(911, "Cf", "v2", "LORA",
+                        [file_entry("cf.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user("models/Lora", "Cf_v2").read_text())
+        self.assertEqual(u["notes"], "my note")
+        self.assertEqual(u["usage_tips"], "cfg 4")
+        self.assertEqual(u["tags"], ["anime"])
+        self.assertTrue(u["favorite"])
+        # standard civitai/preview are NOT preserved; only the unmatched
+        # bespoke field (the timestamp) is kept + noted
+        self.assertEqual(u["unmatched"]["cf.metadata.json"],
+                         {"date_added": "2026-01-01"})
+        self.assertNotIn("civitai", u["unmatched"]["cf.metadata.json"])
+        self.assertIn("note: unrecognized field(s) in cf.metadata.json: "
+                      "date_added — kept under 'unmatched'", out)
+
+    def test_ingest_cm_info_prefs_and_unmatched(self):
+        # CRITICAL: the former gap -- an unmapped .cm-info.json user field is
+        # now preserved under `unmatched` and surfaced, not silently dropped.
+        content = b"stability matrix lora"
+        f = self.fx.add_download("sm.safetensors", content)
+        self.fx.add_download("sm.cm-info.json", json.dumps({
+            "ModelName": "SM", "VersionName": "v1",  # standard mirror: skip
+            "Notes": "curated note", "IsFavorite": True,
+            "MyCustomField": "keepme"}).encode())     # unmapped -> unmatched
+        v = version_obj(912, "SM", "v1", "LORA",
+                        [file_entry("sm.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user("models/Lora", "SM_v1").read_text())
+        self.assertEqual(u["notes"], "curated note")
+        self.assertTrue(u["favorite"])
+        self.assertEqual(u["unmatched"]["sm.cm-info.json"],
+                         {"MyCustomField": "keepme"})
+        self.assertIn("note: unrecognized field(s) in sm.cm-info.json: "
+                      "MyCustomField — kept under 'unmatched'", out)
+
+    def test_pure_standard_source_makes_no_user_file_or_note(self):
+        content = b"no prefs here"
+        f = self.fx.add_download("p.safetensors", content)
+        # an A1111 sidecar with ONLY standard fields -> nothing to preserve
+        self.fx.add_download("p.json", json.dumps({
+            "description": "std", "sd version": "SDXL"}).encode())
+        v = version_obj(913, "Plain", "v1", "LORA",
+                        [file_entry("p.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.fx.user("models/Lora", "Plain_v1").exists())
+        self.assertNotIn("unrecognized field", out)
+
+    def test_unmatched_note_prints_in_dry_run(self):
+        # dry-run is exactly when the user wants to preview what's
+        # unrecognized: the note prints, but nothing is written.
+        content = b"dry run note test"
+        f = self.fx.add_download("dr.safetensors", content)
+        self.fx.add_download("dr.json",
+                             json.dumps({"notes": "n", "mystery": 1}).encode())
+        v = version_obj(915, "Dryly", "v1", "LORA",
+                        [file_entry("dr.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run(str(f))  # NO --apply -> dry-run default
+        self.assertEqual(rc, 0, err)
+        self.assertIn("DRY RUN", out)
+        self.assertIn("note: unrecognized field(s) in dr.json: "
+                      "mystery — kept under 'unmatched'", out)
+        # dry-run: no .user.droste (nor any sidecar) actually written
+        self.assertFalse(self.fx.user("models/Lora", "Dryly_v1").exists())
+        self.assertEqual(list(self.fx.cache.rglob("*")), [])
+
+    def test_unmatched_note_hidden_under_quiet(self):
+        content = b"quiet note test"
+        f = self.fx.add_download("q.safetensors", content)
+        self.fx.add_download("q.json",
+                             json.dumps({"weird_key": "x"}).encode())
+        v = version_obj(914, "Quiet", "v1", "LORA",
+                        [file_entry("q.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", "-q", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("unrecognized field", out)   # normal-level: hidden
+        # ... yet the unmatched field was still preserved
+        u = json.loads(self.fx.user("models/Lora", "Quiet_v1").read_text())
+        self.assertEqual(u["unmatched"]["q.json"], {"weird_key": "x"})
+
+    # ----------------------------------------------- idempotent sync
+    def test_idempotent_sync_second_run_writes_nothing(self):
+        content = b"idempotent bytes"
+        f = self.fx.add_download("i.safetensors", content)
+        self.fx.add_download("i.json",
+                             json.dumps({"notes": "n"}).encode())
+        v = version_obj(920, "Idem", "v1", "LORA",
+                        [file_entry("i.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        rel, stem = "models/Lora", "Idem_v1"
+        sidecars = [self.fx.civ(rel, stem),
+                    self.cache_meta(rel, stem), self.fx.user(rel, stem)]
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in sidecars}
+        time.sleep(0.01)
+        rc, out, err = self.fx.run("--apply", str(f))  # identical inputs
+        self.assertEqual(rc, 0, err)
+        self.assertIn("0 adopted, 1 already cached, 0 refused", out)
+        for p, (data, mtime) in before.items():
+            self.assertEqual(p.read_bytes(), data, p.name)
+            self.assertEqual(p.stat().st_mtime_ns, mtime, p.name)
+
+    def cache_meta(self, rel, stem):
+        return self.fx.cache / rel / (stem + ".meta.droste")
+
+    def test_already_branch_refreshes_metadata_when_api_changes(self):
+        content = b"cached model bytes"
+        f = self.fx.add_download("r.safetensors", content)
+        v1 = version_obj(930, "Refresh", "v1", "LORA",
+                         [file_entry("r.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v1})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        rel, stem = "models/Lora", "Refresh_v1"
+        info_before = self.fx.civ(rel, stem).read_text()
+        # API grows a field; model file already cached -> ALREADY branch
+        v2 = dict(v1, description="freshly documented on civitai")
+        self.fx.set_by_hash({sha256(content): v2})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("ALREADY", out)
+        info_after = json.loads(self.fx.civ(rel, stem).read_text())
+        self.assertNotEqual(self.fx.civ(rel, stem).read_text(), info_before)
+        self.assertEqual(info_after["description"],
+                         "freshly documented on civitai")
+
+    def test_monotonic_merge_retains_vanished_and_adds_new(self):
+        content = b"monotonic bytes"
+        f = self.fx.add_download("m.safetensors", content)
+        # first source carries a normalized field AND an unmatched one
+        self.fx.add_download("m.json", json.dumps(
+            {"notes": "keep me", "weird_key": "x"}).encode())
+        v = version_obj(940, "Mono", "v1", "LORA",
+                        [file_entry("m.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        rel, stem = "models/Lora", "Mono_v1"
+        # source sidecar vanishes, a DIFFERENT source appears with a NEW field
+        (self.fx.downloads / "m.json").unlink()
+        self.fx.add_download("m.metadata.json",
+                             json.dumps({"usage_tips": "cfg 5"}).encode())
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user(rel, stem).read_text())
+        self.assertEqual(u["notes"], "keep me")     # retained though source gone
+        self.assertEqual(u["usage_tips"], "cfg 5")   # newly added
+        # the unmatched entry from the now-vanished source is retained
+        self.assertEqual(u["unmatched"]["m.json"], {"weird_key": "x"})
+
+    # ------------------------------------------------- user-data guard
+    def test_user_data_guard_refuses_and_prints_diff(self):
+        content = b"guard bytes"
+        f = self.fx.add_download("g.safetensors", content)
+        self.fx.add_download("g.json", json.dumps({
+            "notes": "original", "preferred weight": 0.5}).encode())
+        v = version_obj(950, "Guard", "v1", "LORA",
+                        [file_entry("g.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        rel, stem = "models/Lora", "Guard_v1"
+        user_path = self.fx.user(rel, stem)
+        before = user_path.read_bytes()
+        model_dest = self.fx.dest(rel, "Guard_v1.safetensors")
+        # source prefs now CONFLICT with the stored ones
+        (self.fx.downloads / "g.json").write_text(json.dumps({
+            "notes": "rewritten", "preferred weight": 0.9}))
+        rc, out, err = self.fx.run("--apply", "--move", str(f))
+        self.assertEqual(rc, 1)  # nothing adopted, one refused -> exit 1
+        # exact message on stderr, side-by-side per conflicting field
+        self.assertIn("Error: sheepishly refusing to overwrite existing "
+                      f"user data in {user_path}.", err)
+        self.assertIn("old: original", err)
+        self.assertIn("new: rewritten", err)
+        self.assertIn("old: 0.5", err)
+        self.assertIn("new: 0.9", err)
+        self.assertIn("add the --force flag to ignore this error", err)
+        # ENTIRE adoption aborted: user file untouched, source not moved
+        self.assertEqual(user_path.read_bytes(), before)
+        self.assertTrue(f.exists())              # --move did NOT remove source
+        self.assertTrue(model_dest.exists())     # model file still present
+        self.assertIn("0 adopted, 0 already cached, 1 refused", out)
+
+    def test_force_overrides_user_guard(self):
+        content = b"force bytes"
+        f = self.fx.add_download("fo.safetensors", content)
+        self.fx.add_download("fo.json", json.dumps({"notes": "original"}).encode())
+        v = version_obj(951, "Forced", "v1", "LORA",
+                        [file_entry("fo.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        self.fx.run("--apply", str(f))
+        rel, stem = "models/Lora", "Forced_v1"
+        (self.fx.downloads / "fo.json").write_text(json.dumps({"notes": "new"}))
+        rc, out, err = self.fx.run("--apply", "--force", str(f))
+        self.assertEqual(rc, 0, err)
+        u = json.loads(self.fx.user(rel, stem).read_text())
+        self.assertEqual(u["notes"], "new")
+
+    def test_force_does_not_imply_apply(self):
+        content = b"force-no-apply"
+        f = self.fx.add_download("fna.safetensors", content)
+        self.fx.add_download("fna.json", json.dumps({"notes": "original"}).encode())
+        v = version_obj(952, "FNA", "v1", "LORA",
+                        [file_entry("fna.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        self.fx.run("--apply", str(f))
+        rel, stem = "models/Lora", "FNA_v1"
+        user_path = self.fx.user(rel, stem)
+        before = user_path.read_bytes()
+        (self.fx.downloads / "fna.json").write_text(json.dumps({"notes": "new"}))
+        # --force WITHOUT --apply: guard is overridden (no refuse) but it is
+        # still a dry-run, so nothing is written
+        rc, out, err = self.fx.run("--force", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("sheepishly refusing", err)
+        self.assertEqual(user_path.read_bytes(), before)  # unchanged (dry-run)
+
+    def test_force_does_not_bypass_identity_gate(self):
+        content = b"genuine"
+        other = b"not in this version"
+        f = self.fx.add_download("id.safetensors", other)
+        self.fx.add_version(version_obj(
+            953, "Ident", "v1", "LORA",
+            [file_entry("ident.safetensors", content)]))
+        rc, out, err = self.fx.run("--apply", "--force",
+                                   "--version-id", "953", str(f))
+        self.assertEqual(rc, 1)
+        self.assertIn("not byte-identical to any file in version 953", out)
+
+    def test_force_does_not_bypass_different_content_model_refusal(self):
+        content = b"canon"
+        f = self.fx.add_download("dc.safetensors", content)
+        v = version_obj(954, "DiffC", "v1", "LORA",
+                        [file_entry("dc.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        rel = "models/Lora"
+        dest = self.fx.dest(rel, "DiffC_v1.safetensors")
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b"USER DATA - different")
+        rc, out, err = self.fx.run("--apply", "--force", str(f))
+        self.assertEqual(rc, 1)
+        self.assertIn("exists with DIFFERENT content; refusing to overwrite",
+                      out)
+        self.assertEqual(dest.read_bytes(), b"USER DATA - different")
+
+    def test_guard_refuses_only_conflicting_file_in_batch(self):
+        ca = b"clean file bytes"
+        cc = b"conflicting file bytes"
+        fa = self.fx.add_download("clean.safetensors", ca)
+        fc = self.fx.add_download("conf.safetensors", cc)
+        self.fx.add_download("conf.json", json.dumps({"notes": "orig"}).encode())
+        va = version_obj(960, "Clean", "v1", "LORA",
+                         [file_entry("clean.safetensors", ca)])
+        vc = version_obj(961, "Conf", "v1", "LORA",
+                         [file_entry("conf.safetensors", cc)])
+        self.fx.set_by_hash({sha256(ca): va, sha256(cc): vc})
+        self.fx.run("--apply", str(fc))  # seed Conf's user file
+        (self.fx.downloads / "conf.json").write_text(
+            json.dumps({"notes": "changed"}))
+        rc, out, err = self.fx.run("--apply", str(fa), str(fc))
+        # clean adopts, conflicting refuses, run continues
+        self.assertIn("ADOPT", out)
+        self.assertTrue(self.fx.dest("models/Lora",
+                                     "Clean_v1.safetensors").exists())
+        self.assertIn("sheepishly refusing", err)
+        self.assertIn("1 adopted, 0 already cached, 1 refused", out)
 
     # ------------------------------------------------- sidecar id fallback
     def test_sidecar_fallback_each_format(self):
@@ -296,7 +615,7 @@ class CivitaiAdoptTest(unittest.TestCase):
 
     # ---------------------------------------------------- type-dir taxonomy
     def test_all_type_dirs_incl_new_and_root_level(self):
-        cases = [  # (model.type, expected relative dir)
+        cases = [
             ("Checkpoint", "models/Stable-diffusion"),
             ("LORA", "models/Lora"),
             ("LoCon", "models/LyCORIS"),
@@ -323,7 +642,6 @@ class CivitaiAdoptTest(unittest.TestCase):
                 self.assertEqual(rc, 0, err)
                 dest = self.fx.dest(rel, f"{mtype}Model_v1.pt")
                 self.assertEqual(dest.read_bytes(), content, mtype)
-        # embeddings is at the cache root, never under models/
         self.assertFalse((self.fx.cache / "models" / "embeddings").exists())
 
     def test_unknown_api_type_goes_to_other_never_refused(self):
@@ -336,9 +654,8 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)  # NOT refused
         dest = self.fx.dest("other/QuantumEmbedding", "Frobnicator_v2.pt")
         self.assertEqual(dest.read_bytes(), content)
-        info = self.fx.sidecar("other/QuantumEmbedding", "Frobnicator_v2")
-        self.assertEqual(info["extensions"]["droste"]["resolved_type"],
-                         "QuantumEmbedding")
+        m = self.fx.meta("other/QuantumEmbedding", "Frobnicator_v2")
+        self.assertEqual(m["resolved_type"], "QuantumEmbedding")
 
     def test_vae_file_entry_overrides_model_type(self):
         ckpt = b"main checkpoint bytes"
@@ -365,7 +682,6 @@ class CivitaiAdoptTest(unittest.TestCase):
                                  "adapter.body.1.block2.weight"])
         fcn = self.fx.add_download("cn.safetensors", cn)
         ft2i = self.fx.add_download("t2i.safetensors", t2i)
-        # BOTH declared Controlnet by the API; sniff must split them
         vcn = version_obj(810, "MyControl", "v1", "Controlnet",
                           [file_entry("mycn.safetensors", cn)])
         vt2i = version_obj(811, "MyAdapter", "v1", "Controlnet",
@@ -375,20 +691,18 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertTrue(self.fx.dest("models/ControlNet",
                                      "MyControl_v1.safetensors").exists())
-        # sniff (absolute) overrode the wrong API type -> T2IAdapter dir
         self.assertTrue(self.fx.dest("models/T2IAdapter",
                                      "MyAdapter_v1.safetensors").exists())
         self.assertIn("sniff-override", out)
-        info = self.fx.sidecar("models/T2IAdapter", "MyAdapter_v1")
-        d = info["extensions"]["droste"]
-        self.assertEqual(d["api_type"], "Controlnet")
-        self.assertEqual(d["resolved_type"], "T2IAdapter")
-        self.assertTrue(d["routing"].startswith("sniff-override"))
-        self.assertEqual(d["sniff"]["kind"],
+        m = self.fx.meta("models/T2IAdapter", "MyAdapter_v1")
+        self.assertEqual(m["api_type"], "Controlnet")
+        self.assertEqual(m["resolved_type"], "T2IAdapter")
+        self.assertTrue(m["routing"].startswith("sniff-override"))
+        self.assertEqual(m["sniff"]["kind"],
                          {"value": "t2i_adapter", "confidence": "absolute"})
 
     def test_upscaler_arch_split_and_catchall(self):
-        cases = [  # (keys, expected dir)
+        cases = [
             (["layers.0.residual_group.blocks.0.attn."
               "relative_position_bias_table", "conv_first.weight"],
              "models/SwinIR"),
@@ -397,7 +711,7 @@ class CivitaiAdoptTest(unittest.TestCase):
             (["model.0.weight", "model.1.sub.0.RDB1.conv1.0.weight"],
              "models/ESRGAN"),
             (["totally.unknown.arch.weight", "mystery.block.bias"],
-             "models/upscale_models"),  # unknown arch -> catch-all
+             "models/upscale_models"),
         ]
         for i, (keys, rel) in enumerate(cases):
             with self.subTest(dir=rel):
@@ -412,7 +726,6 @@ class CivitaiAdoptTest(unittest.TestCase):
                                 .exists(), rel)
 
     def test_sniff_uncertain_keeps_api_type(self):
-        # SD1.x base is 'uncertain' and no absolute kind -> API type wins
         content = safetensors_bytes(["model.diffusion_model.x.weight",
                                      "lora_unet_down.lora_down.weight"])
         f = self.fx.add_download("thing.safetensors", content)
@@ -421,14 +734,12 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.fx.set_by_hash({sha256(content): v})
         rc, out, err = self.fx.run("--apply", str(f))
         self.assertEqual(rc, 0, err)
-        # stayed in the API-declared Lora dir, no override
         self.assertTrue(self.fx.dest("models/Lora",
                                      "Styler_v1.safetensors").exists())
-        info = self.fx.sidecar("models/Lora", "Styler_v1")
-        d = info["extensions"]["droste"]
-        self.assertEqual(d["routing"], "api")
-        self.assertEqual(d["resolved_type"], "LORA")
-        self.assertEqual(d["sniff"]["base_model"]["confidence"], "uncertain")
+        m = self.fx.meta("models/Lora", "Styler_v1")
+        self.assertEqual(m["routing"], "api")
+        self.assertEqual(m["resolved_type"], "LORA")
+        self.assertEqual(m["sniff"]["base_model"]["confidence"], "uncertain")
 
     def test_base_model_sniff_flux(self):
         content = safetensors_bytes(["double_blocks.0.img_attn.qkv.weight",
@@ -440,21 +751,17 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.fx.set_by_hash({sha256(content): v})
         rc, out, err = self.fx.run("--apply", str(f))
         self.assertEqual(rc, 0, err)
-        info = self.fx.sidecar("models/Stable-diffusion", "FluxThing_v1")
-        d = info["extensions"]["droste"]
-        self.assertEqual(d["sniffed_base_model"], "FLUX.1")
-        self.assertEqual(d["sniff"]["base_model"]["confidence"], "absolute")
+        m = self.fx.meta("models/Stable-diffusion", "FluxThing_v1")
+        self.assertEqual(m["detected_base_model"], "FLUX.1")
+        self.assertEqual(m["sniff"]["base_model"]["confidence"], "absolute")
 
     # --------------------------------------------- restricted unpickler
     def test_restricted_unpickler_recovers_keys(self):
         keys = ["layers.0.weight", "layers.0.bias", "layers.1.weight"]
-        # plain dict -> concrete dict, keys read directly
         self.assertEqual(sorted(mod._restricted_unpickle_keys(
             io.BytesIO(pickle_statedict(keys)))), sorted(keys))
-        # OrderedDict -> class stubbed inert, keys recovered via __setitem__
         self.assertEqual(sorted(mod._restricted_unpickle_keys(
             io.BytesIO(pickle_statedict(keys, ordered=True)))), sorted(keys))
-        # via the file entry point, incl. a zip-wrapped (torch-style) pickle
         raw = self.fx.add_download("raw.pt", pickle_statedict(keys))
         self.assertEqual(sorted(mod.sniff_pickle_keys(raw)), sorted(keys))
         zp = self.fx.add_download("z.pt", pickle_statedict(keys, zipped=True))
@@ -469,11 +776,9 @@ class CivitaiAdoptTest(unittest.TestCase):
                 return (_os.system, (f"touch {marker}",))
 
         evil = self.fx.add_download("evil.pt", pickle.dumps(_Evil()))
-        # must not import/execute os.system: no marker, no crash
         keys = mod.sniff_pickle_keys(evil)
         self.assertFalse(marker.exists(), "restricted unpickler executed code")
         self.assertIsInstance(keys, (list, type(None)))
-        # and the same file driven through a full adopt run stays inert
         content = evil.read_bytes()
         v = version_obj(850, "Trap", "v1", "LORA",
                         [file_entry("evil.pt", content)])
@@ -484,7 +789,6 @@ class CivitaiAdoptTest(unittest.TestCase):
 
     # ----------------------------------------------------- normalization
     def test_normalize_sanitizes_names(self):
-        # unicode kept; path/Windows-hostile removed; spaces -> '-'
         content = b"unicode and unsafe chars"
         f = self.fx.add_download("dl.safetensors", content)
         v = version_obj(860, "Modèl: Bad/Name*  Two", "v9 <final>",
@@ -511,7 +815,6 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.fx.set_by_hash({sha256(full): v, sha256(pruned): v})
         rc, out, err = self.fx.run("--apply", str(ff), str(fp))
         self.assertEqual(rc, 0, err)
-        # both share Dream_v8 in the same dir -> original stem appended
         self.assertTrue(self.fx.dest("models/Stable-diffusion",
                                      "Dream_v8-full.safetensors").exists())
         self.assertTrue(self.fx.dest("models/Stable-diffusion",
@@ -525,10 +828,9 @@ class CivitaiAdoptTest(unittest.TestCase):
              "hashes": {"SHA256": sha256(content).upper()}}])
         self.fx.set_by_hash({sha256(content): v})
         rc, out, err = self.fx.run("--apply", str(f))
-        self.assertEqual(rc, 0, err)  # normalized to a safe name, not refused
+        self.assertEqual(rc, 0, err)
         self.assertTrue(self.fx.dest("models/Lora",
                                      "Evil_v1.safetensors").exists())
-        # nothing escaped the cache root
         self.assertFalse((self.fx.root / "escape.safetensors").exists())
 
     # ------------------------------------------------------- never-clobber
@@ -539,30 +841,17 @@ class CivitaiAdoptTest(unittest.TestCase):
         dest = self.fx.dest("models/Stable-diffusion",
                             "Great-Model_v1.0.safetensors")
         dest.parent.mkdir(parents=True)
-        dest.write_bytes(content)  # same content already present
+        dest.write_bytes(content)
         rc, out, err = self.fx.run("--apply", str(f))
         self.assertEqual(rc, 0, err)
         self.assertIn("ALREADY", out)
         self.assertIn("0 adopted, 1 already cached, 0 refused", out)
-        dest.write_bytes(b"USER DATA - different")  # collision, diff content
+        dest.write_bytes(b"USER DATA - different")
         rc, out, err = self.fx.run("--apply", str(f))
         self.assertEqual(rc, 1)
         self.assertIn("exists with DIFFERENT content; refusing to overwrite",
                       out)
         self.assertEqual(dest.read_bytes(), b"USER DATA - different")
-
-    def test_existing_sidecar_left_alone(self):
-        content = b"bytes"
-        f = self.fx.add_download("dl.safetensors", content)
-        self.simple_checkpoint(content)
-        side = self.fx.dest("models/Stable-diffusion",
-                            "Great-Model_v1.0.civitai.info")
-        side.parent.mkdir(parents=True)
-        side.write_text('{"mine": true}')
-        rc, out, err = self.fx.run("--apply", str(f))
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(json.loads(side.read_text()), {"mine": True})
-        self.assertIn("sidecar exists; leaving it", out)
 
     # ------------------------------------------------------- preview carry
     def test_preview_carried_and_never_clobbered(self):
@@ -576,7 +865,7 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         pdest = self.fx.dest("models/Lora", "My-Lora_v1.preview.png")
         self.assertEqual(pdest.read_bytes(), b"PNGDATA")
-        pdest.write_bytes(b"CURATED")  # a curated preview must survive
+        pdest.write_bytes(b"CURATED")
         f2 = self.fx.add_download("again/mylora.safetensors", content)
         self.fx.add_download("again/mylora.png", b"OTHERPNG")
         rc, out, err = self.fx.run("--apply", str(f2))
@@ -606,7 +895,6 @@ class CivitaiAdoptTest(unittest.TestCase):
                                      "Model-A_v1.safetensors").exists())
         self.assertTrue(self.fx.dest("models/Lora",
                                      "Model-B_v2.safetensors").exists())
-        # b's preview was carried alongside the normalized Model-B name
         self.assertTrue(self.fx.dest("models/Lora",
                                      "Model-B_v2.preview.png").exists())
 
@@ -632,7 +920,7 @@ class CivitaiAdoptTest(unittest.TestCase):
         f2 = self.fx.add_download("two.safetensors", b"two")
         self.fx.set_by_hash({"error": "connection reset"})
         rc, out, err = self.fx.run(str(f1), str(f2))
-        self.assertEqual(rc, 1)  # refused, never crashed
+        self.assertEqual(rc, 1)
         self.assertIn("warning: CivitAI hash lookup failed", out)
         self.assertEqual(out.count("REFUSE"), 2, out)
         self.assertIn("CivitAI lookup unavailable; try again or pass "
@@ -646,24 +934,23 @@ class CivitaiAdoptTest(unittest.TestCase):
                 return True
 
         args = types.SimpleNamespace(quiet=0, verbose=0)
-        plain = io.StringIO()  # non-TTY: strict no-op
+        plain = io.StringIO()
         with contextlib.redirect_stderr(plain):
             mod.progress(args, "  looking up 3 hash(es) on CivitAI...")
             mod.progress_clear()
         self.assertEqual(plain.getvalue(), "")
-        tty = FakeTTY()  # -q suppresses even on a TTY
+        tty = FakeTTY()
         with contextlib.redirect_stderr(tty):
             mod.progress(types.SimpleNamespace(quiet=1, verbose=0), "  x")
             mod.progress_clear()
         self.assertEqual(tty.getvalue(), "")
-        tty = FakeTTY()  # TTY: \r-updated in place, wiped clean
+        tty = FakeTTY()
         with contextlib.redirect_stderr(tty):
             mod.progress(args, "  fetching version 12345...")
             mod.progress_clear()
         raw = tty.getvalue()
         self.assertIn("\r  fetching version 12345...", raw)
         self.assertTrue(raw.endswith("\r"))
-        # scan_file hashing progress with thresholds patched small
         f = self.fx.add_download("big.bin", b"z" * 4096)
         tty = FakeTTY()
         with mock.patch.object(mod, "HASH_PROGRESS_MIN", 1024), \
@@ -675,7 +962,7 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.assertIn("hashing big.bin: ", raw)
         self.assertIn("100%", raw)
         self.assertTrue(raw.endswith("\r"))
-        tty = FakeTTY()  # hash_file without args: silent even on a TTY
+        tty = FakeTTY()
         with contextlib.redirect_stderr(tty):
             mod.hash_file(f, 4096)
         self.assertEqual(tty.getvalue(), "")
