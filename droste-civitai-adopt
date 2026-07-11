@@ -15,13 +15,27 @@ hash proof, never on name similarity.
 
 HOW: every candidate file is hashed once (streamed sha256) and looked up
 with the batch by-hash API (one round-trip for a whole directory). A hit
-names the model version, the canonical filename and the file type, which
-map onto the A1111 layout:
+names the model version. During that same hash pass we also SNIFF the
+file's content (safetensors header keys, or state-dict keys recovered from
+a pickled checkpoint via a restricted, execution-free unpickler) to derive
+facts -- ControlNet vs T2I-Adapter, upscaler architecture, base model,
+dtype -- each tagged 'absolute' or 'uncertain'. Placement then routes to a
+fine-grained directory (one per distinct kind, created on demand):
 
-    <cache>/models/<TypeDir>/<canonical-name>       (Checkpoint, LoRA, ...)
-    <cache>/embeddings/<canonical-name>             (TextualInversion)
-    ... plus <canonical-stem>.civitai.info          metadata sidecar
-    ... plus <canonical-stem>.preview.<ext>         carried from the source
+    <cache>/models/<TypeDir>/<Model_Version.ext>    (Checkpoint, LoRA, ...)
+    <cache>/embeddings/<Model_Version.ext>          (TextualInversion)
+    <cache>/other/<Type>/<Model_Version.ext>        (unknown/future types)
+    ... plus <Model_Version>.civitai.info           metadata sidecar
+    ... plus <Model_Version>.preview.<ext>           carried from the source
+
+Filenames are NORMALIZED to <model.name>_<version.name> + original ext
+(sanitized), so the cache is consistent regardless of the uploader's
+filename; the sidecar retains the original name and all IDs. An absolute
+content sniff that disagrees with the API's declared type wins the routing
+(e.g. a mislabelled T2I-adapter lands in T2IAdapter/, not ControlNet/); an
+uncertain sniff keeps the API type. Sniffing NEVER overrides the hash-
+proven identity -- only the placement category -- and every decision is
+recorded in the sidecar's extensions.droste.
 
 Files the API does not know by hash fall back to metadata sidecars next
 to the SOURCE file (.civitai.info / .cm-info.json / .metadata.json /
@@ -31,8 +45,7 @@ manual escape hatch with the same sha256-must-appear gate.
 
 CAVEAT: CivitAI never hashed some very old uploads; those 404 by hash
 even though they are genuine. The sidecar fallback and --version-id
-cover them. The sidecar we write is the raw model-version API response
-(Civitai Helper convention) plus our own data under extensions.droste.
+cover them.
 
 Placements are staged as .tmp-* and renamed into place, so there is never
 partial state; existing files are never overwritten (identical content
@@ -47,11 +60,15 @@ import errno
 import hashlib
 import json
 import os
+import pickle
+import re
 import shutil
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from collections import Counter
 from pathlib import Path
 
 CHUNK = 1 << 20  # 1 MiB read chunks for streamed hashing
@@ -60,21 +77,51 @@ FIXTURE_ENV = "DROSTE_CIVITAI_API_FIXTURE"  # test hook; not in --help
 BATCH_LIMIT = 100  # by-hash POST accepts at most 100 hashes per call
 HASH_PROGRESS_MIN = 256 << 20  # smaller files hash too fast to show progress
 HASH_PROGRESS_STEP = 128 << 20  # progress update cadence while hashing
+SNIFF_PREFIX = 1 << 20  # bytes buffered during hashing for content sniffing
 
-# model.type -> directory under the cache root (A1111 webui convention).
-# Types not listed here (Poses, Wildcards, Workflows, Other, ...) have no
-# canonical home and are refused rather than guessed at.
+# CivitAI model type / sniffed kind -> directory under the cache root.
+# Fine-grained: one dir per distinct kind, created on demand. A1111-
+# compatible names where those exist; new dirs for the splits A1111
+# collapses. Unknown/future types are NEVER refused -- they land in
+# other/<TypeName>/ (see resolve_placement).
 TYPE_DIRS = {
     "checkpoint": "models/Stable-diffusion",
     "lora": "models/Lora",
-    "locon": "models/Lora",
-    "dora": "models/Lora",
-    "textualinversion": "embeddings",  # root level, not under models/
+    "locon": "models/LyCORIS",            # LyCORIS/LoCon split out of Lora
+    "dora": "models/DoRA",                # DoRA split out of Lora
+    "textualinversion": "embeddings",     # root level, not under models/
     "hypernetwork": "models/hypernetworks",
     "vae": "models/VAE",
     "controlnet": "models/ControlNet",
-    "upscaler": "models/ESRGAN",
-    "motionmodule": "models/animatediff",
+    "t2iadapter": "models/T2IAdapter",    # content-sniff split of ControlNet
+    "upscaler": "models/ESRGAN",          # arch-split at runtime (see below)
+    "motionmodule": "models/motion_modules",
+    "aestheticgradient": "models/aesthetic_embeddings",
+    "detection": "models/detection",
+    "poses": "poses",
+    "wildcards": "wildcards",
+    "workflows": "workflows",
+}
+
+# Upscaler network architecture (sniffed) -> directory; unknown -> catch-all.
+UPSCALER_ARCH_DIRS = {
+    "ESRGAN": "models/ESRGAN",
+    "RealESRGAN": "models/RealESRGAN",
+    "SwinIR": "models/SwinIR",
+    "ScuNET": "models/ScuNET",
+    "DAT": "models/DAT",
+    "HAT": "models/HAT",
+    "LDSR": "models/LDSR",
+}
+UPSCALER_CATCHALL = "models/upscale_models"
+
+# sniffed routing "kind" -> the canonical CivitAI-style type it resolves to.
+# Only kinds we can assert ABSOLUTELY from a deterministic key signature are
+# emitted for routing; everything else is left to the API type.
+KIND_TO_TYPE = {
+    "controlnet": "Controlnet",
+    "t2i_adapter": "T2IAdapter",
+    "upscaler": "Upscaler",
 }
 
 # metadata sidecars we mine for a model-version id (fallback), and the
@@ -86,13 +133,15 @@ PREVIEW_SUFFIXES = (".preview.png", ".preview.jpg", ".preview.jpeg",
 
 EXAMPLES = """\
 examples:
-  # Adopt a checkpoint you fetched with a browser (dry-run first):
+  # Adopt a checkpoint you fetched with a browser (dry-run first). It is
+  # placed under a normalized <Model>_<Version> name in the right dir:
   droste-civitai-adopt ~/Downloads/juggernautXL_v9.safetensors
   droste-civitai-adopt --apply ~/Downloads/juggernautXL_v9.safetensors
 
   # A whole downloads dir: one batch API call identifies everything,
-  # files may belong to different models/versions:
-  droste-civitai-adopt --apply --move ~/Downloads/loras/
+  # files may belong to different models/versions and route to different
+  # dirs (LoRA, VAE, ControlNet vs T2IAdapter, upscaler-by-arch, ...):
+  droste-civitai-adopt --apply --move ~/Downloads/mixed/
 
   # Rescue an old file CivitAI never hashed (404 by hash), when you know
   # its model version id -- adoption still requires the version to list
@@ -100,9 +149,9 @@ examples:
   droste-civitai-adopt --apply --version-id 128713 ~/old/dreamshaper.ckpt
 
 Only files whose sha256 the CivitAI API can prove are adopted; everything
-else is refused with a reason. Very old uploads were never hashed by
-CivitAI and 404 by hash even though genuine -- the metadata-sidecar
-fallback and --version-id cover those.
+else is refused with a reason. Content is sniffed (safetensors header /
+restricted-unpickler key recovery) during the hash pass to route by the
+real network kind, recorded in the .civitai.info sidecar.
 """
 
 
@@ -170,7 +219,7 @@ def api_request(args, url, token, payload=None):
     fatality."""
     body = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=body, headers={
-        "User-Agent": "droste-civitai-adopt/0.1",
+        "User-Agent": "droste-civitai-adopt/0.2",
         **({"Content-Type": "application/json"} if body else {}),
         **({"Authorization": f"Bearer {token}"} if token else {}),
     })
@@ -302,8 +351,9 @@ def hash_entries(version):
 
 
 def safe_filename(name):
-    """Validate a bare filename from the API before using it on disk:
-    no separators, no traversal, no Windows-hostile characters."""
+    """Validate a bare filename before using it on disk: no separators,
+    no traversal, no Windows-hostile characters. Applied to the FINAL
+    normalized name as a belt-and-braces gate."""
     if not name or not isinstance(name, str):
         return None
     if "/" in name or "\\" in name or ":" in name:
@@ -338,14 +388,260 @@ def hash_file(path, size, args=None):
     return h256.hexdigest()
 
 
-def memo_hash(path, size, memo, args=None):
-    """hash_file, cached per run: sources are hashed once for identify +
-    adopt, and existing destination files are hashed at most once for
-    the never-clobber comparison."""
+def scan_file(path, size, args=None):
+    """Stream the file ONCE: sha256 + content sniff. A bounded prefix is
+    captured during the hash pass and handed to the sniffer (safetensors
+    headers live at the front); pickled checkpoints need a small bounded
+    metadata read of their own (never a second pass over tensor data).
+    Returns (sha256_hex, facts_dict)."""
+    h256 = hashlib.sha256()
+    prefix = bytearray()
+    show = args is not None and size >= HASH_PROGRESS_MIN
+    done = next_tick = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            h256.update(chunk)
+            if len(prefix) < SNIFF_PREFIX:
+                prefix.extend(chunk[:SNIFF_PREFIX - len(prefix)])
+            if show:
+                done += len(chunk)
+                if done >= next_tick or done == size:
+                    gib = 1 << 30
+                    progress(args, f"  hashing {Path(path).name}: "
+                                   f"{done * 100 // size}% "
+                                   f"({done / gib:.1f}/{size / gib:.1f} GiB)")
+                    next_tick = done + HASH_PROGRESS_STEP
+    if show:
+        progress_clear()
+    return h256.hexdigest(), sniff_content(Path(path), bytes(prefix))
+
+
+def memo_scan(path, size, memo, args=None, sniff=False):
+    """hash_file/scan_file, cached per run. Sources are scanned (hash +
+    sniff) once; existing destination files are hash-only. Returns
+    (sha256, facts_or_None)."""
     key = str(path)
     if key not in memo:
-        memo[key] = hash_file(path, size, args)
+        if sniff:
+            memo[key] = scan_file(path, size, args)
+        else:
+            memo[key] = (hash_file(path, size, args), None)
     return memo[key]
+
+
+# -------------------------------------------------------------- content sniff
+
+def parse_safetensors_header(prefix, path):
+    """safetensors layout: 8-byte little-endian header length, then that
+    many bytes of JSON (tensor name -> {dtype, shape, data_offsets}). We
+    read ONLY the header. Returns the parsed dict or None."""
+    if len(prefix) < 8:
+        return None
+    n = int.from_bytes(prefix[:8], "little")
+    if n <= 0 or n > (200 << 20):  # sane header bound
+        return None
+    blob = bytes(prefix[8:8 + n])
+    if len(blob) < n:  # header longer than the captured prefix (rare)
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(8)
+                blob = fh.read(n)
+        except OSError:
+            return None
+    try:
+        header = json.loads(blob)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return header if isinstance(header, dict) else None
+
+
+def _restricted_unpickle_keys(fileobj):
+    """Recover the string keys of a pickled state dict WITHOUT executing
+    any of its payload. Security: find_class never imports or resolves a
+    real class -- it returns a single inert stand-in; persistent_load
+    (torch tensor storages) also returns the stand-in. Every REDUCE /
+    instantiation therefore calls the inert stub, not attacker code. The
+    stub only records dict keys assigned to it (SETITEM/SETITEMS) so a
+    state dict's tensor-name keys survive. Plain-dict pickles come back as
+    a real dict and we read their keys directly."""
+    recorded = set()
+
+    class _Inert:
+        def __call__(self, *a, **k):
+            return self                       # REDUCE / call -> inert
+        def __setitem__(self, key, value):
+            if isinstance(key, str):
+                recorded.add(key)
+        def __setstate__(self, state):
+            if isinstance(state, dict):
+                recorded.update(k for k in state if isinstance(k, str))
+        def append(self, *a):
+            pass
+        def extend(self, *a):
+            pass
+        def __getattr__(self, name):
+            return self                       # any attribute -> inert
+
+    inert = _Inert()
+
+    class _Restricted(pickle.Unpickler):
+        def find_class(self, module, name):
+            return inert                      # NEVER import anything
+        def persistent_load(self, pid):
+            return inert
+
+    obj = _Restricted(fileobj).load()
+    keys = set(recorded)
+    # a plain dict / OrderedDict may come back concrete; harvest its keys
+    # (and one level of nested dicts, e.g. {"state_dict": {...}}).
+    stack, seen = [obj], 0
+    while stack and seen < 8:
+        cur = stack.pop()
+        seen += 1
+        if isinstance(cur, dict):
+            keys.update(k for k in cur if isinstance(k, str))
+            stack.extend(v for v in cur.values() if isinstance(v, dict))
+    return sorted(keys)
+
+
+def sniff_pickle_keys(path):
+    """Recover state-dict keys from a pickled checkpoint. Modern torch
+    files are zip archives (data.pkl inside); legacy ones are a bare
+    pickle. Bounded: only the pickle structure is read, never the tensor
+    storages. Any trouble -> None (fall back to API-type routing)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+        if head[:2] == b"PK":  # zip archive
+            with zipfile.ZipFile(path) as z:
+                names = [n for n in z.namelist() if n.endswith("data.pkl")]
+                if not names:
+                    return None
+                with z.open(names[0]) as fh:
+                    return _restricted_unpickle_keys(fh)
+        with open(path, "rb") as f:
+            return _restricted_unpickle_keys(f)
+    except Exception:
+        return None
+
+
+def _dominant_dtype(header):
+    c = Counter()
+    for k, v in header.items():
+        if k == "__metadata__":
+            continue
+        if isinstance(v, dict) and isinstance(v.get("dtype"), str):
+            c[v["dtype"]] += 1
+    return c.most_common(1)[0][0] if c else None
+
+
+def _detect_upscaler_arch(keys):
+    """Super-resolution network architecture from key signatures.
+    Returns (arch, confidence) or (None, None)."""
+    has = lambda sub: any(sub in k for k in keys)
+    starts = lambda pre: any(k.startswith(pre) for k in keys)
+    if starts("m_head") and has("m_body") and has("m_tail"):
+        return ("ScuNET", "absolute")
+    if has("relative_position_bias_table"):
+        # SwinIR-family window attention; HAT adds conv blocks per group
+        if has("conv_block") or has("conv_after_body"):
+            return ("HAT", "absolute")
+        if has("residual_group"):
+            return ("SwinIR", "absolute")
+        return ("SwinIR", "uncertain")
+    if has("spatial_block") or has(".dat_"):
+        return ("DAT", "uncertain")
+    if has("model.1.sub.") or has("RRDB_trunk"):
+        return ("ESRGAN", "absolute")
+    if has("conv_first") and (has("rdb") or has("RDB") or has("conv_body")):
+        return ("RealESRGAN", "absolute")
+    return (None, None)
+
+
+def _detect_kind(keys):
+    """Routing-relevant network KIND from key signatures. Only kinds we
+    can assert absolutely are returned (uncertain guesses defer to the
+    API type). Returns (kind, confidence) or None."""
+    has = lambda sub: any(sub in k for k in keys)
+    if has("adapter.body") or has("adapter_down"):
+        return ("t2i_adapter", "absolute")
+    if has("control_model") or has("controlnet_cond_embedding") \
+            or has("controlnet_down_blocks"):
+        return ("controlnet", "absolute")
+    arch, conf = _detect_upscaler_arch(keys)
+    if arch is not None and conf == "absolute":
+        return ("upscaler", "absolute")
+    return None
+
+
+def _detect_base_model(keys):
+    """Base diffusion model from key signatures. Distinct architectures
+    (FLUX/SD3/SDXL) are absolute; SD1.x vs SD2 is uncertain. Recorded
+    only -- never used for routing."""
+    has = lambda sub: any(sub in k for k in keys)
+    if has("double_blocks.") or has("single_blocks."):
+        return ("FLUX.1", "absolute")
+    if has("joint_blocks."):
+        return ("SD3", "absolute")
+    if has("conditioner.embedders.1"):
+        return ("SDXL", "absolute")
+    if has("cond_stage_model.model."):
+        return ("SD2", "uncertain")
+    if has("model.diffusion_model.") or has("cond_stage_model.transformer"):
+        return ("SD1.x", "uncertain")
+    return None
+
+
+def sniff_content(path, prefix):
+    """Best-effort content facts derived DURING the hash pass (from the
+    captured prefix / bounded metadata reads -- never a second full read).
+    Returns {fact: (value, confidence)}; confidence is 'absolute' (a
+    deterministic key signature that can be nothing else) or 'uncertain'.
+    Never raises -- on any trouble, facts = {'sniff': ('unavailable', ..)}
+    and routing falls back to the API type."""
+    facts = {}
+    try:
+        ext = path.suffix.lower()
+        keys = header = None
+        if ext in (".safetensors", ".sft"):
+            header = parse_safetensors_header(prefix, path)
+            if header is not None:
+                facts["format"] = ("safetensors", "absolute")
+                keys = [k for k in header if k != "__metadata__"]
+        if keys is None and ext in (".ckpt", ".pt", ".pth", ".bin"):
+            keys = sniff_pickle_keys(path)
+            if keys is not None:
+                facts["format"] = ("pytorch-pickle", "absolute")
+        if keys is None:
+            facts["sniff"] = ("unavailable", "uncertain")
+            return facts
+        facts["tensor_count"] = (len(keys), "absolute")
+        if header is not None:
+            dt = _dominant_dtype(header)
+            if dt:
+                facts["dtype"] = (dt, "absolute")
+        kind = _detect_kind(keys)
+        if kind:
+            facts["kind"] = kind
+            if kind[0] == "upscaler":
+                arch, conf = _detect_upscaler_arch(keys)
+                if arch:
+                    facts["upscaler_arch"] = (arch, conf)
+        else:
+            # not a routing kind, but still record an upscaler-arch guess
+            arch, conf = _detect_upscaler_arch(keys)
+            if arch:
+                facts["upscaler_arch"] = (arch, conf)
+        base = _detect_base_model(keys)
+        if base:
+            facts["base_model"] = base
+        if any("first_stage_model." in k for k in keys):
+            facts["embedded_vae"] = (True, "absolute")
+        if any(".model_ema." in k or k.startswith("model_ema.") for k in keys):
+            facts["has_ema"] = (True, "absolute")
+    except Exception:
+        facts.setdefault("sniff", ("unavailable", "uncertain"))
+    return facts
 
 
 # ----------------------------------------------------------- identification
@@ -391,19 +687,77 @@ def describe_version(version):
     return label
 
 
-def type_dir(version, fentry):
-    """Directory (relative to the cache root) for a matched file.
-    model.type decides, except a files[] entry typed VAE overrides --
-    checkpoints often publish their VAE as a second file. Returns None
-    for unmapped types (refused, never guessed)."""
+def _norm_type(s):
+    return re.sub(r"[-_ ]+", "", (s or "").strip().lower())
+
+
+def resolve_placement(version, fentry, facts):
+    """Decide (relative_dir, resolved_type, arch, routing) for a matched
+    file. VAE file-entry override wins first (bundled VAEs). Otherwise the
+    Jei sniff-vs-API rule: an ABSOLUTE sniff kind routes the file (winning
+    over the API type when they disagree, and routing coarse/absent API
+    types); an uncertain/absent sniff keeps the API type. Unknown types
+    are never refused -- they get other/<Type>/."""
+    model = version.get("model") or {}
+    api_type = (model.get("type") or "").strip()
     ftype = (fentry.get("type") or "").strip()
-    if ftype.lower() == "vae":
-        return TYPE_DIRS["vae"], ftype
-    mtype = ((version.get("model") or {}).get("type") or "").strip()
-    return TYPE_DIRS.get(mtype.lower()), mtype or ftype or "?"
+    facts = facts or {}
+
+    if ftype.lower() == "vae":  # bundled-VAE second file: strongest signal
+        return TYPE_DIRS["vae"], "VAE", None, "file-entry:VAE"
+
+    kind, kconf = facts.get("kind", (None, None))
+    sniff_type = KIND_TO_TYPE.get(kind)
+    if sniff_type and kconf == "absolute":
+        if _norm_type(sniff_type) == _norm_type(api_type):
+            routing = "agree"
+        else:
+            routing = f"sniff-override(api={api_type or 'none'})"
+        resolved = sniff_type
+    else:
+        resolved = api_type
+        routing = "api" if api_type else "api-missing"
+
+    arch = None
+    key = resolved.lower()
+    if key == "upscaler":
+        arch = facts.get("upscaler_arch", (None,))[0]
+        rel = UPSCALER_ARCH_DIRS.get(arch, UPSCALER_CATCHALL)
+    elif key in TYPE_DIRS:
+        rel = TYPE_DIRS[key]
+    else:
+        rel = "other/" + (sanitize_component(resolved) or "Unknown")
+    return rel, resolved or "Unknown", arch, routing
 
 
 # ---------------------------------------------------------------- placement
+
+def sanitize_component(s):
+    """model.name / version.name -> filename-safe component: drop path and
+    Windows-hostile characters, collapse whitespace to '-', collapse
+    repeated dashes, strip leading/trailing dots/dashes/spaces. Unicode
+    letters are kept."""
+    if not isinstance(s, str):
+        return ""
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "", s)
+    s = re.sub(r"\s+", "-", s.strip())
+    s = re.sub(r"-{2,}", "-", s)
+    return s.strip(" .-")
+
+
+def normalized_name(version, fentry, disambiguator=None):
+    """<sanitized model.name>_<sanitized version.name>[-<disamb>] + ext.
+    The extension is taken from the original files[].name so the on-disk
+    type is preserved."""
+    model = version.get("model") or {}
+    mname = sanitize_component(model.get("name")) or "model"
+    vname = sanitize_component(version.get("name")) or "v"
+    ext = Path(fentry.get("name") or "").suffix
+    base = f"{mname}_{vname}"
+    if disambiguator:
+        base += "-" + disambiguator
+    return base + ext
+
 
 def place_file(args, src, dest, mode):
     """Get src's content to dest atomically. Returns a short verb
@@ -434,10 +788,10 @@ def place_file(args, src, dest, mode):
     return verb
 
 
-def write_sidecar(args, dest, version, sha, src, apply_mode):
+def write_sidecar(args, dest, version, extra, apply_mode):
     """Write <placed-stem>.civitai.info: the raw model-version response
-    (Civitai Helper convention) plus our provenance under
-    extensions.droste, so naive consumers still parse it. An existing
+    (Civitai Helper convention) plus our provenance + routing/sniff record
+    under extensions.droste, so naive consumers still parse it. An existing
     sidecar is left alone -- conservative, never clobbered."""
     side = dest.with_name(dest.stem + ".civitai.info")
     if side.exists():
@@ -448,8 +802,7 @@ def write_sidecar(args, dest, version, sha, src, apply_mode):
         return
     info = dict(version)
     ext = dict(info.get("extensions") or {})
-    ext["droste"] = {"tool": "droste-civitai-adopt/0.1",
-                     "sha256": sha, "adopted_from": str(src)}
+    ext["droste"] = {"tool": "droste-civitai-adopt/0.2", **extra}
     info["extensions"] = ext
     tmp = side.parent / f".tmp-{side.name}-{os.getpid()}"
     try:
@@ -528,12 +881,14 @@ def build_parser():
                     "(checkpoints, LoRAs, VAEs, embeddings, ...) into a "
                     "webui-style cache dir -- no re-download. Each file is "
                     "IDENTIFIED by its sha256 via the CivitAI API and "
-                    "adopted only on hash proof, with a .civitai.info "
-                    "metadata sidecar; everything else is refused. NOTE: "
-                    "CivitAI never hashed some very old uploads -- those "
-                    "404 by hash even though genuine; local metadata "
-                    "sidecars and --version-id cover them. DRY-RUN by "
-                    "default: pass --apply to actually change the cache.",
+                    "adopted only on hash proof; content is sniffed during "
+                    "the hash pass to route it to a fine-grained directory, "
+                    "and it is placed under a normalized <Model>_<Version> "
+                    "name with a .civitai.info sidecar. Unidentifiable "
+                    "files are refused. NOTE: CivitAI never hashed some very "
+                    "old uploads -- those 404 by hash even though genuine; "
+                    "local metadata sidecars and --version-id cover them. "
+                    "DRY-RUN by default: pass --apply to change the cache.",
         epilog=EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version-id", type=int, metavar="N",
@@ -567,39 +922,78 @@ def build_parser():
     p.add_argument("-q", "--quiet", action="count", default=0,
                    help="only refusals, warnings and the summary")
     p.add_argument("-v", "--verbose", action="count", default=0,
-                   help="show hashes, API details, per-step decisions")
+                   help="show hashes, sniff facts, API details, decisions")
     return p
 
 
-def adopt_group(args, cache, version, entries, hash_memo):
-    """Place all files matched to one model version: canonical name +
-    type dir + sidecar + preview, never clobbering anything. `entries`
-    is [(src, sha256, files[]-entry), ...]. Returns
+def _sidecar_extra(version, plan, name):
+    """extensions.droste payload: provenance + normalization + routing +
+    the full sniff record (each fact as {value, confidence})."""
+    model = version.get("model") or {}
+    facts = {k: {"value": v[0], "confidence": v[1]}
+             for k, v in (plan["facts"] or {}).items()}
+    extra = {
+        "sha256": plan["sha"],
+        "adopted_from": str(plan["src"]),
+        "original_name": plan["fentry"].get("name"),
+        "normalized_name": name,
+        "modelId": version.get("modelId") or model.get("id"),
+        "modelVersionId": version.get("id"),
+        "api_type": model.get("type"),
+        "resolved_type": plan["rtype"],
+        "routing": plan["routing"],
+        "sniff": facts,
+    }
+    if plan["arch"]:
+        extra["upscaler_arch"] = plan["arch"]
+    if "base_model" in (plan["facts"] or {}):
+        extra["sniffed_base_model"] = plan["facts"]["base_model"][0]
+    return extra
+
+
+def adopt_group(args, cache, version, entries, scan_memo):
+    """Place all files matched to one model version: resolve dir (API type
+    refined by content sniff) + normalized name (disambiguated on same-dir
+    collision) + sidecar + preview, never clobbering anything. `entries`
+    is [(src, sha256, files[]-entry, facts), ...]. Returns
     (adopted, already, refused)."""
     apply_mode = args.apply
     log(args, 1, f"version {describe_version(version)} "
                  f"(id {version.get('id', '?')}) | {len(entries)} file(s) "
                  f"| mode: {args.mode}")
 
+    # Plan every placement first so same-dir/same-name collisions within
+    # this version can be disambiguated deterministically.
+    plans = []
+    for src, sha, fentry, facts in entries:
+        rel, rtype, arch, routing = resolve_placement(version, fentry, facts)
+        plans.append({"src": src, "sha": sha, "fentry": fentry,
+                      "facts": facts, "rel": rel, "rtype": rtype,
+                      "arch": arch, "routing": routing,
+                      "base": normalized_name(version, fentry)})
+    collide = Counter((p["rel"], p["base"]) for p in plans)
+    for p in plans:
+        if collide[(p["rel"], p["base"])] > 1:
+            stem = sanitize_component(Path(p["fentry"].get("name") or "").stem)
+            p["base"] = normalized_name(version, p["fentry"],
+                                        disambiguator=stem or p["sha"][:8])
+
     adopted = already = refused = 0
-    for src, sha, fentry in entries:
+    for p in plans:
+        src, sha, rel = p["src"], p["sha"], p["rel"]
         shown = str(src)
-        name = safe_filename(fentry.get("name"))
+        name = safe_filename(p["base"])
         if name is None:
-            log(args, 0, f"REFUSE  {shown}: unsafe filename from the API: "
-                         f"{fentry.get('name')!r}")
-            refused += 1
-            continue
-        rel, tlabel = type_dir(version, fentry)
-        if rel is None:
-            log(args, 0, f"REFUSE  {shown}: unmapped CivitAI type "
-                         f"{tlabel!r}; place it manually")
+            log(args, 0, f"REFUSE  {shown}: could not derive a safe "
+                         f"filename from the model/version names")
             refused += 1
             continue
         dest = cache / rel / name
+        extra = _sidecar_extra(version, p, name)
 
         if dest.exists():
-            if memo_hash(dest, dest.stat().st_size, hash_memo, args) != sha:
+            d_sha, _ = memo_scan(dest, dest.stat().st_size, scan_memo, args)
+            if d_sha != sha:
                 log(args, 0, f"REFUSE  {shown}: {rel}/{name} exists with "
                              f"DIFFERENT content; refusing to overwrite")
                 refused += 1
@@ -607,7 +1001,7 @@ def adopt_group(args, cache, version, entries, hash_memo):
             log(args, 1, f"ALREADY {shown}")
             log(args, 1, f"        == {rel}/{name} (same content already "
                          f"in cache)")
-            write_sidecar(args, dest, version, sha, src, apply_mode)
+            write_sidecar(args, dest, version, extra, apply_mode)
             carry_preview(args, src, dest, apply_mode)
             already += 1
             if apply_mode and args.mode == "move" \
@@ -621,10 +1015,12 @@ def adopt_group(args, cache, version, entries, hash_memo):
         else:
             verb = {"link": "would hardlink", "copy": "would copy",
                     "move": "would move"}[args.mode]
+        note = f" via {p['routing']}" \
+            if p["routing"].startswith("sniff-override") else ""
         log(args, 0, f"ADOPT   {shown}")
         log(args, 0, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
-                     f"[{verb}]")
-        write_sidecar(args, dest, version, sha, src, apply_mode)
+                     f"[{verb}]{note}")
+        write_sidecar(args, dest, version, extra, apply_mode)
         prev = carry_preview(args, src, dest, apply_mode)
         if apply_mode and args.mode == "move":
             src.unlink()
@@ -644,13 +1040,13 @@ def main(argv=None):
     cache = resolve_cache(args.cache)
     token = find_token()
     files = gather_files(args, args.paths)
-    hash_memo = {}  # each file (and clobber-checked dest) hashed once
+    scan_memo = {}  # path -> (sha256, facts); each file scanned once
     header = (f"{'DRY RUN (pass --apply to make changes)' if not apply_mode else 'APPLY'}"
               f" | cache: {cache}")
 
     refused = 0
     versions_cache = {}  # version id -> version object (or None), per run
-    groups = {}  # version id -> [(src, sha, files[]-entry), ...]
+    groups = {}  # version id -> [(src, sha, files[]-entry, facts), ...]
 
     if args.version_id:
         progress(args, f"  fetching version {args.version_id}...")
@@ -663,23 +1059,25 @@ def main(argv=None):
         log(args, 1, header)
         entries = hash_entries(version)
         for f in files:
-            sha = memo_hash(f, f.stat().st_size, hash_memo, args)
+            sha, facts = memo_scan(f, f.stat().st_size, scan_memo, args,
+                                   sniff=True)
             fentry = entries.get(sha)
             if fentry is None:
                 log(args, 0, f"REFUSE  {f}: not byte-identical to any "
                              f"file in version {args.version_id}")
                 refused += 1
                 continue
-            groups.setdefault(version["id"], []).append((f, sha, fentry))
+            groups.setdefault(version["id"], []).append((f, sha, fentry,
+                                                          facts))
         versions_cache[version["id"]] = version
     else:
-        # IDENTIFY phase: hash everything, one batch by-hash round-trip,
-        # then per-file sidecar fallback for the misses. One directory
-        # may hold files from many models/versions.
+        # IDENTIFY phase: hash+sniff everything, one batch by-hash round-
+        # trip, then per-file sidecar fallback for the misses. One
+        # directory may hold files from many models/versions.
         log(args, 1, header)
-        shas = {f: memo_hash(f, f.stat().st_size, hash_memo, args)
-                for f in files}
-        unique = list(dict.fromkeys(shas.values()))
+        scans = {f: memo_scan(f, f.stat().st_size, scan_memo, args,
+                              sniff=True) for f in files}
+        unique = list(dict.fromkeys(sha for sha, _ in scans.values()))
         try:
             found = batch_lookup(args, unique, token)
         except (urllib.error.URLError, TimeoutError) as e:
@@ -695,7 +1093,7 @@ def main(argv=None):
             versions_cache.setdefault(v["id"], v)
 
         for f in files:
-            sha = shas[f]
+            sha, facts = scans[f]
             if found is None:
                 log(args, 0, f"REFUSE  {f}: CivitAI lookup unavailable; "
                              f"try again or pass --version-id")
@@ -733,12 +1131,13 @@ def main(argv=None):
             v, fentry = hit
             log(args, 1, f"IDENTIFIED {f} -> {describe_version(v)} "
                          f"({note})")
-            groups.setdefault(v.get("id"), []).append((f, sha, fentry))
+            groups.setdefault(v.get("id"), []).append((f, sha, fentry,
+                                                        facts))
 
     adopted = already = 0
     for vid, entries in groups.items():
         a, c, r = adopt_group(args, cache, versions_cache[vid], entries,
-                              hash_memo)
+                              scan_memo)
         adopted += a
         already += c
         refused += r
