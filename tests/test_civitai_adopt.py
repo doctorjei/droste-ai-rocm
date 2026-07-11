@@ -21,6 +21,7 @@ Run:  python3 tests/test_civitai_adopt.py -v
 """
 
 import contextlib
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -1037,8 +1038,10 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertTrue(self.fx.dest("models/Stable-diffusion",
                                      "Bundle_v3.safetensors").exists())
+        # split_ext keeps the multi-dot .vae.safetensors extension whole,
+        # so the bundled VAE's marker survives into the normalized name
         self.assertTrue(self.fx.dest("models/VAE",
-                                     "Bundle_v3.safetensors").exists())
+                                     "Bundle_v3.vae.safetensors").exists())
 
     # ---------------------------------------------- content sniff: routing
     def test_controlnet_vs_t2i_adapter_sniff(self):
@@ -1334,6 +1337,274 @@ class CivitaiAdoptTest(unittest.TestCase):
         with contextlib.redirect_stderr(tty):
             mod.hash_file(f, 4096)
         self.assertEqual(tty.getvalue(), "")
+
+    # ------------------------- long names: split_ext / byte budget / refuse
+    WAN_MODEL = ("ON-THE-FLY 实时生成！Wan-AI 万相 Wan2.1 Video Model "
+                 "(multi-specs) - CausVid&Comfy&Kijai - workflow included")
+    WAN_VERSION = "首尾帧-FLF2V-14B-720P"
+    # Jei's expected recommendation -- CUMULATIVE cascade: NFKC (step 1)
+    # folds the fullwidth '！' to ASCII '!', which then survives step 4's
+    # CJK drop; deletions leave double dashes intact (NO re-collapse). Note
+    # the kept '!' right after 'ON-THE-FLY-'.
+    WAN_RECOMMENDED = ("ON-THE-FLY-!Wan-AI--Wan2.1-Video-Model-(multi-specs)-"
+                       "CausVid&Comfy&Kijai-workflow-included_-FLF2V-14B-720P")
+
+    def test_split_ext_variants(self):
+        self.assertEqual(mod.split_ext("model.safetensors"),
+                         ("model", ".safetensors"))
+        self.assertEqual(mod.split_ext("archive.tar.gz"),
+                         ("archive", ".tar.gz"))
+        self.assertEqual(mod.split_ext("Foo_v1.civitai.info"),
+                         ("Foo_v1", ".civitai.info"))
+        self.assertEqual(mod.split_ext("bundle_v3.vae.safetensors"),
+                         ("bundle_v3", ".vae.safetensors"))
+        self.assertEqual(mod.split_ext("noext"), ("noext", ""))
+        self.assertEqual(mod.split_ext(".hidden"), (".hidden", ""))
+        # a trailing dotted run past the cap is NOT an extension
+        long = "file." + "x" * 33
+        self.assertEqual(mod.split_ext(long), (long, ""))
+        # the cap bounds the WHOLE dotted run, not each segment
+        self.assertEqual(mod.split_ext("name.tar.twelvechars0", cap=16),
+                         ("name.tar", ".twelvechars0"))
+        # path separators never join an extension
+        self.assertEqual(mod.split_ext("../../escape.safetensors"),
+                         ("../../escape", ".safetensors"))
+
+    def test_stem_budget_is_in_bytes_not_chars(self):
+        with mock.patch.object(mod, "_name_max", return_value=255):
+            budget = mod.stem_budget_bytes(Path("/nonexistent"),
+                                           ".safetensors")
+        # reserves the widest family member: the staged .civitai.info
+        self.assertEqual(budget,
+                         255 - len(f".tmp-.civitai.info-{os.getpid()}"))
+        # bytes, never characters: 3-byte CJK burns the budget 3x faster
+        self.assertLessEqual(len(("好" * (budget // 3)).encode()), budget)
+        self.assertGreater(len(("好" * (budget // 3 + 1)).encode()), budget)
+        self.assertLessEqual(len(("x" * budget).encode()), budget)
+
+    def test_name_max_pathconf_and_fallback(self):
+        with mock.patch("os.pathconf", return_value=180):
+            self.assertEqual(mod._name_max(self.fx.cache), 180)
+        with mock.patch("os.pathconf", side_effect=OSError):
+            self.assertEqual(mod._name_max(self.fx.cache), 255)
+        # a not-yet-created dest dir resolves via its nearest ancestor
+        self.assertGreater(mod._name_max(self.fx.cache / "no" / "such"), 0)
+
+    def test_recommend_cascade_each_step(self):
+        # 1: NFKC-normalize, then drop historic-script chars (runes vanish,
+        #    fullwidth folds to ASCII)
+        self.assertEqual(mod.recommend_stem("ᚠᚹᛖ-Model", 6), "-Model")
+        self.assertEqual(mod.recommend_stem("Ｍｏｄｅｌ", 5), "Model")
+        # 2: planes 2-16 dropped (U+20000 is CJK ext-B) while BMP CJK stays
+        self.assertEqual(mod.recommend_stem("A\U00020000B好", 5), "AB好")
+        # 3: plane 1 (emoji) dropped, BMP CJK still kept
+        self.assertEqual(mod.recommend_stem("A\U0001F600B好", 5), "AB好")
+        # 4: 3-byte UTF-8 (all CJK) dropped
+        self.assertEqual(mod.recommend_stem("A好B好C", 3), "ABC")
+        # 5: non-ASCII dropped
+        self.assertEqual(mod.recommend_stem("AéBé", 2), "AB")
+        # 6: right-truncate keeping the last 8 chars -- guaranteed fit
+        self.assertEqual(mod.recommend_stem("x" * 50 + "LAST8888", 20),
+                         "x" * 12 + "LAST8888")
+        self.assertEqual(mod.recommend_stem("x" * 50 + "LAST8888", 5),
+                         "T8888")
+
+    def test_recommend_cascade_is_cumulative(self):
+        # Regression guard against reverting to independent steps: the later
+        # plane/byte filters must narrow step 1's NFKC output, NOT the raw
+        # stem. A fullwidth '！' (U+FF01) NFKC-folds to ASCII '!' (0x21) in
+        # step 1; a BMP CJK '好' (0x597D) is over budget. Step 4 (drop >=
+        # 0x800) removes the CJK while the FOLDED '!' survives -- only
+        # possible if step 4 sees the folded candidate.
+        self.assertEqual(mod.recommend_stem("Ａ！好Ｂ", 4), "A!B")
+        # were the steps independent (re-deriving from the raw stem), step 4
+        # would drop the raw fullwidth '！' too and yield "AB".
+        self.assertNotEqual(mod.recommend_stem("Ａ！好Ｂ", 4), "AB")
+
+    def test_recommend_wan_example_exact(self):
+        stem = (mod.sanitize_component(self.WAN_MODEL) + "_"
+                + mod.sanitize_component(self.WAN_VERSION))
+        self.assertEqual(len(stem.encode()), 135)  # CJK = 3 bytes/char
+        # steps 1-3 miss; step 4 lands via the CUMULATIVE path (folded '!'
+        # from step-1 NFKC is retained; CJK dropped)
+        rec = mod.recommend_stem(stem, 110)
+        self.assertEqual(rec, self.WAN_RECOMMENDED)
+        self.assertIn("ON-THE-FLY-!Wan-AI", rec)   # folded '!' kept
+        # deletions leave surrounding punctuation intact -- NO re-collapse
+        self.assertIn("Wan-AI--Wan2.1", rec)
+        self.assertIn("included_-FLF2V", rec)
+
+    def test_too_long_name_refused_batch_continues(self):
+        # THE original bug: dest.exists() on a > NAME_MAX name raised
+        # ENAMETOOLONG and killed the whole batch. Now: the fit check
+        # refuses it up front and the NEXT file still adopts.
+        long_bytes = b"the too-long model bytes"
+        ok_bytes = b"the fine model bytes"
+        fl = self.fx.add_download("long.safetensors", long_bytes)
+        fk = self.fx.add_download("ok.safetensors", ok_bytes)
+        vl = version_obj(2000, "好" * 90, "v1", "LORA",
+                         [file_entry("orig-long.safetensors", long_bytes)])
+        vk = version_obj(2001, "Fine", "v1", "LORA",
+                         [file_entry("ok.safetensors", ok_bytes)])
+        self.fx.set_by_hash({sha256(long_bytes): vl, sha256(ok_bytes): vk})
+        rc, out, err = self.fx.run("--apply", str(fl), str(fk))
+        self.assertEqual(rc, 0, err)  # something adopted -> exit 0
+        self.assertIn(f"REFUSE  {fl}", out)
+        self.assertIn("over the filesystem's name limit by", out)
+        self.assertIn("recommend: --rename", out)
+        self.assertIn("1 adopted, 0 already cached, 1 refused", out)
+        self.assertTrue(self.fx.dest("models/Lora",
+                                     "Fine_v1.safetensors").exists())
+        # nothing of the too-long family was written (or even touched)
+        self.assertFalse(any("好" in p.name
+                             for p in self.fx.cache.rglob("*")))
+
+    def test_wan_refuse_prints_byte_overage_and_recommendation(self):
+        content = b"wan flf2v model bytes"
+        f = self.fx.add_download("wan.safetensors", content)
+        v = version_obj(2100, self.WAN_MODEL, self.WAN_VERSION, "Checkpoint",
+                        [file_entry("wan_flf2v.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        # the spec's (abridged) Wan name is 147 bytes -- squeeze NAME_MAX so
+        # it overflows and the cascade still lands on step 4
+        with mock.patch.object(mod, "_name_max", return_value=140):
+            rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 1)  # nothing adopted, one refused
+        self.assertIn(f"REFUSE  {f}: name for {self.WAN_MODEL} / "
+                      f"{self.WAN_VERSION} (Checkpoint, SDXL 1.0) is over "
+                      f"the filesystem's name limit by", out)
+        self.assertIn(f"recommend: --rename '{self.WAN_RECOMMENDED}'", out)
+        self.assertEqual(list(self.fx.cache.rglob("*")), [])  # untouched
+
+    def test_per_file_oserror_refuses_and_batch_continues(self):
+        # containment is broader than the fit check: ANY per-file OSError
+        # during placement becomes a REFUSE line, never a dead batch
+        a, b = b"oserror one", b"oserror two"
+        fa = self.fx.add_download("oa.safetensors", a)
+        fb = self.fx.add_download("ob.safetensors", b)
+        va = version_obj(2500, "OA", "v1", "LORA",
+                         [file_entry("oa.safetensors", a)])
+        vb = version_obj(2501, "OB", "v1", "LORA",
+                         [file_entry("ob.safetensors", b)])
+        self.fx.set_by_hash({sha256(a): va, sha256(b): vb})
+        real, tripped = mod.place_file, []
+
+        def boom(args, src, dest, mode):
+            if not tripped:
+                tripped.append(1)
+                raise OSError(errno.ENAMETOOLONG, "File name too long")
+            return real(args, src, dest, mode)
+
+        with mock.patch.object(mod, "place_file", side_effect=boom):
+            rc, out, err = self.fx.run("--apply", str(fa), str(fb))
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"REFUSE  {fa}:", out)
+        self.assertIn("File name too long", out)
+        self.assertIn("1 adopted, 0 already cached, 1 refused", out)
+        self.assertTrue(self.fx.dest("models/Lora",
+                                     "OB_v1.safetensors").exists())
+
+    # ------------------------------------------------------------- --rename
+    def _long_name_fixture(self, content=b"long-name model bytes", vid=2300):
+        """A hash-identified file whose normalized name (90 CJK chars =
+        270 bytes) cannot fit NAME_MAX -- the --rename use case."""
+        f = self.fx.add_download("long.safetensors", content)
+        v = version_obj(vid, "好" * 90, "v1", "LORA",
+                        [file_entry("orig.safetensors", content)])
+        self.fx.set_by_hash({sha256(content): v})
+        return f
+
+    def test_rename_bare_stem_appends_source_ext(self):
+        f = self._long_name_fixture()
+        rc, out, err = self.fx.run("--apply", "--rename", "Wan21-FLF2V",
+                                   str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.fx.dest("models/Lora",
+                                     "Wan21-FLF2V.safetensors").exists())
+        # the override is captured as the guarded `filename` user field
+        u = json.loads(self.fx.user("models/Lora", "Wan21-FLF2V").read_text())
+        self.assertEqual(u["filename"], "Wan21-FLF2V.safetensors")
+
+    def test_rename_full_filename_not_doubled(self):
+        # NAME's own trailing extension (16-char detection window) matches
+        # the identified file's -> NAME is a whole filename already
+        f = self._long_name_fixture()
+        rc, out, err = self.fx.run("--apply", "--rename",
+                                   "Wan21-FLF2V.safetensors", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.fx.dest("models/Lora",
+                                     "Wan21-FLF2V.safetensors").exists())
+        self.assertFalse(self.fx.dest(
+            "models/Lora", "Wan21-FLF2V.safetensors.safetensors").exists())
+
+    def test_rename_different_ext_gets_source_ext_appended(self):
+        # .ckpt is an extension, but not THIS file's -- the tool owns the
+        # extension of the sha-identified file, so .safetensors is appended
+        f = self._long_name_fixture()
+        rc, out, err = self.fx.run("--apply", "--rename", "Wan21.ckpt",
+                                   str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.fx.dest("models/Lora",
+                                     "Wan21.ckpt.safetensors").exists())
+
+    def test_rename_still_too_long_self_validates(self):
+        f = self._long_name_fixture()
+        rc, out, err = self.fx.run("--apply", "--rename", "x" * 300, str(f))
+        self.assertEqual(rc, 1)
+        self.assertIn("over the filesystem's name limit by", out)
+        self.assertEqual([p for p in self.fx.cache.rglob("*") if p.is_file()],
+                         [])  # never writes an unusable name
+
+    def test_rename_requires_exactly_one_file(self):
+        a, b = b"rename file one", b"rename file two"
+        fa = self.fx.add_download("one.safetensors", a)
+        fb = self.fx.add_download("two.safetensors", b)
+        va = version_obj(2400, "One", "v1", "LORA",
+                         [file_entry("one.safetensors", a)])
+        vb = version_obj(2401, "Two", "v1", "LORA",
+                         [file_entry("two.safetensors", b)])
+        self.fx.set_by_hash({sha256(a): va, sha256(b): vb})
+        rc, out, err = self.fx.run("--apply", "--rename", "X",
+                                   str(fa), str(fb))
+        self.assertEqual(rc, 2)
+        self.assertIn("--rename applies to a single file; 2 matched", err)
+        self.assertEqual(list(self.fx.cache.rglob("*")), [])
+
+    # -------------------------------------------- filename capture/read-back
+    def test_readback_makes_plain_rerun_already(self):
+        f = self._long_name_fixture()
+        rc, out, err = self.fx.run("--apply", "--rename", "Shorty", str(f))
+        self.assertEqual(rc, 0, err)
+        # plain re-run, NO --rename: the routed dir's .meta.droste sha scan
+        # reads the recorded filename back -> ALREADY, not a re-refuse
+        rc, out, err = self.fx.run("--apply", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("ALREADY", out)
+        self.assertIn("0 adopted, 1 already cached, 0 refused", out)
+        self.assertNotIn("REFUSE", out)
+
+    def test_rename_conflict_guarded_then_forced(self):
+        f = self._long_name_fixture()
+        rc, out, err = self.fx.run("--apply", "--rename", "FirstName", str(f))
+        self.assertEqual(rc, 0, err)
+        # a DIFFERENT --rename conflicts with the recorded filename ->
+        # guarded like any user field: refuse without --force
+        rc, out, err = self.fx.run("--apply", "--rename", "SecondName",
+                                   str(f))
+        self.assertEqual(rc, 1)
+        self.assertIn("sheepishly refusing", err)
+        self.assertIn("filename", err)
+        self.assertIn("old: FirstName.safetensors", err)
+        self.assertIn("new: SecondName.safetensors", err)
+        self.assertFalse(self.fx.dest("models/Lora",
+                                      "SecondName.safetensors").exists())
+        rc, out, err = self.fx.run("--apply", "--force", "--rename",
+                                   "SecondName", str(f))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.fx.dest("models/Lora",
+                                     "SecondName.safetensors").exists())
+        u = json.loads(self.fx.user("models/Lora", "SecondName").read_text())
+        self.assertEqual(u["filename"], "SecondName.safetensors")
 
     def test_help_exits_zero(self):
         with self.assertRaises(SystemExit) as cm:

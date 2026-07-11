@@ -55,8 +55,9 @@ tool-internal/redundant -> drop.
      notes/preferred_weight/usage_tips/favorite, title (cm-info UserTitle
      when it differs from the model name), trigger_words and tags kept as
      the user-distinct DELTA vs CivitAI trainedWords/tags, inference_defaults
-     (cm-info), plus an 'unmatched' discovery bucket for truly-unknown keys
-     (surfaced on screen). Written ONLY when non-empty.
+     (cm-info), filename (a --rename override, read back on re-runs), plus
+     an 'unmatched' discovery bucket for truly-unknown keys (surfaced on
+     screen). Written ONLY when non-empty.
 
 Every adopt (new placement AND already-cached) runs an idempotent SYNC:
 each sidecar is recomputed, canonically serialized, and written ONLY if it
@@ -83,6 +84,16 @@ content counts as already cached, different content is refused); source
 files are never deleted except under --move, and only after successful
 placement.
 
+Composed names can outgrow the destination filesystem's NAME_MAX (255
+bytes on ext4 -- BYTES, so CJK costs 3 per character). A name whose whole
+sidecar family cannot fit is REFUSED up front, with its byte overage and
+a recommended shorter stem, and the batch continues -- the tool never
+truncates a name itself. Pass --rename NAME (the run must match exactly
+one file) to choose the stem yourself: it is recorded as `filename` in
+.user.droste (guarded like any user field) and read back on later runs,
+so a plain re-run lands on ALREADY instead of re-refusing. Any other
+per-file OSError likewise refuses that file only, never the batch.
+
 DEFAULT IS DRY-RUN: nothing is touched until you pass --apply.
 """
 
@@ -95,6 +106,7 @@ import pickle
 import re
 import shutil
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -178,9 +190,11 @@ TOOL_ID = "droste-civitai-adopt/0.3"
 # Anything NOT in a format's table is 'unmatched' -> the discovery bucket.
 
 # The normalized user fields the guard protects + the sync monotonically
-# preserves (title + inference_defaults included -> 8 guarded fields).
+# preserves (title, inference_defaults and the --rename-captured filename
+# included -> 9 guarded fields).
 USER_PREF_FIELDS = ("notes", "preferred_weight", "usage_tips", "favorite",
-                    "tags", "trigger_words", "title", "inference_defaults")
+                    "tags", "trigger_words", "title", "inference_defaults",
+                    "filename")
 # suffix -> source format, for the per-format extraction below
 USER_SIDECAR_FORMATS = {
     ".json": "a1111",             # AUTOMATIC1111 flat sidecar
@@ -267,6 +281,11 @@ examples:
   # its model version id -- adoption still requires the version to list
   # our exact sha256:
   droste-civitai-adopt --apply --version-id 128713 ~/old/dreamshaper.ckpt
+
+  # A <Model>_<Version> name past the filesystem's 255-BYTE limit (CJK is
+  # 3 bytes/char) is refused with a recommended shorter stem; adopt it
+  # under your own name instead (recorded, and reused on re-runs):
+  droste-civitai-adopt --apply --rename 'Wan21-FLF2V-14B-720P' ~/dl/wan.safetensors
 
 Only files whose sha256 the CivitAI API can prove are adopted; everything
 else is refused with a reason. Each model gets three sidecars -- a pure
@@ -867,18 +886,145 @@ def sanitize_component(s):
     return s.strip(" .-")
 
 
+def split_ext(name, cap=32):
+    """(stem, ext) where ext is the dotted trailing run accumulated RIGHT-
+    to-left while it stays within `cap` characters -- so multi-dot
+    extensions (.tar.gz, .civitai.info, .vae.safetensors) hold together,
+    while a dotted run past `cap` is no extension at all and falls into
+    the stem. Segments must be non-empty and free of path separators and
+    whitespace; a leading dot (hidden file) never starts an extension.
+    Replaces Path.suffix's last-dot rule wherever a model file's extension
+    is derived."""
+    stem, ext = name, ""
+    while True:
+        i = stem.rfind(".")
+        if i <= 0:
+            break
+        seg = stem[i + 1:]
+        if not seg or any(c in "/\\" or c.isspace() for c in seg):
+            break
+        cand = stem[i:] + ext
+        if len(cand) > cap:
+            break
+        stem, ext = stem[:i], cand
+    return stem, ext
+
+
 def normalized_name(version, fentry, disambiguator=None):
     """<sanitized model.name>_<sanitized version.name>[-<disamb>] + ext.
     The extension is taken from the original files[].name so the on-disk
-    type is preserved."""
+    type is preserved (split_ext: multi-dot extensions ride along whole)."""
     model = version.get("model") or {}
     mname = sanitize_component(model.get("name")) or "model"
     vname = sanitize_component(version.get("name")) or "v"
-    ext = Path(fentry.get("name") or "").suffix
+    ext = split_ext(fentry.get("name") or "")[1]
     base = f"{mname}_{vname}"
     if disambiguator:
         base += "-" + disambiguator
     return base + ext
+
+
+# ------------------------------------------------- name-length byte budget
+
+def _name_max(directory):
+    """NAME_MAX in BYTES for the filesystem holding `directory`, walking up
+    past not-yet-created components; 255 when pathconf cannot say."""
+    d = Path(directory)
+    while True:
+        try:
+            nm = os.pathconf(str(d), "PC_NAME_MAX")
+            if nm > 0:
+                return nm
+        except (OSError, ValueError, AttributeError):
+            pass
+        if d.parent == d:
+            return 255
+        d = d.parent
+
+
+def stem_budget_bytes(directory, ext):
+    """How many UTF-8 BYTES a placed stem may hold in `directory`: NAME_MAX
+    minus the worst family member built over the stem -- the model file
+    itself, the widest sidecar (which derives from dest.stem, so all of the
+    ext but its last dotted segment survives into it), the carried preview,
+    and the .tmp-<name>-<pid> staging form of each. Everything here is
+    bytes, never characters (CJK costs 3 per character)."""
+    ext_b = len(ext.encode())
+    # sidecars/previews build on dest.stem == stem + ext-minus-last-segment
+    side_b = ext_b - len(ext[ext.rfind("."):].encode()) if ext else 0
+    tmp_b = len(f".tmp--{os.getpid()}".encode())  # staging wraps a name
+    worst = max(
+        ext_b,                                   # the model file
+        side_b + len(".civitai.info"),           # widest sidecar
+        side_b + len(".preview.jpeg"),           # widest carried preview
+        ext_b + tmp_b,                           # staged model file
+        side_b + len(".civitai.info") + tmp_b,   # staged sidecar/preview
+    )
+    return _name_max(directory) - worst
+
+
+# Unicode blocks of historic/archaic scripts, dropped FIRST by the
+# recommendation cascade (the least likely part of a name a user wants to
+# keep). Inclusive codepoint ranges; the stdlib has no script API, so this
+# is a small curated table, not an exhaustive one.
+HISTORIC_SCRIPT_RANGES = (
+    (0x1680, 0x169F),    # Ogham
+    (0x16A0, 0x16FF),    # Runic
+    (0x10000, 0x1007F),  # Linear B Syllabary
+    (0x10080, 0x100FF),  # Linear B Ideograms
+    (0x10100, 0x1013F),  # Aegean Numbers
+    (0x10280, 0x1029F),  # Lycian
+    (0x102A0, 0x102DF),  # Carian
+    (0x10300, 0x1032F),  # Old Italic
+    (0x10330, 0x1034F),  # Gothic
+    (0x10380, 0x1039F),  # Ugaritic
+    (0x103A0, 0x103DF),  # Old Persian
+    (0x10600, 0x1077F),  # Linear A
+    (0x10900, 0x1091F),  # Phoenician
+    (0x10A00, 0x10A5F),  # Kharoshthi
+    (0x10C00, 0x10C4F),  # Old Turkic
+    (0x10C80, 0x10CFF),  # Old Hungarian
+    (0x12000, 0x123FF),  # Cuneiform
+    (0x12400, 0x1247F),  # Cuneiform Numbers and Punctuation
+    (0x13000, 0x1342F),  # Egyptian Hieroglyphs
+    (0x14400, 0x1467F),  # Anatolian Hieroglyphs
+)
+
+
+def _is_historic(cp):
+    return any(lo <= cp <= hi for lo, hi in HISTORIC_SCRIPT_RANGES)
+
+
+def recommend_stem(stem, budget):
+    """Advisory shortened stem for a REFUSEd too-long name -- the tool
+    NEVER applies it; the user pastes it into --rename. A CUMULATIVE cascade
+    of ever-blunter filters: each step narrows the PREVIOUS step's candidate
+    (never re-derives from the raw stem), returned at the first that fits
+    `budget` bytes. Deleted characters leave their surrounding punctuation
+    intact (no dash/space re-collapse), so the result stays honest about
+    what was removed:
+      1. NFKC-normalize, then drop historic/archaic-script characters
+         (NFKC folds e.g. fullwidth '！' U+FF01 -> ASCII '!', which then
+         survives every later step)
+      2. drop Unicode planes 2-16      (codepoint >= 0x20000)
+      3. drop plane 1                  (>= 0x10000)
+      4. drop 3-byte UTF-8             (>= 0x800; all CJK)
+      5. drop non-ASCII                (>= 0x80)
+      6. right-truncate keeping the last 8 characters (always fits)."""
+    def fits(s):
+        return len(s.encode()) <= budget
+    cand = unicodedata.normalize("NFKC", stem)
+    cand = "".join(c for c in cand if not _is_historic(ord(c)))
+    if fits(cand):
+        return cand
+    for bound in (0x20000, 0x10000, 0x800, 0x80):
+        cand = "".join(c for c in cand if ord(c) < bound)  # narrow PREVIOUS
+        if fits(cand):
+            return cand
+    keep = cand[-8:]           # cand is pure ASCII after step 5
+    if budget <= len(keep):
+        return keep[len(keep) - budget:] if budget > 0 else ""
+    return cand[:-len(keep)][:budget - len(keep)] + keep
 
 
 def place_file(args, src, dest, mode):
@@ -955,6 +1101,26 @@ def write_if_changed(args, path, obj, apply_mode, label):
         tmp.unlink(missing_ok=True)
     log(args, 2, f"# synced {label}: {path.name}")
     return "written"
+
+
+def stored_user_prefs(dirpath, sha):
+    """READ-BACK: find an existing placement of `sha` in the routed dir by
+    scanning its *.meta.droste sidecars, and return (user_path, user_dict)
+    for its paired .user.droste -- (None, None) when nothing matches. A
+    prior --rename left `filename` there; reusing it makes a plain re-run
+    land on ALREADY instead of re-refusing a too-long normalized name.
+    Tolerant of a missing dir and unreadable/foreign json."""
+    try:
+        metas = sorted(dirpath.glob("*.meta.droste"))
+    except OSError:
+        return None, None
+    for mp in metas:
+        meta = _read_json(mp)
+        if not meta or meta.get("sha256") != sha:
+            continue
+        up = mp.with_name(mp.name[:-len(".meta.droste")] + ".user.droste")
+        return up, _read_json(up)
+    return None, None
 
 
 # ------------------------------- source-sidecar categorization + enrichment
@@ -1336,6 +1502,15 @@ def build_parser():
                         "does NOT imply --apply and does NOT bypass the "
                         "hash identity gate or the different-content "
                         "model-file refusal")
+    p.add_argument("--rename", metavar="NAME",
+                   help="place the adopted file under NAME instead of the "
+                        "normalized <Model>_<Version> name (the escape for "
+                        "names past the filesystem's byte limit -- the tool "
+                        "never truncates on its own). A bare stem gets the "
+                        "identified file's extension appended; a NAME that "
+                        "already ends in it is used whole. Recorded in "
+                        ".user.droste and reused on later runs. The run "
+                        "must match exactly one file")
     p.add_argument("--recursive", action="store_true",
                    help="recurse into directories")
     p.add_argument("--cache", metavar="DIR",
@@ -1397,7 +1572,6 @@ def adopt_group(args, cache, version, entries, scan_memo):
     collision) + sidecar + preview, never clobbering anything. `entries`
     is [(src, sha256, files[]-entry, facts), ...]. Returns
     (adopted, already, refused)."""
-    apply_mode = args.apply
     log(args, 1, f"version {describe_version(version)} "
                  f"(id {version.get('id', '?')}) | {len(entries)} file(s) "
                  f"| mode: {args.mode}")
@@ -1423,90 +1597,153 @@ def adopt_group(args, cache, version, entries, scan_memo):
     for p in plans:
         src, sha, rel = p["src"], p["sha"], p["rel"]
         shown = str(src)
-        name = safe_filename(p["base"])
-        if name is None:
-            log(args, 0, f"REFUSE  {shown}: could not derive a safe "
-                         f"filename from the model/version names")
+        # BATCH CONTAINMENT: any per-file OSError (ENAMETOOLONG on a path
+        # the fit check could not foresee, a permission wall, ...) refuses
+        # THIS file and the batch continues -- it never aborts the run.
+        try:
+            adopted_one, already_one = _adopt_one(
+                args, cache, version, p, scan_memo, run_discoveries)
+        except OSError as e:
+            log(args, 0, f"REFUSE  {shown}: {e}")
             refused += 1
             continue
-        dest = cache / rel / name
-        _, _, user_p = sidecar_paths(dest)
-
-        # Sort the source-sidecar fields once (user / meta-subtype / enrich /
-        # drop / unmatched), relative to the hash-proven CivitAI version.
-        cat = categorize_sources(src, version)
-        discoveries = cat["discoveries"]
-
-        # USER-DATA GUARD -- run BEFORE any placement/move/write. Compare
-        # incoming ingested prefs against an on-disk .user.droste; a
-        # conflicting field aborts this file's entire adoption unless
-        # --force is given.
-        incoming_user = incoming_user_prefs(cat)
-        merged_user, conflicts = merge_user_prefs(_read_json(user_p),
-                                                  incoming_user)
-        if conflicts and not args.force:
-            print_user_conflict(user_p, conflicts)
-            log(args, 0, f"REFUSE  {shown}: existing user data in "
-                         f"{user_p.name} would be overwritten; pass --force")
+        adopted += adopted_one
+        already += already_one
+        if not (adopted_one or already_one):
             refused += 1
-            continue
-        if conflicts:  # --force: overwrite the conflicting fields
-            for field, _old, new in conflicts:
-                merged_user[field] = new
-
-        meta = _meta_payload(version, p, name, cat["meta_sub_type"])
-        info = enrich_civitai_info(version, cat["enrich_scalars"],
-                                   cat["enrich_images"], p["facts"])
-        dest_exists = dest.exists()
-        if dest_exists:
-            d_sha, _ = memo_scan(dest, dest.stat().st_size, scan_memo, args)
-            if d_sha != sha:
-                log(args, 0, f"REFUSE  {shown}: {rel}/{name} exists with "
-                             f"DIFFERENT content; refusing to overwrite")
-                refused += 1
-                continue
-            log(args, 1, f"ALREADY {shown}")
-            log(args, 1, f"        == {rel}/{name} (same content already "
-                         f"in cache)")
-        else:
-            if apply_mode:
-                verb = place_file(args, src, dest, args.mode)
-            else:
-                verb = {"link": "would hardlink", "copy": "would copy",
-                        "move": "would move"}[args.mode]
-            note = f" via {p['routing']}" \
-                if p["routing"].startswith("sniff-override") else ""
-            # level 1 so -q suppresses the per-file adopt lines (leaving the
-            # data-dump view: progress + unrecognized list + summary)
-            log(args, 1, f"ADOPT   {shown}")
-            log(args, 1, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
-                         f"[{verb}]{note}")
-
-        # discovery signal: unrecognized source fields kept under 'unmatched'.
-        # Non-quiet prints them inline per file; quiet collects them for one
-        # consolidated block before the summary (the -q data-dump view).
-        for fname, keys in discoveries:
-            run_discoveries.append((fname, keys))
-            if not args.quiet:
-                log(args, 1, f"note: unrecognized field(s) in {fname}: "
-                             f"{', '.join(keys)} — kept under 'unmatched'")
-
-        # idempotent metadata sync -- both branches, write-only-if-changed
-        sync_sidecars(args, dest, info, meta, merged_user, apply_mode)
-        prev = carry_preview(args, src, dest, apply_mode)
-
-        if apply_mode and args.mode == "move" \
-                and src.resolve() != dest.resolve():
-            src.unlink()
-            if prev is not None:
-                prev.unlink()  # carried successfully -> reclaim it too
-            log(args, 1, "        source removed (--move)")
-
-        if dest_exists:
-            already += 1
-        else:
-            adopted += 1
     return adopted, already, refused, run_discoveries
+
+
+def _adopt_one(args, cache, version, p, scan_memo, run_discoveries):
+    """Place ONE planned file (the body of adopt_group's loop). Returns
+    (adopted, already) as 0/1 -- (0, 0) means this file was refused (the
+    reason has been logged). Raises OSError on filesystem trouble; the
+    caller contains it to this file."""
+    apply_mode = args.apply
+    src, sha, rel = p["src"], p["sha"], p["rel"]
+    shown = str(src)
+
+    # READ-BACK: an earlier run may have placed this very sha under a
+    # user-chosen name (--rename); reuse that recorded `filename` so a
+    # plain re-run lands on ALREADY instead of re-refusing a too-long
+    # normalized name.
+    stored_user_p, stored_user = stored_user_prefs(cache / rel, sha)
+    base = p["base"]
+    stored_name = (stored_user or {}).get("filename")
+    if isinstance(stored_name, str) and stored_name:
+        base = stored_name
+
+    # --rename override (the run is gated to exactly ONE file; see main).
+    # NAME is a bare stem unless its own trailing extension -- parsed with
+    # a tighter 16-char detection window -- equals the identified file's
+    # extension, in which case NAME is already a whole filename. Either
+    # way the tool owns the extension of the sha-identified file.
+    if args.rename is not None:
+        ext = split_ext(p["fentry"].get("name") or "")[1]
+        _, own_ext = split_ext(args.rename, cap=16)
+        base = args.rename if own_ext == ext else args.rename + ext
+
+    name = safe_filename(base)
+    if name is None:
+        log(args, 0, f"REFUSE  {shown}: could not derive a safe "
+                     f"filename from the model/version names")
+        return 0, 0
+
+    # FIT CHECK -- in BYTES, and BEFORE any exists()/stat on dest, so a
+    # name past NAME_MAX is refused, never touched (pathlib.Path.exists
+    # propagates ENAMETOOLONG). The recommendation is advisory only: the
+    # user pastes it into --rename; the tool never applies it.
+    stem, ext = split_ext(name)
+    budget = stem_budget_bytes(cache / rel, ext)
+    over = len(stem.encode()) - budget
+    if over > 0:
+        log(args, 0, f"REFUSE  {shown}: name for "
+                     f"{describe_version(version)} is over the "
+                     f"filesystem's name limit by {over} bytes")
+        log(args, 0, f"        recommend: --rename "
+                     f"'{recommend_stem(stem, budget)}'")
+        return 0, 0
+    dest = cache / rel / name
+    _, _, user_p = sidecar_paths(dest)
+
+    # Sort the source-sidecar fields once (user / meta-subtype / enrich /
+    # drop / unmatched), relative to the hash-proven CivitAI version.
+    cat = categorize_sources(src, version)
+    discoveries = cat["discoveries"]
+
+    # USER-DATA GUARD -- run BEFORE any placement/move/write. Compare
+    # incoming ingested prefs against an on-disk .user.droste; a
+    # conflicting field aborts this file's entire adoption unless
+    # --force is given. A stem that differs from the pure normalized
+    # name (a --rename, now or read back) rides along as the guarded
+    # `filename` field; when the final dest has no user file yet, the
+    # read-back one (same sha, earlier name) is the guard's basis, so a
+    # DIFFERENT --rename cannot silently shed the recorded name.
+    incoming_user = incoming_user_prefs(cat)
+    if name != p["base"]:
+        incoming_user = dict(incoming_user or {})
+        incoming_user["filename"] = name
+    ondisk_user, guard_p = _read_json(user_p), user_p
+    if ondisk_user is None and stored_user is not None:
+        ondisk_user, guard_p = stored_user, stored_user_p
+    merged_user, conflicts = merge_user_prefs(ondisk_user, incoming_user)
+    if conflicts and not args.force:
+        print_user_conflict(guard_p, conflicts)
+        log(args, 0, f"REFUSE  {shown}: existing user data in "
+                     f"{guard_p.name} would be overwritten; pass --force")
+        return 0, 0
+    if conflicts:  # --force: overwrite the conflicting fields
+        for field, _old, new in conflicts:
+            merged_user[field] = new
+
+    meta = _meta_payload(version, p, name, cat["meta_sub_type"])
+    info = enrich_civitai_info(version, cat["enrich_scalars"],
+                               cat["enrich_images"], p["facts"])
+    dest_exists = dest.exists()
+    if dest_exists:
+        d_sha, _ = memo_scan(dest, dest.stat().st_size, scan_memo, args)
+        if d_sha != sha:
+            log(args, 0, f"REFUSE  {shown}: {rel}/{name} exists with "
+                         f"DIFFERENT content; refusing to overwrite")
+            return 0, 0
+        log(args, 1, f"ALREADY {shown}")
+        log(args, 1, f"        == {rel}/{name} (same content already "
+                     f"in cache)")
+    else:
+        if apply_mode:
+            verb = place_file(args, src, dest, args.mode)
+        else:
+            verb = {"link": "would hardlink", "copy": "would copy",
+                    "move": "would move"}[args.mode]
+        note = f" via {p['routing']}" \
+            if p["routing"].startswith("sniff-override") else ""
+        # level 1 so -q suppresses the per-file adopt lines (leaving the
+        # data-dump view: progress + unrecognized list + summary)
+        log(args, 1, f"ADOPT   {shown}")
+        log(args, 1, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
+                     f"[{verb}]{note}")
+
+    # discovery signal: unrecognized source fields kept under 'unmatched'.
+    # Non-quiet prints them inline per file; quiet collects them for one
+    # consolidated block before the summary (the -q data-dump view).
+    for fname, keys in discoveries:
+        run_discoveries.append((fname, keys))
+        if not args.quiet:
+            log(args, 1, f"note: unrecognized field(s) in {fname}: "
+                         f"{', '.join(keys)} — kept under 'unmatched'")
+
+    # idempotent metadata sync -- both branches, write-only-if-changed
+    sync_sidecars(args, dest, info, meta, merged_user, apply_mode)
+    prev = carry_preview(args, src, dest, apply_mode)
+
+    if apply_mode and args.mode == "move" \
+            and src.resolve() != dest.resolve():
+        src.unlink()
+        if prev is not None:
+            prev.unlink()  # carried successfully -> reclaim it too
+        log(args, 1, "        source removed (--move)")
+
+    return (0, 1) if dest_exists else (1, 0)
 
 
 def main(argv=None):
@@ -1611,6 +1848,11 @@ def main(argv=None):
                          f"({note})")
             groups.setdefault(v.get("id"), []).append((f, sha, fentry,
                                                         facts))
+
+    if args.rename is not None:
+        matched = sum(len(e) for e in groups.values())
+        if matched != 1:
+            die(f"--rename applies to a single file; {matched} matched")
 
     adopted = already = 0
     discoveries = []  # unrecognized source fields across the whole run
