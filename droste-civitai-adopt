@@ -239,12 +239,13 @@ _progress = 0  # width of the transient stderr status line; 0 = none showing
 
 
 def progress(args, msg):
-    """Transient in-place status line (long hashes, API waits) -- shown
-    only on an interactive stderr and never under -q, so pipes, logs and
-    cron output are untouched. Overwritten via \\r; progress_clear()
-    wipes it before any real output can collide with it."""
+    """Transient in-place status line (long hashes, API waits) -- shown on
+    an interactive stderr, INCLUDING under -q (whose data-dump view keeps
+    the progress bar). Absent when stderr isn't a TTY, so pipes, logs and
+    cron output are untouched. Overwritten via \\r; progress_clear() wipes
+    it before any real output can collide with it."""
     global _progress
-    if args.quiet or not sys.stderr.isatty():
+    if not sys.stderr.isatty():
         return
     pad = max(_progress - len(msg), 0)
     sys.stderr.write("\r" + msg + " " * pad)
@@ -1128,7 +1129,9 @@ def build_parser():
                    help="cache dir laid out like a webui root (default: "
                         "$DROSTE_CIVITAI_CACHE or ~/.cache/civitai)")
     p.add_argument("-q", "--quiet", action="count", default=0,
-                   help="only refusals, warnings and the summary")
+                   help="quiet: only the summary, refusals/warnings, and a "
+                        "consolidated list of unrecognized fields (progress "
+                        "bar still shown)")
     p.add_argument("-v", "--verbose", action="count", default=0,
                    help="show hashes, sniff facts, API details, decisions")
     return p
@@ -1200,6 +1203,7 @@ def adopt_group(args, cache, version, entries, scan_memo):
                                         disambiguator=stem or p["sha"][:8])
 
     adopted = already = refused = 0
+    run_discoveries = []  # (source filename, [unmatched keys]) for this group
     for p in plans:
         src, sha, rel = p["src"], p["sha"], p["rel"]
         shown = str(src)
@@ -1249,14 +1253,20 @@ def adopt_group(args, cache, version, entries, scan_memo):
                         "move": "would move"}[args.mode]
             note = f" via {p['routing']}" \
                 if p["routing"].startswith("sniff-override") else ""
-            log(args, 0, f"ADOPT   {shown}")
-            log(args, 0, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
+            # level 1 so -q suppresses the per-file adopt lines (leaving the
+            # data-dump view: progress + unrecognized list + summary)
+            log(args, 1, f"ADOPT   {shown}")
+            log(args, 1, f"        -> {rel}/{name} (sha256 {sha[:12]}..) "
                          f"[{verb}]{note}")
 
-        # discovery signal: unrecognized source fields kept under 'unmatched'
+        # discovery signal: unrecognized source fields kept under 'unmatched'.
+        # Non-quiet prints them inline per file; quiet collects them for one
+        # consolidated block before the summary (the -q data-dump view).
         for fname, keys in discoveries:
-            log(args, 1, f"note: unrecognized field(s) in {fname}: "
-                         f"{', '.join(keys)} — kept under 'unmatched'")
+            run_discoveries.append((fname, keys))
+            if not args.quiet:
+                log(args, 1, f"note: unrecognized field(s) in {fname}: "
+                             f"{', '.join(keys)} — kept under 'unmatched'")
 
         # idempotent metadata sync -- both branches, write-only-if-changed
         sync_sidecars(args, dest, version, meta, merged_user, apply_mode)
@@ -1273,7 +1283,7 @@ def adopt_group(args, cache, version, entries, scan_memo):
             already += 1
         else:
             adopted += 1
-    return adopted, already, refused
+    return adopted, already, refused, run_discoveries
 
 
 def main(argv=None):
@@ -1380,12 +1390,22 @@ def main(argv=None):
                                                         facts))
 
     adopted = already = 0
+    discoveries = []  # unrecognized source fields across the whole run
     for vid, entries in groups.items():
-        a, c, r = adopt_group(args, cache, versions_cache[vid], entries,
-                              scan_memo)
+        a, c, r, disc = adopt_group(args, cache, versions_cache[vid], entries,
+                                    scan_memo)
         adopted += a
         already += c
         refused += r
+        discoveries.extend(disc)
+
+    # QUIET data-dump: one consolidated, filename-sorted list of unrecognized
+    # fields, just before the summary. (Non-quiet already printed them inline
+    # per file; under -q the inline notes are suppressed in favour of this.)
+    if args.quiet and discoveries:
+        log(args, 0, "unrecognized fields:")
+        for fname, keys in sorted(discoveries):
+            log(args, 0, f"  {fname}: {', '.join(keys)}")
 
     tag = " (dry-run; nothing was changed)" if not apply_mode else ""
     log(args, 0, f"summary: {adopted} adopted, {already} already cached, "

@@ -334,20 +334,53 @@ class CivitaiAdoptTest(unittest.TestCase):
         self.assertFalse(self.fx.user("models/Lora", "Dryly_v1").exists())
         self.assertEqual(list(self.fx.cache.rglob("*")), [])
 
-    def test_unmatched_note_hidden_under_quiet(self):
-        content = b"quiet note test"
-        f = self.fx.add_download("q.safetensors", content)
-        self.fx.add_download("q.json",
-                             json.dumps({"weird_key": "x"}).encode())
-        v = version_obj(914, "Quiet", "v1", "LORA",
-                        [file_entry("q.safetensors", content)])
+    def test_quiet_consolidates_unrecognized_fields(self):
+        # -q data-dump view: per-file inline notes AND the ADOPT lines are
+        # suppressed; instead ONE consolidated, filename-sorted list of
+        # unrecognized fields prints (level 0), plus the summary.
+        a = b"quiet file A"
+        b = b"quiet file B"
+        fa = self.fx.add_download("aaa.safetensors", a)
+        fb = self.fx.add_download("bbb.safetensors", b)
+        self.fx.add_download("aaa.json",
+                             json.dumps({"notes": "n", "zeta": 1}).encode())
+        self.fx.add_download("bbb.json",
+                             json.dumps({"alpha": 2, "beta": 3}).encode())
+        va = version_obj(914, "QA", "v1", "LORA",
+                         [file_entry("aaa.safetensors", a)])
+        vb = version_obj(916, "QB", "v1", "LORA",
+                         [file_entry("bbb.safetensors", b)])
+        self.fx.set_by_hash({sha256(a): va, sha256(b): vb})
+        rc, out, err = self.fx.run("--apply", "-q", str(fa), str(fb))
+        self.assertEqual(rc, 0, err)
+        # consolidated block, entries sorted by source filename
+        self.assertIn("unrecognized fields:\n"
+                      "  aaa.json: zeta\n"
+                      "  bbb.json: alpha, beta\n", out)
+        # the inline per-file wording is NOT used under -q ...
+        self.assertNotIn("kept under 'unmatched'", out)
+        # ... nor the per-file adopt / identify noise; summary still shows
+        self.assertNotIn("ADOPT", out)
+        self.assertNotIn("IDENTIFIED", out)
+        self.assertIn("2 adopted, 0 already cached, 0 refused", out)
+        # the block sits just before the summary line
+        self.assertLess(out.index("unrecognized fields:"),
+                        out.index("summary:"))
+        # data was still preserved on disk
+        u = json.loads(self.fx.user("models/Lora", "QA_v1").read_text())
+        self.assertEqual(u["unmatched"]["aaa.json"], {"zeta": 1})
+
+    def test_quiet_no_unrecognized_fields_prints_no_block(self):
+        content = b"clean quiet"
+        f = self.fx.add_download("c.safetensors", content)
+        v = version_obj(917, "Clean", "v1", "LORA",
+                        [file_entry("c.safetensors", content)])
         self.fx.set_by_hash({sha256(content): v})
         rc, out, err = self.fx.run("--apply", "-q", str(f))
         self.assertEqual(rc, 0, err)
-        self.assertNotIn("unrecognized field", out)   # normal-level: hidden
-        # ... yet the unmatched field was still preserved
-        u = json.loads(self.fx.user("models/Lora", "Quiet_v1").read_text())
-        self.assertEqual(u["unmatched"]["q.json"], {"weird_key": "x"})
+        self.assertNotIn("unrecognized fields:", out)  # nothing to list
+        self.assertNotIn("ADOPT", out)
+        self.assertIn("1 adopted, 0 already cached, 0 refused", out)
 
     # ----------------------------------------------- idempotent sync
     def test_idempotent_sync_second_run_writes_nothing(self):
@@ -934,16 +967,18 @@ class CivitaiAdoptTest(unittest.TestCase):
                 return True
 
         args = types.SimpleNamespace(quiet=0, verbose=0)
-        plain = io.StringIO()
+        plain = io.StringIO()  # non-TTY stderr: strict no-op
         with contextlib.redirect_stderr(plain):
             mod.progress(args, "  looking up 3 hash(es) on CivitAI...")
             mod.progress_clear()
         self.assertEqual(plain.getvalue(), "")
+        # progress no longer checks quiet: on a TTY it shows even under -q
         tty = FakeTTY()
         with contextlib.redirect_stderr(tty):
-            mod.progress(types.SimpleNamespace(quiet=1, verbose=0), "  x")
+            mod.progress(types.SimpleNamespace(quiet=1, verbose=0),
+                         "  hashing under quiet...")
             mod.progress_clear()
-        self.assertEqual(tty.getvalue(), "")
+        self.assertIn("\r  hashing under quiet...", tty.getvalue())
         tty = FakeTTY()
         with contextlib.redirect_stderr(tty):
             mod.progress(args, "  fetching version 12345...")
