@@ -58,6 +58,14 @@ RUN chmod +x /opt/resources/scripts/download_model.sh \
 ENV PYTHONNOUSERSITE=1 \
     PATH=/opt/resources/scripts:$PATH
 
+# Group-writable venv so the distrobox-lane box user (in group `droste`) can
+# pip-install into the baked venv after overlay copy-up (dirs setgid → copy-up
+# is metadata-only; new files inherit the group). Re-applied here AFTER this
+# port's pip installs (runtime-base did it for its own venv content).
+RUN chgrp -R droste /opt/venv \
+    && chmod -R g+rwX /opt/venv \
+    && find /opt/venv -type d -exec chmod g+s {} +
+
 # Server by default (distrobox/toolbx override the entrypoint → same image is both);
 # `podman run IMAGE <cmd>` still wins over SERVICE inside the entrypoint.
 ENTRYPOINT ["/opt/resources/resolve/droste-entrypoint.sh"]

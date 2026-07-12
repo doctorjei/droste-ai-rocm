@@ -35,8 +35,16 @@ RUN apt-get -qq update \
     && apt-get -qq install -y --no-install-recommends \
        sudo procps libnss-myhostname radeontop fuse-overlayfs \
        python3-venv python3-pip \
+       curl wget gnupg less bc pinentry-curses util-linux passwd findutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Shared 'droste' group (fixed gid, within the rootless userns gid map) so the
+# distrobox-lane box user (uid 1000, added to this group) can pip-install into the
+# baked venv. The group-writable venv pass below relies on this group existing.
+# `-f`: never fail the build — no-op if the group already exists, and auto-pick a
+# free gid if 1024 is ever taken on a future base (membership is by name, not gid).
+RUN groupadd -f -g 1024 droste
 
 # Python venv with the TheRock gfx1151 RUNTIME kernels, with venv
 RUN python3 -m venv /opt/venv
@@ -44,6 +52,17 @@ ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH PIP_NO_CACHE_DIR=1
 RUN pip install --upgrade pip setuptools wheel \
     && pip install --index-url ${ROCM_INDEX_URL} \
        "rocm[libraries]==${ROCM_SDK_LIBRARIES_VERSION}"
+
+# Group-writable venv pass: make /opt/venv DIRECTORIES group-owned by droste,
+# group-writable, and setgid. Dirs carry no data payload, so overlay copy-up of a
+# g+w+setgid dir is metadata-only (cheap) even without metacopy; pip add/remove/replace
+# are directory-entry ops, so this covers new installs AND baked-package upgrades in the
+# distrobox lane. Copy-up preserves group+mode -> copied-up dirs stay group=droste, g+w,
+# setgid. Ports RE-APPLY this same pass after their own pip installs. Recursive on a plain
+# build-time dir here (no overlay yet), so no payload is duplicated.
+RUN chgrp -R droste /opt/venv \
+    && chmod -R g+rwX /opt/venv \
+    && find /opt/venv -type d -exec chmod g+s {} +
 
 # Pin a stable /opt/rocm -> the ROCm core tree. NOTE: `rocm-sdk path --root` CANNOT be used here
 RUN ln -sfn "$(python3 -c "import sysconfig,os; print(os.path.join(sysconfig.get_paths()['purelib'],'_rocm_sdk_core'))")" /opt/rocm \

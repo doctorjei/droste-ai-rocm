@@ -92,7 +92,8 @@ no signal -> "unclassified", which is recorded but NEVER linked):
      transformer/unet/prior -> diffusion_models, image_encoder -> clip_vision, ...)
   1. path segments (snapshot-relative dirs, e.g. Comfy-Org `split_files/<category>/`,
      or category-named subdirs under the local models dir)
-  2. filename keywords (lora, vae, controlnet, t5/clip_l/clip_g, esrgan, ...)
+  2. filename keywords (lora, vae, controlnet, t5/clip_l/clip_g, esrgan/4x-upscalers,
+     yolo detectors -> ultralytics/{bbox,segm}, sam -> sams, face-parsing, pose, ...)
   3. CTranslate2 layout: `model.bin` + a sibling vocabulary file -> ctranslate2
   4. safetensors header (8-byte length + JSON header ONLY -- tensors never read):
      tensor-name prefixes + `__metadata__` modelspec.architecture
@@ -126,7 +127,7 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------- constants
 
 REGISTRY_VERSION = 2
-HEURISTICS_VERSION = 2
+HEURISTICS_VERSION = 3
 
 DEFAULT_CACHE_DIR = "~/.cache/huggingface/hub"
 DEFAULT_MODELS_DIR = "/opt/models"
@@ -146,6 +147,19 @@ CATEGORIES = {
     "background_removal", "detection", "frame_interpolation",
     "geometry_estimation", "optical_flow",
 }
+
+# Custom-node detector/aux dirs that popular ComfyUI packs scan (Impact-Pack,
+# ReActor/facexlib, ControlNet-aux). Not core folder_paths categories, but the tree
+# link mechanics are identical, so they are added to the LINKABLE set. Nested paths
+# (ultralytics/bbox) work directly: plan_links just joins "<cat>/<link_name>".
+DETECTOR_CATEGORIES = {
+    "ultralytics/bbox",   # Impact-Pack UltralyticsDetectorProvider: detection/bbox
+    "ultralytics/segm",   # Impact-Pack UltralyticsDetectorProvider: segmentation
+    "sams",               # Impact-Pack SAMLoader: Segment-Anything checkpoints
+    "facedetection",      # ReActor / facerestore facexlib weights (face parsing)
+    "controlnet_aux",     # ControlNet-aux annotator / pose-estimator weights
+}
+CATEGORIES |= DETECTOR_CATEGORIES
 
 # Inventory-only categories: real classifications that ComfyUI cannot load.
 # Recorded with links:[] so later features are a linking rule, never a re-scan.
@@ -213,6 +227,13 @@ CT2_SIBLINGS = ("vocabulary.txt", "vocabulary.json",
 
 # multi-part weight files: model-00001-of-00002.safetensors, *-00001-of-00003.gguf, ...
 SHARDED_RE = re.compile(r"-\d{4,6}-of-\d{4,6}\.[A-Za-z0-9]+$")
+
+# ESRGAN-style upscaler scale-factor tag on an otherwise arch-unknown .pth: a leading
+# "4x"/"2x"/"8x"/"16x" or a trailing "x4"/"x2"/... (e.g. 4x-ClearRealityV1, RealESRGAN_x4).
+# Matched on the normalized stem (non-alnum -> "_"), only AFTER lora/vae/controlnet/text
+# checks have excluded genuine models, so a bare scale tag is a strong upscaler signal.
+UPSCALE_SCALE_RE = re.compile(
+    r"(?:^|_)(?:2|4|8|16)x(?=$|_|[a-z])|(?:^|_)x(?:2|4|8|16)(?=$|_|[a-z])")
 
 # generic basenames that must never be used as link names (provenance rule)
 GENERIC_STEM_RE = re.compile(
@@ -456,7 +477,32 @@ def classify_by_filename(name: str) -> str | None:
             or "clip_l" in norm or "clip_g" in norm
             or "text_encoder" in norm or "qwen_2_5_vl" in norm):
         return "text_encoders"
-    if "esrgan" in norm or tokens & {"upscale", "upscaler"}:
+    # ---- auxiliary detector / estimator models (Impact-Pack / ReActor / ControlNet-aux).
+    # These are .pt/.pth pickles the scanner never content-sniffs, so filename is the
+    # only signal -- same idiom as the esrgan/taesd rules above.
+    # Ultralytics / YOLO detectors -> Impact-Pack models/ultralytics/{bbox,segm}
+    # ("yolo" substring catches yolov5/8/9, yolo11, yolov11, yolox, ... in one shot).
+    if "yolo" in norm:
+        if "segm" in norm or tokens & {"seg", "segmentation"}:
+            return "ultralytics/segm"
+        return "ultralytics/bbox"
+    # SAM (Segment Anything) -> Impact-Pack models/sams
+    if ("sam_vit" in norm or "mobile_sam" in norm or "sam_hq" in norm
+            or "sam2_hiera" in norm or "sam2" in tokens
+            or ("sam" in tokens and "vit" in tokens)):
+        return "sams"
+    # BiSeNet / ParseNet face-parsing (facexlib) -> models/facedetection
+    if tokens & {"parsenet", "bisenet"} or "parsing_parsenet" in norm \
+            or "parsing_bisenet" in norm:
+        return "facedetection"
+    # OpenPose / DWPose body & hand estimators -> ControlNet-aux annotator weights
+    if ("openpose" in norm or "dwpose" in norm
+            or "body_pose" in norm or "hand_pose" in norm
+            or ("pose" in tokens and tokens & {"body", "hand", "model"})):
+        return "controlnet_aux"
+    # ESRGAN-family upscalers, incl. arch-unknown 4x/2x/x4 .pth files
+    if ("esrgan" in norm or tokens & {"upscale", "upscaler"}
+            or UPSCALE_SCALE_RE.search(norm)):
         return "upscale_models"
     if tokens & {"embedding", "embeddings"} or "textual_inversion" in norm:
         return "embeddings"

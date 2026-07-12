@@ -305,6 +305,42 @@ class ScannerTest(unittest.TestCase):
         self.assertEqual((h.call_count, g.call_count, c.call_count), (0, 0, 0))
         self.assertIn("0 new", out2)
 
+    def test_detector_aux_family_routes_to_conventional_dirs(self):
+        """Raiju s26 gap: adetailer/YOLO, SAM, face-parsing, pose, and arch-unknown
+        upscaler .pt/.pth files used to fall through to `unclassified`; they must now
+        land in the Impact-Pack / ReActor / ControlNet-aux conventional subdirs."""
+        # local /opt/models drop-ins (bare .pt/.pth, never content-sniffed)
+        self.fx.add_local_file("face_yolov8n.pt", b"\x80\x02yolo-pickle")
+        self.fx.add_local_file("person_yolov8m-seg.pt", b"\x80\x02yolo-pickle")
+        self.fx.add_local_file("sam_vit_b_01ec64.pth", b"\x00" * 32)
+        self.fx.add_local_file("parsing_parsenet.pth", b"\x00" * 32)
+        self.fx.add_local_file("body_pose_model.pth", b"\x00" * 32)
+        self.fx.add_local_file("4x-ClearRealityV1.pth", b"\x00" * 32)
+        # a HF-cache adetailer detector (Bingsu) reaches the same rule
+        self.fx.add_hf_file("Bingsu/adetailer", "hand_yolov8s.pt", b"\x80\x02yolo")
+        rc, out = self.fx.sync()
+        self.assertEqual(rc, 0)
+        self.assertEqual(tree_links(self.fx.tree), {
+            "ultralytics/bbox/face_yolov8n.pt",
+            "ultralytics/bbox/hand_yolov8s.pt",
+            "ultralytics/segm/person_yolov8m-seg.pt",
+            "sams/sam_vit_b_01ec64.pth",
+            "facedetection/parsing_parsenet.pth",
+            "controlnet_aux/body_pose_model.pth",
+            "upscale_models/4x-ClearRealityV1.pth",
+        })
+        # every one is a real classification now -- nothing left unclassified
+        self.assertNotIn("UNCLASSIFIED", out)
+        self.assertIn("0 unclassified", out)
+        reg = self.fx.load_registry()
+        cats = {e["display"]: e["category"] for e in reg["entries"].values()}
+        self.assertEqual(cats["face_yolov8n.pt"], "ultralytics/bbox")
+        self.assertEqual(cats["person_yolov8m-seg.pt"], "ultralytics/segm")
+        self.assertEqual(cats["sam_vit_b_01ec64.pth"], "sams")
+        self.assertEqual(cats["parsing_parsenet.pth"], "facedetection")
+        self.assertEqual(cats["body_pose_model.pth"], "controlnet_aux")
+        self.assertEqual(cats["4x-ClearRealityV1.pth"], "upscale_models")
+
     def test_sharded_diffusers_component_classified_not_linked(self):
         repo = "acme/big-pipeline"
         self.fx.add_hf_aux(repo, "model_index.json",
@@ -619,6 +655,39 @@ class ScannerTest(unittest.TestCase):
         self.assertEqual(ms.classify_by_filename("flux1-canny-dev.safetensors"),
                          "controlnet")
         self.assertEqual(ms.classify_by_filename("plain-model.safetensors"), None)
+
+        # ---- auxiliary detector / estimator families (Impact-Pack / ReActor / cnet-aux)
+        # Ultralytics / YOLO: bbox vs segm split
+        for bbox_name in ("face_yolov8n.pt", "hand_yolov8s.pt", "person_yolov8m.pt",
+                          "yolov11-face.pt", "yolov5n-face.pt", "yolo11n.pt"):
+            self.assertEqual(ms.classify_by_filename(bbox_name), "ultralytics/bbox",
+                             bbox_name)
+        for segm_name in ("person_yolov8m-seg.pt", "deepfashion2_yolov8s-seg.pt",
+                          "yolov8n-segm.pt"):
+            self.assertEqual(ms.classify_by_filename(segm_name), "ultralytics/segm",
+                             segm_name)
+        # SAM (Segment Anything)
+        for sam_name in ("sam_vit_b_01ec64.pth", "sam_vit_h_4b8939.pth",
+                         "sam_vit_l_0b3195.pth", "mobile_sam.pt", "sam2_hiera_large.pt"):
+            self.assertEqual(ms.classify_by_filename(sam_name), "sams", sam_name)
+        # BiSeNet / ParseNet face-parsing
+        self.assertEqual(ms.classify_by_filename("parsing_parsenet.pth"), "facedetection")
+        self.assertEqual(ms.classify_by_filename("parsing_bisenet.pth"), "facedetection")
+        # OpenPose / DWPose estimators
+        self.assertEqual(ms.classify_by_filename("body_pose_model.pth"), "controlnet_aux")
+        self.assertEqual(ms.classify_by_filename("hand_pose_model.pth"), "controlnet_aux")
+        self.assertEqual(ms.classify_by_filename("dwpose.pth"), "controlnet_aux")
+        # ESRGAN-family upscalers, incl. arch-unknown 4x/2x/x4 .pth files
+        self.assertEqual(ms.classify_by_filename("4x-ClearRealityV1.pth"),
+                         "upscale_models")
+        self.assertEqual(ms.classify_by_filename("4x_foolhardy_Remacri.pth"),
+                         "upscale_models")
+        self.assertEqual(ms.classify_by_filename("RealESRGAN_x4plus.pth"),
+                         "upscale_models")
+        self.assertEqual(ms.classify_by_filename("2x_APISR_RRDB.pth"), "upscale_models")
+        # conservative: a plain checkpoint / size tag is NOT swept into upscale
+        self.assertIsNone(ms.classify_by_filename("dreamshaper_8.safetensors"))
+        self.assertIsNone(ms.classify_by_filename("sdxl_base_1.0.safetensors"))
 
         self.assertEqual(ms.classify_gguf({"general.architecture": "wan"}),
                          "diffusion_models")

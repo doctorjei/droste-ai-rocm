@@ -39,6 +39,17 @@ if [ -n "${DROSTE_USER_HOME:-}" ]; then
     export HOME="$DROSTE_USER_HOME"
 fi
 
+# Group membership for the writable baked venv (fix: distrobox-lane pip installs).
+# The image makes /opt/venv (+ custom_nodes) group-writable under group `droste`;
+# the box user must belong to that group to write after overlay copy-up. Rootless
+# userns blocks runtime setgid(), so membership must be granted at LOGIN — this hook
+# runs as root before distrobox's login shell, so usermod here takes effect there.
+# Best-effort: never abort startup if the group is absent (older image) or usermod fails.
+if [ -n "${DROSTE_USER:-}" ] && getent group droste >/dev/null 2>&1; then
+    usermod -aG droste "$DROSTE_USER" 2>/dev/null \
+        || printf 'droste-init-hook: WARN: could not add %s to group droste\n' "$DROSTE_USER" >&2
+fi
+
 RESOLVE_DIR=${RESOLVE_DIR:-/opt/resources/resolve}
 # shellcheck source=/dev/null
 source "$RESOLVE_DIR/droste-resolve.sh"
@@ -62,4 +73,21 @@ PRE_LAUNCH=""
 # shellcheck source=/dev/null
 source "$SPEC"
 
-resolve::apply_spec
+# Surface resolver diagnostics. distrobox shows only a generic "An error occurred"
+# for a failed init hook, hiding the resolver's actionable CRITICAL message. That
+# failure often arrives as an internal `exit 1` from resolve::critical (sourced,
+# runs in THIS shell), so we catch it with an EXIT trap — not `|| rc=$?`, which the
+# direct exit bypasses — and write stderr to a log SYNCHRONOUSLY (a backgrounded
+# tee could be killed mid-flush by that exit, truncating the log).
+RESOLVE_LOG="${DROSTE_DATA_DIR:-/opt/data}/.droste-resolve.log"
+# Fall back to /tmp if the data dir isn't writable (ro bind, missing, etc.) so the
+# redirect itself can never abort the hook.
+if ! ( : >>"$RESOLVE_LOG" ) 2>/dev/null; then
+    RESOLVE_LOG="/tmp/droste-resolve.log"
+fi
+# On ANY non-zero exit (including resolve::critical's internal exit 1) dump the log
+# to stderr with a pointer; on success this is a no-op.
+trap 'ec=$?; if [ "$ec" -ne 0 ]; then { printf "droste-init-hook: resolver FAILED (exit %s). Detail (also saved to %s):\n" "$ec" "$RESOLVE_LOG"; tail -n 30 "$RESOLVE_LOG" 2>/dev/null; } >&2; fi' EXIT
+resolve::apply_spec 2>"$RESOLVE_LOG"
+# Success path: surface the resolver's own INFO/WARN lines (fuse fallback, etc.) too.
+cat "$RESOLVE_LOG" >&2

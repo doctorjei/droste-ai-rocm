@@ -96,6 +96,14 @@ RUN chmod 0644 /etc/profile.d/*.sh \
 # Jupyter kernel points at the venv python; friendly display name (upstream parity).
 RUN /opt/venv/bin/python -m ipykernel install --name=python3 --display-name "Python (venv)" --prefix=/opt/venv
 
+# Group-writable venv so the distrobox-lane box user (in group `droste`) can
+# pip-install into the baked venv after overlay copy-up (dirs setgid → copy-up
+# is metadata-only; new files inherit the group). Re-applied here AFTER this
+# port's pip installs + kernel install (runtime-base did it for its own venv content).
+RUN chgrp -R droste /opt/venv \
+    && chmod -R g+rwX /opt/venv \
+    && find /opt/venv -type d -exec chmod g+s {} +
+
 # Shared droste entrypoint (server lane): resolves mounts/criticals/templates from
 # /opt/resources/build-spec, then execs JupyterLab on :8888. distrobox/toolbx
 # override the entrypoint and get the interactive lane. Writability comes from the

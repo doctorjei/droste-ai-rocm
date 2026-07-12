@@ -101,6 +101,15 @@ RUN chmod +x /opt/resources/scripts/* \
     && pip cache purge || true \
     && rm -rf /root/.cache/pip || true
 
+# Group-writable venv + custom_nodes so the distrobox-lane box user (in group
+# `droste`) can pip-install / add nodes into the baked trees after overlay
+# copy-up (dirs setgid → copy-up is metadata-only; new files inherit the group).
+# Re-applied here AFTER this port's pip installs + node clones (runtime-base did
+# it for its own venv content).
+RUN chgrp -R droste /opt/venv /opt/ComfyUI/custom_nodes \
+    && chmod -R g+rwX /opt/venv /opt/ComfyUI/custom_nodes \
+    && find /opt/venv /opt/ComfyUI/custom_nodes -type d -exec chmod g+s {} +
+
 # Interactive login shell wiring (torch/AOTriton env, login banner, guards, core-dump suppression)
 COPY profile.d/01-rocm-envs.sh /etc/profile.d/01-rocm-envs.sh
 COPY profile.d/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
