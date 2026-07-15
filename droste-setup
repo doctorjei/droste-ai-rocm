@@ -333,9 +333,18 @@ ask_path_raw() {  # label default → ANS_PATH (absolute; NOT created)
   return 0
 }
 
-ask_path() {  # label default → ANS_PATH (absolute, created if absent)
-  ask_path_raw "$1" "$2"
-  mkdir -p "$ANS_PATH" 2>/dev/null || warn "could not create $ANS_PATH"
+ask_path() {  # label default → ANS_PATH (existing dir, or confirm-create, else re-ask)
+  # No silent mkdir: an existing dir is accepted as-is; otherwise confirm before
+  # creating, and re-ask the path if the user declines or the create fails.
+  while :; do
+    ask_path_raw "$1" "$2"
+    [[ -d $ANS_PATH ]] && return 0
+    ask_yn "Create $(home_disp "$ANS_PATH")?" Y
+    if [[ $ANS_YN -eq 1 ]]; then
+      mkdir -p "$ANS_PATH" 2>/dev/null && return 0
+      warn "could not create $ANS_PATH — pick another location"
+    fi
+  done
 }
 
 # Terse variant: the caller supplies the FULL prompt label; we append the
@@ -352,9 +361,18 @@ ask_path_as_raw() {  # "prompt label" default → ANS_PATH (absolute; NOT create
   return 0
 }
 
-ask_path_as() {  # "prompt label" default → ANS_PATH (absolute, created if absent)
-  ask_path_as_raw "$1" "$2"
-  mkdir -p "$ANS_PATH" 2>/dev/null || warn "could not create $ANS_PATH"
+ask_path_as() {  # "prompt label" default → ANS_PATH (existing dir, or confirm-create, else re-ask)
+  # No silent mkdir: an existing dir is accepted as-is; otherwise confirm before
+  # creating, and re-ask the path if the user declines or the create fails.
+  while :; do
+    ask_path_as_raw "$1" "$2"
+    [[ -d $ANS_PATH ]] && return 0
+    ask_yn "Create $(home_disp "$ANS_PATH")?" Y
+    if [[ $ANS_YN -eq 1 ]]; then
+      mkdir -p "$ANS_PATH" 2>/dev/null && return 0
+      warn "could not create $ANS_PATH — pick another location"
+    fi
+  done
 }
 
 ANS_PORT=""
@@ -1016,10 +1034,18 @@ emit_compose() {  # box → writes droste-<box>-halo-server.compose.yaml
     printf '      # shared compute cache (MIOpen/Triton/torch/vLLM kernels):\n'
     printf '      - %s:/opt/caches\n' "$COMPUTE_CACHE"
     if [[ ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
-      # Opt-in only: a read-only /opt/models bind to a possibly-missing dir is
-      # fatal, so it is NEVER auto-added — uncomment (and create the dir) to use.
-      printf '      # Optional read-only local model collection — uncomment to enable:\n'
-      printf '      # - %s:/opt/models:ro\n' "${MODELS_DIR:-$HOME/models}"
+      if [[ -n $MODELS_DIR ]]; then
+        # Opted in: the dir was confirmed-or-created at prompt time, so this
+        # :ro bind is safe. Native `podman compose` handles it fine (older
+        # podman-compose 1.0.6 may emit a non-fatal read-only-mount warning).
+        printf '      # read-only local model collection (scanner source #2):\n'
+        printf '      - %s:/opt/models:ro\n' "$MODELS_DIR"
+      else
+        # Not opted in: a :ro bind to a missing dir is fatal — uncomment (and
+        # create the dir) to enable a local model collection.
+        printf '      # Optional read-only local model collection — uncomment to enable:\n'
+        printf '      # - %s:/opt/models:ro\n' "$HOME/models"
+      fi
     fi
     case "${CFG_MODE[$box]:-}" in
       fuse|copy)
@@ -1078,16 +1104,26 @@ emit_ini() {  # box → writes droste-<box>-halo-box.ini (distrobox assemble rec
     if [[ $HF_CACHE != "$HOME/.cache/huggingface" ]]; then
       vols="$vols $HF_CACHE:$HOME/.cache/huggingface"
     fi
+    # Opted-in read-only model collection: the dir was confirmed-or-created at
+    # prompt time, so the :ro bind is safe (a bind to a missing dir would be
+    # fatal to `distrobox assemble create`). It lands INSIDE the single volume=.
+    [[ -n $MODELS_DIR ]] && vols="$vols $MODELS_DIR:/opt/models:ro"
     printf '# Shared compute caches across ALL droste boxes are folded into the\n'
     printf '# single volume= value below (distrobox reads only the LAST volume=).\n'
     printf 'volume="%s"\n' "$vols"
     if [[ ${BOX_HAS_MODELS[$box]} -eq 1 ]]; then
-      # Opt-in only: a read-only /opt/models bind to a possibly-missing dir is
-      # fatal to `distrobox assemble create`, so it is NEVER auto-added.
-      printf '# Optional read-only local model collection: to enable, APPEND\n'
-      printf '#   %s:/opt/models:ro\n' "$(home_disp "${MODELS_DIR:-$HOME/models}")"
-      printf '# (space-separated) INSIDE the single volume= value above — do NOT add a\n'
-      printf '# second volume= line (distrobox reads only the LAST, dropping the rest).\n'
+      if [[ -n $MODELS_DIR ]]; then
+        printf '# The read-only local model collection (%s -> /opt/models:ro)\n' \
+          "$(home_disp "$MODELS_DIR")"
+        printf '# is already included in the single volume= value above.\n'
+      else
+        # Not opted in: a read-only /opt/models bind to a missing dir is fatal to
+        # `distrobox assemble create`, so it is not added — enable it by hand.
+        printf '# Optional read-only local model collection: to enable, APPEND\n'
+        printf '#   %s:/opt/models:ro\n' "$(home_disp "$HOME/models")"
+        printf '# (space-separated) INSIDE the single volume= value above — do NOT add a\n'
+        printf '# second volume= line (distrobox reads only the LAST, dropping the rest).\n'
+      fi
     fi
   } > "$f"
   printf '  %sWrote %s.%s\n' "$ITALIC" "$(home_disp "$f")" "$RESET"
@@ -1114,9 +1150,11 @@ plain_create_args() {  # box → prints podman/docker create args (one per line)
   done
   printf -- '-v\n%s:/root/.cache/huggingface\n' "$HF_CACHE"
   printf -- '-v\n%s:/opt/caches\n' "$COMPUTE_CACHE"
-  # The optional /opt/models bind is never auto-added (a :ro bind to a
-  # possibly-missing dir is fatal); opt in via the compose file's commented
-  # line + `podman compose up`.
+  # The optional /opt/models bind is added when opted in (MODELS_DIR set); it is
+  # safe because the dir was confirmed-or-created at prompt time (a :ro bind to a
+  # missing dir would be fatal). Skipped entirely when not opted in.
+  [[ -n $MODELS_DIR && ${BOX_HAS_MODELS[$box]} -eq 1 ]] \
+    && printf -- '-v\n%s:/opt/models:ro\n' "$MODELS_DIR"
   case "${CFG_MODE[$box]:-}" in
     fuse|copy) printf -- '-e\nDROSTE_OVERLAY_MODE=%s\n' "${CFG_MODE[$box]}" ;;
   esac
@@ -1234,11 +1272,11 @@ write_notes() {
       "$HF_CACHE"
     printf 'store (a model one box downloads is available to all the others).\n'
     if [[ -n $MODELS_DIR ]]; then
-      printf 'Local model collection: `%s` — opt-in only: it is NOT auto-bound\n' \
+      printf 'Local model collection: `%s` — bound read-only at `/opt/models`\n' \
         "$MODELS_DIR"
-      printf '(a read-only bind to a missing dir is fatal). Uncomment the\n'
-      printf '`/opt/models:ro` line in the compose file, or APPEND it to the\n'
-      printf 'single `volume=` value in the ini, then recreate.\n'
+      printf 'in every box that supports it (comfyui/llama/vllm/ds4). The dir was\n'
+      printf 'confirmed-or-created at setup time, so the bind is safe and already\n'
+      printf 'present in the compose files and the single `volume=` value of each ini.\n'
     else
       printf 'Local model collection: not configured (/opt/models unbound).\n'
     fi
@@ -1450,20 +1488,9 @@ main() {
 
   section "Resource Path"
   sub "Recreation (compose.yaml/distrobox ini), logs, & program data"
-  # A typo here fans out into every emitted file — confirm before creating.
-  while :; do
-    ask_path_as_raw "Please Identify a path to use for droste resources" "$HOME/droste"
-    if [[ -d $ANS_PATH ]]; then
-      break
-    fi
-    ask_yn "Create $ANS_PATH?" Y
-    if [[ $ANS_YN -eq 1 ]]; then
-      if mkdir -p "$ANS_PATH" 2>/dev/null; then
-        break
-      fi
-      warn "could not create $ANS_PATH — pick another location"
-    fi
-  done
+  # A typo here fans out into every emitted file — ask_path_as confirms before
+  # creating (and re-asks if the user declines or the create fails).
+  ask_path_as "Please Identify a path to use for droste resources" "$HOME/droste"
   EMIT_DIR=$ANS_PATH
   DEFAULT_ROOT=$EMIT_DIR
 
