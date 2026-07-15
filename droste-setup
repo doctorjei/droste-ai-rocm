@@ -58,6 +58,11 @@ declare -A BOX_NAME=(
   [comfyui]="ComfyUI" [llama]="llama.cpp" [vllm]="vLLM" [ds4]="DeepSeek" [finetuning]="Finetuning"
 )
 
+# Human-readable titles for each prompted bind family (underlined per-bind header).
+declare -A BIND_TITLE=(
+  [data]="Program Data" [input]="Input Files" [output]="Output Files" [workspace]="Workspace"
+)
+
 # Canonical container-side service port (SERVICE row of each build-spec).
 declare -A BOX_PORT=(
   [comfyui]=8188 [llama]=8080 [vllm]=8000 [ds4]=8000 [finetuning]=8888
@@ -91,7 +96,7 @@ declare -A BOX_CONFIG=(
 declare -A BIND_DESC=(
   [data]="venv overlay upper, caches, seeded config"
   [input]="source files you feed ComfyUI"
-  [output]="generated images/videos - your work"
+  [output]="generated images/videos"
   [workspace]="notebooks + trained adapters - your work"
 )
 
@@ -167,15 +172,17 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
 esac
 
 if [[ $PLAIN -eq 1 ]]; then
-  BOLD="" ULINE="" RESET="" DIVCH="-"
+  BOLD="" ULINE="" ITALIC="" RESET="" DIVCH="-"
   G_ACTIVE="[+] ACTIVE" G_STOPPED="[-] STOPPED" G_NONE="[ ] none"
   W_ACTIVE=10 W_STOPPED=11 W_NONE=8
+  GS_ACTIVE="[+]" GS_STOPPED="[-]" GS_NONE="[ ]" W_STATE=3   # glyph-only State cell
   G_YES="Y" G_NO="n" W_GLYPH=1
   BOXTL="." BOXTR="." BOXBL="'" BOXBR="'" BOXH="-" BOXV="|"
 else
-  BOLD=$'\e[1m' ULINE=$'\e[4m' RESET=$'\e[0m' DIVCH="─"
+  BOLD=$'\e[1m' ULINE=$'\e[4m' ITALIC=$'\e[3m' RESET=$'\e[0m' DIVCH="─"
   G_ACTIVE=$'\U1F7E2 ACTIVE' G_STOPPED=$'\U1F6D1 STOPPED' G_NONE=$'⚫ none'
   W_ACTIVE=9 W_STOPPED=10 W_NONE=7        # emoji glyphs are double-width
+  GS_ACTIVE=$'\U1F7E2' GS_STOPPED=$'\U1F6D1' GS_NONE=$'⚫' W_STATE=2  # glyph-only State cell
   G_YES=$'✅' G_NO=$'\U1F6AB' W_GLYPH=2
   BOXTL="┌" BOXTR="┐" BOXBL="└" BOXBR="┘" BOXH="─" BOXV="│"
 fi
@@ -284,6 +291,19 @@ ask_yn() {  # question default(Y|N)  → ANS_YN=1/0
   done
 }
 
+ask_yn_q() {  # question default(Y|N) → ANS_YN  (renders "... [y/N]?: ")
+  local q=$1 def=$2 hint
+  [[ $def == Y ]] && hint="[Y/n]" || hint="[y/N]"
+  while :; do
+    ask_raw "$q $hint?: "
+    case "$ANS" in
+      "") [[ $def == Y ]] && ANS_YN=1 || ANS_YN=0; return 0 ;;
+      y|Y) ANS_YN=1; return 0 ;;
+      n|N) ANS_YN=0; return 0 ;;
+    esac
+  done
+}
+
 ANS_CH=""
 ask_choice() {  # prompt letters(first=default, shown capital) → ANS_CH (lower)
   local q=$1 letters=$2 def=${2:0:1} c
@@ -341,7 +361,7 @@ ANS_PORT=""
 ask_port() {  # box default → ANS_PORT
   local box=$1 def=$2 other
   while :; do
-    ask_raw "What host port should be used for $box? [$def] "
+    ask_raw "What host port should be used for ${BOX_NAME[$box]} [$def]? "
     [[ -z $ANS ]] && ANS=$def
     if [[ ! $ANS =~ ^[0-9]+$ ]] || (( ANS < 1 || ANS > 65535 )); then
       say "  Please give a port number (1-65535)."
@@ -784,7 +804,7 @@ maybe_offer_pattern() {  # box label answered-path
 
 # Ask (or pattern-fill) one bind path for a box; sets PATHS[box:label].
 ask_bind_path() {  # box label dest prose
-  local box=$1 label=$2 dest=$3 prose=$4 def plabel
+  local box=$1 label=$2 dest=$3 prose=$4 def
   : "$prose"   # prose kept for call-site compatibility; label is now derived
   def=$(path_default "$box" "$label")
   if [[ -n $PATTERN_ROOT && ${ACTION[$box]} != modify && $PATTERN_ASKED -eq 1 ]]; then
@@ -792,11 +812,11 @@ ask_bind_path() {  # box label dest prose
     mkdir -p "$def" 2>/dev/null || warn "could not create $def"
     say "  $box $label: $(home_disp "$def") (pattern)"
   else
-    # The data bind's descriptor is now the "Data Mapping" section subtitle;
-    # keep the inline descriptor for the other (input/output/workspace) binds.
-    [[ $label != data ]] && say "  ($label -> $dest: ${BIND_DESC[$label]:-bind})"
-    if [[ $label == data ]]; then plabel="program data"; else plabel=$label; fi
-    ask_path_as "Path to use for ${BOX_NAME[$box]} $plabel" "$def"
+    # Every bind (data included) gets an underlined descriptor header, then the
+    # path prompt uses the box + bind-title proper names.
+    printf '%s%s (%s -> %s: %s)%s\n' "$ULINE" "${BIND_TITLE[$label]}" "$label" \
+      "$dest" "${BIND_DESC[$label]:-bind}" "$RESET"
+    ask_path_as "Path for ${BOX_NAME[$box]} ${BIND_TITLE[$label],,}" "$def"
     PATHS["$box:$label"]=$ANS_PATH
     maybe_offer_pattern "$box" "$label" "$ANS_PATH"
   fi
@@ -893,9 +913,9 @@ configure_box() {  # box remaining-after-this (count)
     CFG_AS[$box]=""
     if [[ ${CFG_LANE[$box]} != distrobox ]]; then
       if [[ ${ACTION[$box]} == modify && -n "${EXD_AS[$box]:-}" ]]; then
-        ask_yn "Auto-start the $box server at boot?" Y
+        ask_yn_q "Auto-start the $box server at boot" Y
       else
-        ask_yn "Auto-start the $box server at boot?" N
+        ask_yn_q "Auto-start the $box server at boot" N
       fi
       [[ $ANS_YN -eq 1 ]] && CFG_AS[$box]=1
     fi
@@ -913,7 +933,7 @@ configure_box() {  # box remaining-after-this (count)
   # Both lanes share this ONE /opt/data host path (only the container name
   # differs between lanes).
   section "Data Mapping"
-  sub "(data -> /opt/data: ${BIND_DESC[data]})"
+  sub "Program data, input, & output"
   choose_data_dir "$box"
   for pair in ${BOX_EXTRA_BINDS[$box]}; do
     label=${pair%%:*} dest=${pair#*:}
@@ -938,12 +958,13 @@ configure_box() {  # box remaining-after-this (count)
 
 # ── Build ladder ─────────────────────────────────────────────────────────────
 ask_ladder() {
-  section "Build step"
+  section "Build & Activation"
+  sub "Options for records & startup"
   say "  [w] Write definition(s) only (compose & ini)"
   say "  [p] Pull image(s) & write definition(s)"
   say "  [c] Pull, write, & create box(es)"
   say "  [A] All of the above, and start server(s)"
-  ask_choice "[w/p/c/A]" "Awpc"
+  ask_choice "Select box preparation option [w/p/c/A]" "Awpc"
   RUNG=$ANS_CH
   return 0
 }
@@ -1011,7 +1032,7 @@ emit_compose() {  # box → writes droste-<box>-halo-server.compose.yaml
     fi
     printf '    # security_opt: ["seccomp=unconfined"]  # uncomment if GPU fails\n'
   } > "$f"
-  say "  wrote $(home_disp "$f")"
+  printf '  %sWrote %s.%s\n' "$ITALIC" "$(home_disp "$f")" "$RESET"
   return 0
 }
 
@@ -1069,7 +1090,7 @@ emit_ini() {  # box → writes droste-<box>-halo-box.ini (distrobox assemble rec
       printf '# second volume= line (distrobox reads only the LAST, dropping the rest).\n'
     fi
   } > "$f"
-  say "  wrote $(home_disp "$f")"
+  printf '  %sWrote %s.%s\n' "$ITALIC" "$(home_disp "$f")" "$RESET"
   return 0
 }
 
@@ -1111,14 +1132,15 @@ create_server() {  # box
     "$RUNTIME" rm -f "$(server_name "$box")" >/dev/null 2>&1 \
       || warn "could not remove old container $(server_name "$box")"
   fi
+  printf '%s%s%s\n' "$ULINE" "Creating $(server_name "$box")..." "$RESET"
   if [[ -n $COMPOSE_CMD ]]; then
     if [[ $RUNG == a ]]; then
-      $COMPOSE_CMD -f "$f" up -d \
+      $COMPOSE_CMD -f "$f" up -d >/dev/null \
         && SESSION_STATE[$box]=ACTIVE \
         || warn "compose up failed for $box (see output above)"
     else
       if $COMPOSE_CMD -f "$f" up --no-start >/dev/null 2>&1 \
-         || $COMPOSE_CMD -f "$f" create; then
+         || $COMPOSE_CMD -f "$f" create >/dev/null; then
         SESSION_STATE[$box]=STOPPED
       else
         warn "compose create failed for $box"
@@ -1126,7 +1148,7 @@ create_server() {  # box
     fi
   else
     mapfile -t args < <(plain_create_args "$box")
-    if "$RUNTIME" create "${args[@]}"; then
+    if "$RUNTIME" create "${args[@]}" >/dev/null; then
       SESSION_STATE[$box]=STOPPED
       if [[ $RUNG == a ]]; then
         "$RUNTIME" start "$(server_name "$box")" \
@@ -1150,6 +1172,7 @@ create_distrobox() {  # box
     distrobox rm -f "$(dbox_name "$box")" >/dev/null 2>&1 \
       || warn "could not remove old distrobox $(dbox_name "$box")"
   fi
+  printf '%s%s%s\n' "$ULINE" "Creating $(dbox_name "$box")..." "$RESET"
   distrobox assemble create --file "$(ini_file "$box")" \
     || warn "distrobox assemble failed for $box"
   return 0
@@ -1329,7 +1352,7 @@ write_notes() {
     printf 'On the GPU host, the repo'\''s `scaffolding/check-rocm.sh` validates\n'
     printf 'GPU access + per-box smoke across all images (see its --help).\n'
   } > "$f"
-  say "  wrote $(home_disp "$f")"
+  printf '  %sWrote %s.%s\n' "$ITALIC" "$(home_disp "$f")" "$RESET"
   return 0
 }
 
@@ -1380,28 +1403,28 @@ dashboard() {
   local box lane st stg stw g note data row port
   say ""
   hdr "Box Status"
-  say "Legend: St state - Db distrobox - Sv server - AS auto-start ($G_YES yes / $G_NO no)"
+  say "Legend: State $GS_ACTIVE active / $GS_STOPPED stopped / $GS_NONE none — Box=distrobox, Server, AS=auto-start ($G_YES/$G_NO)"
   printf '%s%s%s\n' "$ULINE" \
-    "$(pad_cell "Box" 3 11)$(pad_cell "St" 2 12)$(pad_cell "Db" 2 3)$(pad_cell "Sv" 2 3)$(pad_cell "AS" 2 3)$(pad_cell "Port" 4 5)Important Notes" \
+    "$(pad_cell "Box" 3 11)$(pad_cell "State" 5 7)$(pad_cell "Box" 3 5)$(pad_cell "Server" 6 8)$(pad_cell "AS" 2 4)$(pad_cell "Port" 4 6)Important Notes" \
     "$RESET"
   for box in "${SELECTED[@]}"; do
     lane=$(box_lanes_disp "$box")
     st=$(box_state "$box")
     case "$st" in
-      ACTIVE)  stg=$G_ACTIVE;  stw=$W_ACTIVE ;;
-      STOPPED) stg=$G_STOPPED; stw=$W_STOPPED ;;
-      *)       stg=$G_NONE;    stw=$W_NONE ;;
+      ACTIVE)  stg=$GS_ACTIVE ;;
+      STOPPED) stg=$GS_STOPPED ;;
+      *)       stg=$GS_NONE ;;
     esac
     row=$(pad_cell "$box" ${#box} 11)
-    row+=$(pad_cell "$stg" "$stw" 12)
+    row+=$(pad_cell "$stg" "$W_STATE" 7)
     [[ $lane == distrobox || $lane == both ]] && g=$G_YES || g=$G_NO
-    row+=$(pad_cell "$g" "$W_GLYPH" 3)
+    row+=$(pad_cell "$g" "$W_GLYPH" 5)
     [[ $lane == server || $lane == both ]] && g=$G_YES || g=$G_NO
-    row+=$(pad_cell "$g" "$W_GLYPH" 3)
+    row+=$(pad_cell "$g" "$W_GLYPH" 8)
     [[ -n "$(box_as "$box")" ]] && g=$G_YES || g=$G_NO
-    row+=$(pad_cell "$g" "$W_GLYPH" 3)
+    row+=$(pad_cell "$g" "$W_GLYPH" 4)
     port=$(box_port_disp "$box")
-    row+=$(pad_cell "$port" ${#port} 5)
+    row+=$(pad_cell "$port" ${#port} 6)
     data="${PATHS["$box:data"]:-${EXD_PATH["$box:data"]:-}}"
     note=${BOX_NOTE[$box]//@DATA@/$(home_disp "${data:-~/droste/$box/data}")}
     [[ ${#note} -gt 42 ]] && note="${note:0:39}..."
@@ -1409,13 +1432,13 @@ dashboard() {
   done
   say ""
   hdr "Shortcuts"
-  say "  Enter a box:        distrobox enter droste-<box>-halo-box"
+  say "  Enter box:          distrobox enter droste-<box>-halo-box"
   say "  Start/stop server:  podman start|stop droste-<box>-halo-server"
-  say "  Recreate (from $(home_disp "$EMIT_DIR")):"
+  printf '%s%s%s\n' "$ULINE" "  Recreate (files in $(home_disp "$EMIT_DIR"))" "$RESET"
   say "    server:    podman compose -f droste-<box>-halo-server.compose.yaml up -d"
   say "    distrobox: distrobox assemble create --file droste-<box>-halo-box.ini"
-  say "* ComfyUI models are scanned at start; add more: hf download (shared cache)"
-  say "Definitions + full guide: $(home_disp "$EMIT_DIR") (compose.yaml, ini, NOTES.md)"
+  say "* ComfyUI models scanned at start; to add more run: hf download <shared cache>"
+  say "--> Definitions + full guide: $(home_disp "$EMIT_DIR") (compose.yaml, ini, NOTES.md)"
   return 0
 }
 
@@ -1469,6 +1492,13 @@ main() {
     ask_ladder
     execute
     write_notes
+    # For any created distrobox lane, show the enter command (best-effort).
+    if [[ $RUNG == c || $RUNG == a ]]; then
+      for box in "${SELECTED[@]}"; do
+        [[ ${CFG_LANE[$box]:-} != server ]] || continue
+        printf 'To enter, run: %s%s%s\n' "$BOLD" "distrobox enter $(dbox_name "$box")" "$RESET"
+      done
+    fi
   else
     say ""
     say "No boxes selected."
