@@ -45,6 +45,19 @@ declare -A BOX_PITCH=(
   [finetuning]="JupyterLab — unsloth/HF finetuning"
 )
 
+# All-ASCII per-box banner titles (drawn in a box by banner()) + short display
+# names (used wherever a prompt needs the box's proper name).
+declare -A BOX_BANNER=(
+  [comfyui]="ComfyUI Container(s) - Image/Video Generation"
+  [llama]="llama.cpp Container(s) - GGUF LLM Server"
+  [vllm]="vLLM Container(s) - OpenAI-Compatible LLM Server"
+  [ds4]="DeepSeek Container(s) - Huge MoE Quants"
+  [finetuning]="Finetuning Container(s) - unsloth/HF Training"
+)
+declare -A BOX_NAME=(
+  [comfyui]="ComfyUI" [llama]="llama.cpp" [vllm]="vLLM" [ds4]="DeepSeek" [finetuning]="Finetuning"
+)
+
 # Canonical container-side service port (SERVICE row of each build-spec).
 declare -A BOX_PORT=(
   [comfyui]=8188 [llama]=8080 [vllm]=8000 [ds4]=8000 [finetuning]=8888
@@ -158,11 +171,13 @@ if [[ $PLAIN -eq 1 ]]; then
   G_ACTIVE="[+] ACTIVE" G_STOPPED="[-] STOPPED" G_NONE="[ ] none"
   W_ACTIVE=10 W_STOPPED=11 W_NONE=8
   G_YES="Y" G_NO="n" W_GLYPH=1
+  BOXTL="." BOXTR="." BOXBL="'" BOXBR="'" BOXH="-" BOXV="|"
 else
   BOLD=$'\e[1m' ULINE=$'\e[4m' RESET=$'\e[0m' DIVCH="─"
   G_ACTIVE=$'\U1F7E2 ACTIVE' G_STOPPED=$'\U1F6D1 STOPPED' G_NONE=$'⚫ none'
   W_ACTIVE=9 W_STOPPED=10 W_NONE=7        # emoji glyphs are double-width
   G_YES=$'✅' G_NO=$'\U1F6AB' W_GLYPH=2
+  BOXTL="┌" BOXTR="┐" BOXBL="└" BOXBR="┘" BOXH="─" BOXV="│"
 fi
 
 say()  { printf '%s\n' "$*"; }
@@ -180,6 +195,27 @@ section() {   # ── Name ──────... divider, 79 cols
 }
 
 hdr() { printf '%s%s%s%s\n' "$BOLD" "$ULINE" "$1" "$RESET"; }
+
+# A titled box drawn with the light box-drawing glyphs (ASCII in --plain mode).
+# banner text [bold]  — titles are all-ASCII so byte length == display width.
+banner() {   # text [bold]
+  local text=$1 bold=${2:-} n i fill top mid bot pre="" post=""
+  n=$(( ${#text} + 2 ))          # text plus one space of padding each side
+  fill=""
+  for (( i = 0; i < n; i = i + 1 )); do fill+=$BOXH; done
+  top="$BOXTL$fill$BOXTR"
+  mid="$BOXV $text $BOXV"
+  bot="$BOXBL$fill$BOXBR"
+  if [[ $bold == bold ]]; then pre=$BOLD post=$RESET; fi
+  printf '\n'
+  # Wrap each line separately so it renders even when RESET is empty (--plain).
+  printf '%s%s%s\n' "$pre" "$top" "$post"
+  printf '%s%s%s\n' "$pre" "$mid" "$post"
+  printf '%s%s%s\n' "$pre" "$bot" "$post"
+}
+
+# Plain subtitle printed directly under a section divider (no styling).
+sub() { printf '%s\n' "$1"; }
 
 # Pad a cell whose DISPLAY width may differ from its byte length (emoji).
 pad_cell() {   # text display-width column-width
@@ -279,6 +315,25 @@ ask_path_raw() {  # label default → ANS_PATH (absolute; NOT created)
 
 ask_path() {  # label default → ANS_PATH (absolute, created if absent)
   ask_path_raw "$1" "$2"
+  mkdir -p "$ANS_PATH" 2>/dev/null || warn "could not create $ANS_PATH"
+}
+
+# Terse variant: the caller supplies the FULL prompt label; we append the
+# "[default]: " suffix. Same expand + interpretation-echo as ask_path_raw.
+ask_path_as_raw() {  # "prompt label" default → ANS_PATH (absolute; NOT created)
+  local label=$1 def=$2 typed
+  ask_raw "$label [$(home_disp "$def")]: "
+  typed=$ANS
+  [[ -z $ANS ]] && ANS=$def
+  ANS_PATH=$(expand_path "$ANS")
+  if [[ -n $typed && $typed != "$ANS_PATH" ]]; then
+    say "  -> $ANS_PATH"
+  fi
+  return 0
+}
+
+ask_path_as() {  # "prompt label" default → ANS_PATH (absolute, created if absent)
+  ask_path_as_raw "$1" "$2"
   mkdir -p "$ANS_PATH" 2>/dev/null || warn "could not create $ANS_PATH"
 }
 
@@ -606,8 +661,9 @@ hydrate_keep() {  # box
 
 # ── Shared questions ─────────────────────────────────────────────────────────
 shared_questions() {
-  section "Shared storage"
-  wrap "The Hugging Face cache is the SINGLE model store shared by every box: a model any box downloads is instantly available to all the others."
+  section "Shared Storage"
+  sub "Caches, models, & other data shared across containers"
+  printf '%s%s%s\n' "$ULINE" "Please provide the following paths." "$RESET"
   local def=$HOME/.cache/huggingface box
   for box in "${BOXES[@]}"; do    # seed default from an existing setup
     if [[ -n "${EXD_PATH["$box:hf"]:-}" ]]; then
@@ -615,9 +671,8 @@ shared_questions() {
       break
     fi
   done
-  ask_path "the shared HF cache" "$def"
+  ask_path_as "HuggingFace cache (models)" "$def"
   HF_CACHE=$ANS_PATH
-  wrap "The compute cache (MIOpen/Triton/torch/vLLM kernels) is likewise shared by every box — safe to share: its content is keyed by version and architecture."
   def=$HOME/droste/caches
   for box in "${BOXES[@]}"; do
     if [[ -n "${EXD_PATH["$box:caches"]:-}" ]]; then
@@ -625,9 +680,17 @@ shared_questions() {
       break
     fi
   done
-  ask_path "the shared compute cache (MIOpen/Triton/torch/vLLM)" "$def"
+  ask_path_as "Compute cache (MIOpen/Triton/torch/vLLM kernels)" "$def"
   COMPUTE_CACHE=$ANS_PATH
-  ask_yn "Bind a read-only local model collection at /opt/models (optional)?" N
+  # Same y/N semantics as ask_yn (default N); inline only so the "?" renders
+  # after the [y/N] bracket per the display spec.
+  while :; do
+    ask_raw "Bind read-only local model collection at /opt/models (optional) [y/N]? "
+    case "$ANS" in
+      ""|n|N) ANS_YN=0; break ;;
+      y|Y) ANS_YN=1; break ;;
+    esac
+  done
   if [[ $ANS_YN -eq 1 ]]; then
     def=$HOME/models
     for box in "${BOXES[@]}"; do
@@ -636,7 +699,7 @@ shared_questions() {
         break
       fi
     done
-    ask_path "the local model collection" "$def"
+    ask_path_as "Path for local model collections" "$def"
     MODELS_DIR=$ANS_PATH
   fi
   return 0
@@ -662,13 +725,22 @@ MIT_ASKED=0
 
 fs_mitigation_menu() {  # box dir fstype → ANS_CH in {f,c,i,n}
   local box=$1 dir=$2 fstype=$3
+  : "$fstype"   # probed type kept in the signature (no longer shown inline)
   say ""
-  wrap "Droste uses the Linux kernel's overlayfs to maximize speed and efficiency. However, the filesystem for $(home_disp "$dir") is incompatible with overlayfs ($fstype). Would you like to use another location, select a fallback, or ignore? (If you ignore, the container will fail to load.)"
-  say "  Use [F]use overlay (userspace; slower: $FUSE_SPEED_NOTE)"
-  say "  Make [c]opies of files (no overlay; more storage: ~${BOX_COPY_GB[$box]} GB for $box)"
-  say "  Select [n]ew path (most efficient)"
-  say "  [i]gnore (\"ostrich solution\"; box will fail on start)"
-  ask_choice "[F/c/n/i]" "Fcni"
+  # Fixed two-line wording (not wrap, so the phrasing stays exact).
+  say "The filesystem for $(home_disp "$dir") is incompatible with the default tool"
+  say "droste uses, Linux's overlayfs. How should installation proceed?"
+  printf '%sNOTE: if ignored, filesystem must be changed before containers can load.%s\n' \
+    "$BOLD" "$RESET"
+  say ""
+  printf '  %-26s  %s\n' "[F]use overlay fallback" \
+    "(userspace; app files ~30% slower; models OK)"
+  printf '  %-26s  %s\n' "[c]opies files as fallback" \
+    "(no overlay; more storage: ~${BOX_COPY_GB[$box]} GB for $box)"
+  printf '  %-26s  %s\n' "[n]ew path" "(most efficient)"
+  printf '  %-26s  %s\n' "[i]gnore" "(\"ostrich solution\"; box will fail on start)"
+  say ""
+  ask_choice "Identify how to proceed [F/c/n/i]" "Fcni"
   return 0
 }
 
@@ -712,15 +784,19 @@ maybe_offer_pattern() {  # box label answered-path
 
 # Ask (or pattern-fill) one bind path for a box; sets PATHS[box:label].
 ask_bind_path() {  # box label dest prose
-  local box=$1 label=$2 dest=$3 prose=$4 def
+  local box=$1 label=$2 dest=$3 prose=$4 def plabel
+  : "$prose"   # prose kept for call-site compatibility; label is now derived
   def=$(path_default "$box" "$label")
   if [[ -n $PATTERN_ROOT && ${ACTION[$box]} != modify && $PATTERN_ASKED -eq 1 ]]; then
     PATHS["$box:$label"]=$def
     mkdir -p "$def" 2>/dev/null || warn "could not create $def"
     say "  $box $label: $(home_disp "$def") (pattern)"
   else
-    say "  ($label -> $dest: ${BIND_DESC[$label]:-bind})"
-    ask_path "$prose" "$def"
+    # The data bind's descriptor is now the "Data Mapping" section subtitle;
+    # keep the inline descriptor for the other (input/output/workspace) binds.
+    [[ $label != data ]] && say "  ($label -> $dest: ${BIND_DESC[$label]:-bind})"
+    if [[ $label == data ]]; then plabel="program data"; else plabel=$label; fi
+    ask_path_as "Path to use for ${BOX_NAME[$box]} $plabel" "$def"
     PATHS["$box:$label"]=$ANS_PATH
     maybe_offer_pattern "$box" "$label" "$ANS_PATH"
   fi
@@ -779,15 +855,21 @@ LANE_ASKED=0
 
 configure_box() {  # box remaining-after-this (count)
   local box=$1 remaining=$2 pair label dest lane_def
-  section "$box"
-  say "${BOX_PITCH[$box]}"
+  banner "${BOX_BANNER[$box]}" bold
 
   # Lane (Db/Sv/both) + AutoStart — propagatable after the first box.
+  section "Installation Variant(s)"
   if [[ -n $LANE_ALL && ${ACTION[$box]} != modify ]]; then
     CFG_LANE[$box]=$LANE_ALL
     CFG_AS[$box]=$AS_ALL
     say "Lane: $LANE_ALL (applied to all boxes)"
   else
+    sub "Select the containers to install."
+    say ""
+    printf '%-18s %s\n' "[d]istrobox" '(interactive $HOME-native toolbox)'
+    printf '%-18s %s\n' "[s]erver container" "(podman/docker, runs the service)"
+    say "[B]oth"
+    say ""
     lane_def="b"   # default = BOTH lanes (server + distrobox)
     if [[ ${ACTION[$box]} == modify ]]; then
       case "${EXD_LANE[$box]:-both}" in
@@ -796,12 +878,12 @@ configure_box() {  # box remaining-after-this (count)
         *) lane_def="b" ;;
       esac
     fi
-    say "Lanes: a [S]erver container (podman/docker, runs the service),"
-    say "       a [d]istrobox (interactive \$HOME-native toolbox), or [b]oth."
+    # Letters string first char = shown default (validation unchanged); only the
+    # displayed [d/s/B] order + capitalization reflects the current default.
     case "$lane_def" in
-      S) ask_choice "Which lane(s) for $box? [S/d/b]" "Sdb" ;;
-      d) ask_choice "Which lane(s) for $box? [s/D/b]" "Dsb" ;;
-      b) ask_choice "Which lane(s) for $box? [s/d/B]" "Bsd" ;;
+      S) ask_choice "Identify variants to install for ${BOX_NAME[$box]} [d/S/b]" "Sdb" ;;
+      d) ask_choice "Identify variants to install for ${BOX_NAME[$box]} [D/s/b]" "Dsb" ;;
+      b) ask_choice "Identify variants to install for ${BOX_NAME[$box]} [d/s/B]" "Bsd" ;;
     esac
     case "$ANS_CH" in
       s) CFG_LANE[$box]=server ;;
@@ -830,6 +912,8 @@ configure_box() {  # box remaining-after-this (count)
   # Data dir (+ fs probe / overlay mitigation), then the other CRITICAL binds.
   # Both lanes share this ONE /opt/data host path (only the container name
   # differs between lanes).
+  section "Data Mapping"
+  sub "(data -> /opt/data: ${BIND_DESC[data]})"
   choose_data_dir "$box"
   for pair in ${BOX_EXTRA_BINDS[$box]}; do
     label=${pair%%:*} dest=${pair#*:}
@@ -1338,14 +1422,14 @@ dashboard() {
 # ── Main flow ────────────────────────────────────────────────────────────────
 main() {
   init_input
-  say "droste-setup — guided install for the droste *-halo AI boxes"
+  banner "Droste Installer for Halo Architectures"
   preflight
 
-  section "Where to keep the definitions"
-  wrap "Per-box recreation records (compose.yaml + distrobox ini) and NOTES.md are written to an emit dir; default data dirs live under it too."
+  section "Resource Path"
+  sub "Recreation (compose.yaml/distrobox ini), logs, & program data"
   # A typo here fans out into every emitted file — confirm before creating.
   while :; do
-    ask_path_raw "the definitions (emit dir)" "$HOME/droste"
+    ask_path_as_raw "Please Identify a path to use for droste resources" "$HOME/droste"
     if [[ -d $ANS_PATH ]]; then
       break
     fi
