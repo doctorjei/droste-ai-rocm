@@ -692,7 +692,7 @@ device bitcode all come from the build base's pip SDK (all inherited as ENV).
 HEAVIEST port. Compiles the heavy ROCm/gfx1151 wheels for the vLLM toolbox —
 flash-attention (ROCm fork), aiter (`amd_aiter*.whl`), and vLLM itself — from
 source against the pinned TheRock torch, then ships them alone from `scratch`.
-Toolbox submodule provenance (droste-ai-rocm):
+Toolbox submodule provenance (droste-ai-halo):
 `6446b9595273f289e11586c3c7d3e1e6f2945888`.
 
 - KEY DEVIATION vs upstream: upstream installs a Fedora ROCm-SDK TARBALL via
@@ -917,7 +917,7 @@ kernels the base carries — NO ROCm re-adds. The base already writes a real
 The shippable vLLM toolbox for Strix Halo / gfx1151. FROM the runtime base + the
 pinned TheRock torch, then `COPY --from` the flash-attention/aiter/vLLM wheels
 compiled in vllm-artifacts and pip-install them into the base venv. No compilers,
-no ROCm `-dev` — pure runtime. Toolbox submodule provenance (droste-ai-rocm):
+no ROCm `-dev` — pure runtime. Toolbox submodule provenance (droste-ai-halo):
 `6446b9595273f289e11586c3c7d3e1e6f2945888`.
 
 - Torch (pinned TheRock nightly) into the base venv — must match the torch the
