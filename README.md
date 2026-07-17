@@ -1,4 +1,4 @@
-# droste-ai-rocm
+# droste-ai-halo
 
 Fedora → Debian/gemet port of the [Strix Halo ROCm toolboxes](https://github.com/kyuz0)
 (kyuz0's llama / ds4 / comfyui / vllm / finetuning images). These are **gemet-derived**
