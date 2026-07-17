@@ -39,8 +39,14 @@ _gpu_ok() {
 # Resolve a friendly GPU name. Runs at every login: every probe is guarded by
 # command -v, silenced, and (where a probe could hang) bounded by `timeout`, so
 # a missing/wedged tool can never error out or stall the login shell.
+# ROCm CLI tools ship in /opt/venv/bin, which is NOT on PATH at profile.d time
+# (zz-venv-last.sh only prepends it via PROMPT_COMMAND, after banners source).
+# Resolve by PATH first, then that known location — like rocm_version()'s
+# absolute python path — so rocminfo/rocm-smi are found at banner time.
+_rocm_tool() { command -v "$1" 2>/dev/null || { [[ -x "/opt/venv/bin/$1" ]] && printf '/opt/venv/bin/%s\n' "$1"; }; }
+
 gpu_name() {
-  local name="" cand="" gfx="" rinfo="" TO=""
+  local name="" cand="" gfx="" rinfo="" TO="" rbin="" sbin=""
   # Bound probes that can hang (rocminfo/rocm-smi enumerate hardware). If the
   # `timeout` binary is absent we just run the command directly.
   command -v timeout >/dev/null 2>&1 && TO="timeout 3"
@@ -48,8 +54,8 @@ gpu_name() {
   # rocminfo: capture once, then parse for both a friendly name and the gfx
   # target. APUs like Strix Halo populate "Marketing Name" even when other
   # sources are blank, so it leads the ladder.
-  if command -v rocminfo >/dev/null 2>&1; then
-    rinfo=$($TO rocminfo 2>/dev/null)
+  if rbin=$(_rocm_tool rocminfo); then
+    rinfo=$($TO "$rbin" 2>/dev/null)
     # (1) First GPU agent's Marketing Name. Device Type appears after the Name/
     # Marketing lines within an agent block, so buffer then emit at Device Type.
     cand=$(printf '%s\n' "$rinfo" | awk '
@@ -70,14 +76,14 @@ gpu_name() {
 
   # (2) rocm-smi --showproductname. Column/CSV layout varies by ROCm version,
   # so scan several likely value fields and take the first non-placeholder.
-  if [[ -z "$name" ]] && command -v rocm-smi >/dev/null 2>&1; then
-    cand=$($TO rocm-smi --showproductname 2>/dev/null \
+  if [[ -z "$name" ]] && sbin=$(_rocm_tool rocm-smi); then
+    cand=$($TO "$sbin" --showproductname 2>/dev/null \
       | grep -iE 'Card Series|Card Model|Product Name|Device Name|Market Name' \
       | sed -E 's/.*:[[:space:]]*//' | head -n1)
     _gpu_ok "$cand" && name="$cand"
     # CSV form: header row of column names, then per-GPU value rows.
     if [[ -z "$name" ]]; then
-      cand=$($TO rocm-smi --showproductname --csv 2>/dev/null \
+      cand=$($TO "$sbin" --showproductname --csv 2>/dev/null \
         | awk -F, 'NR>1 && NF>1 { for (i=2;i<=NF;i++) if ($i!="" && $i!="N/A") { print $i; exit } }')
       _gpu_ok "$cand" && name="$cand"
     fi
@@ -136,7 +142,7 @@ cat <<'ASCII'
               ╟───┘ ██ ║  █   █ 🭩🬂🭗🭄🮂🭏 🭄🮀🭧🭢🬨🬂🭗🭂🮀🭍
               ║        ║  █  🭊🭠 🭞  🭕▂🭠 ▄ 🭨🭬🭦🭩🭛🭓🬭🬽
               ╚════════╝ `🮃🮃🮃🭘🭷🭷🭷🭷🭷🭷🭷🭷🭷🭣🬂🭘🭷🭷🭷🭷🭷🭷🭷🭷
-                   COMFY UI - INTERACTIVE BOX
+                    ComfyUI: Interactive Box
 
 ASCII
 echo
@@ -146,7 +152,7 @@ echo
 printf 'Machine: %s\n' "$MACHINE"
 printf 'GPU    : %s\n\n' "$GPU"
 printf 'Image : ghcr.io/doctorjei/droste-comfyui-halo\n'
-printf 'Repo  : https://github.com/doctorjei/droste-ai-rocm\n\n'
+printf 'Repo  : https://github.com/doctorjei/droste-ai-halo\n\n'
 printf 'ComfyUI server: http://localhost:8188\n'
 printf '  - Run as a container → the server starts automatically (image entrypoint).\n'
 printf '  - In a distrobox/toolbox shell nothing autostarts → use: start_comfy_ui\n'

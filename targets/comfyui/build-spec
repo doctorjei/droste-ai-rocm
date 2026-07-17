@@ -81,6 +81,10 @@ PRE_LAUNCH="comfyui_pre_launch"
 comfyui_pre_launch() {
     # shellcheck source=/dev/null
     source /etc/profile.d/01-rocm-envs.sh
+    # ComfyUI writes preview/scratch files under <base>/temp; the baked dir is
+    # not user-writable in the distrobox lane. Create it sticky world-writable
+    # (like /tmp) at start so both lanes can write regardless of the running uid.
+    mkdir -p /opt/ComfyUI/temp && chmod 1777 /opt/ComfyUI/temp
     python3 /opt/resources/scripts/model_scanner.py sync \
         || resolve::warn "model_scanner sync failed (exit $?) — model tree may be stale"
     cd /opt/ComfyUI

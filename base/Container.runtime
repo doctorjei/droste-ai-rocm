@@ -79,7 +79,7 @@ RUN printf '%s\n' \
     'source /opt/venv/bin/activate' \
     'ROCM_PATH=/opt/rocm' \
     'export ROCM_PATH HIP_PATH="$ROCM_PATH"' \
-    'export PATH="$ROCM_PATH/bin:/opt/venv/bin:$PATH"' \
+    'export PATH="/opt/resources/scripts:$ROCM_PATH/bin:/opt/venv/bin:$PATH"' \
     'export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib64:$LD_LIBRARY_PATH"' \
     > /etc/profile.d/rocm.sh
 
